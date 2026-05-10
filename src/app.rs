@@ -842,7 +842,7 @@ impl App {
 
         // Feed interface rates to bandwidth alerts
         let interfaces = self.traffic.interfaces();
-        for iface in &interfaces {
+        for iface in interfaces.iter() {
             self.network_intel.on_interface_rate(InterfaceRateEvent {
                 iface: iface.name.clone(),
                 rx_bps: iface.rx_rate as u64,

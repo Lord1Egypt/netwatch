@@ -341,7 +341,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
     // Aggregate interface RX history as activity proxy (last 60s)
     let interfaces = app.traffic.interfaces();
     let mut acc: Vec<u64> = Vec::new();
-    for iface in &interfaces {
+    for iface in interfaces.iter() {
         if iface.name == "lo0" || iface.name == "lo" {
             continue;
         }

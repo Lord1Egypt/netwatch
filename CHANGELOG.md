@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.4] - 2026-05-10
+
+### Fixed
+- **Second memory-leak source for non-sudo Linux runs** — `TrafficCollector::interfaces()` was deep-cloning the full per-interface state (including each interface's two 600-sample history `VecDeque`s) on every call, ~96 KB per call on a 10-interface host. The Dashboard alone hit it 4 times per render and `App::tick()` another 6, totalling ~10 calls/sec ≈ 1 MB/sec of allocation churn. On Linux, glibc's per-thread arena retention turns that churn into climbing RSS even though no logical leak exists in the data structures. The accessor now returns `Arc<Vec<InterfaceTraffic>>` and `update()` swaps in a fresh `Arc` each tick — reads are a single atomic refcount bump regardless of interface count or history depth. `har5ha` reported continued RSS climb on v0.15.3 (~115 MB after 90 min on Dashboard-only); this addresses the source the v0.15.1 packet-pipeline fix couldn't reach because pcap is dormant without root. Reported in #27.
+
 ## [0.15.3] - 2026-05-09
 
 ### Added

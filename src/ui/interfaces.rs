@@ -70,7 +70,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_header(f, app, chunks[0]);
     render_chip_row(f, app, chunks[1]);
 
-    let mut filtered = app.traffic.interfaces();
+    // Interfaces tab needs to filter+sort, so we materialize a mutable copy
+    // here. Once per render of the Interfaces tab is the budget; the Arc on
+    // the read path keeps the other 99% of callers cheap.
+    let mut filtered: Vec<InterfaceTraffic> = (*app.traffic.interfaces()).clone();
     apply_filter(&mut filtered, app);
     if let Some(state) = app.sort_states.get(&Tab::Interfaces) {
         sort_interfaces(
@@ -445,22 +448,23 @@ fn render_detail_meta(
     } else {
         dns
     };
+    // Snapshot the interfaces once and reuse for both lookups to avoid two
+    // refcount bumps + two lookups when one of each suffices.
+    let traffic_snapshot = app.traffic.interfaces();
     let errors: u64 = info
-        .map(|inf| inf.name.clone())
+        .map(|inf| inf.name.as_str())
         .and_then(|n| {
-            app.traffic
-                .interfaces()
-                .into_iter()
+            traffic_snapshot
+                .iter()
                 .find(|i| i.name == n)
                 .map(|i| i.rx_errors + i.tx_errors)
         })
         .unwrap_or(0);
     let drops: u64 = info
-        .map(|inf| inf.name.clone())
+        .map(|inf| inf.name.as_str())
         .and_then(|n| {
-            app.traffic
-                .interfaces()
-                .into_iter()
+            traffic_snapshot
+                .iter()
                 .find(|i| i.name == n)
                 .map(|i| i.rx_drops + i.tx_drops)
         })

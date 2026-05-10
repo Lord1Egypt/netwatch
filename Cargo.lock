@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "netwatch-tui"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "anyhow",
  "aya 0.12.0",
