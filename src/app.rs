@@ -1142,6 +1142,19 @@ pub async fn run<B: Backend>(
         terminal.draw(|f| {
             let area = f.size();
             app.last_area = area;
+            // Paint the theme's panel background first so themes that
+            // opt in (sky, paper) get a colored fill behind everything.
+            // Themes with `bg: Color::Reset` paint nothing — terminal
+            // default shows through, preserving the historical look.
+            if app.theme.bg != ratatui::style::Color::Reset {
+                use ratatui::widgets::{Block, Borders};
+                f.render_widget(
+                    Block::default()
+                        .borders(Borders::NONE)
+                        .style(ratatui::style::Style::default().bg(app.theme.bg)),
+                    area,
+                );
+            }
             match app.current_tab {
                 Tab::Dashboard => ui::dashboard::render(f, &app, area),
                 Tab::Connections => ui::connections::render(f, &app, area),
