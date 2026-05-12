@@ -94,7 +94,7 @@ fn apply_filter(interfaces: &mut Vec<InterfaceTraffic>, app: &App) {
     interfaces.retain(|i| {
         let info = app.interface_info.iter().find(|info| info.name == i.name);
         let is_up = info.map(|inf| inf.is_up).unwrap_or(false);
-        let has_traffic = i.rx_rate > 0.0 || i.tx_rate > 0.0;
+        let has_traffic = crate::ui::widgets::interface_recently_active(i);
         let role = role_for(&i.name);
         match app.interface_filter {
             InterfaceFilter::Active => is_up && has_traffic,
@@ -172,7 +172,7 @@ fn chip_counts(interfaces: &[InterfaceTraffic], app: &App) -> ChipCounts {
     for i in interfaces {
         let info = app.interface_info.iter().find(|info| info.name == i.name);
         let is_up = info.map(|inf| inf.is_up).unwrap_or(false);
-        let has_traffic = i.rx_rate > 0.0 || i.tx_rate > 0.0;
+        let has_traffic = crate::ui::widgets::interface_recently_active(i);
         let role = role_for(&i.name);
         if is_up && has_traffic {
             counts.active += 1;
@@ -261,7 +261,7 @@ fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: 
         .and_then(|inf| inf.ipv4.clone())
         .unwrap_or_else(|| "—".into());
     let is_up = info.map(|inf| inf.is_up).unwrap_or(false);
-    let has_traffic = iface.rx_rate > 0.0 || iface.tx_rate > 0.0;
+    let has_traffic = crate::ui::widgets::interface_recently_active(iface);
     let active = is_up && has_traffic;
     let dot_color = if active {
         t.status_good

@@ -4,9 +4,22 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::connections::Connection;
 use super::traffic::InterfaceTraffic;
+
+/// Drop a process's accumulated byte totals after this much inactivity.
+/// Without pruning, long sessions would leak entries for every (process, pid)
+/// pair ever observed — PIDs cycle, so the keyset is effectively unbounded.
+const PROCESS_TOTALS_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+struct ProcessTotals {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    last_seen: Instant,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessBandwidth {
@@ -27,15 +40,20 @@ pub struct ProcessBandwidth {
 
 pub struct ProcessBandwidthCollector {
     ranked: Vec<ProcessBandwidth>,
-    /// Baseline interface byte totals captured on the first `update()` call,
-    /// so we attribute only bytes that flowed since netwatch started — not the
-    /// kernel's since-interface-up counter (which can be GBs at startup).
-    baseline_rx_bytes: Option<u64>,
-    baseline_tx_bytes: Option<u64>,
     /// CPU% per-pid cache, populated by a background `ps` thread on a slow
     /// tick. The mutex is short-lived; reads are O(1) lookups.
     cpu_cache: Arc<Mutex<HashMap<u32, f64>>>,
     cpu_busy: Arc<AtomicBool>,
+    /// Per-(process, pid) cumulative bytes, integrated from observed
+    /// rates each tick (`bytes += rate * elapsed`). Survives ticks where
+    /// the current rate is 0, so the Stats "TOP PROCESSES" panel keeps
+    /// showing historical traffic instead of flashing empty every time
+    /// a flow goes idle. Pruned after PROCESS_TOTALS_TTL of inactivity.
+    process_totals: HashMap<(String, Option<u32>), ProcessTotals>,
+    /// Timestamp of the previous `update()` call; used to integrate rate
+    /// into bytes since the last tick. `None` on first call (no elapsed
+    /// time to integrate over).
+    last_tick: Option<Instant>,
 }
 
 impl Default for ProcessBandwidthCollector {
@@ -48,35 +66,25 @@ impl ProcessBandwidthCollector {
     pub fn new() -> Self {
         Self {
             ranked: Vec::new(),
-            baseline_rx_bytes: None,
-            baseline_tx_bytes: None,
             cpu_cache: Arc::new(Mutex::new(HashMap::new())),
             cpu_busy: Arc::new(AtomicBool::new(false)),
+            process_totals: HashMap::new(),
+            last_tick: None,
         }
     }
 
-    pub fn update(&mut self, connections: &[Connection], interfaces: &[InterfaceTraffic]) {
-        // Interface bytes-since-startup form the denominator for the
-        // per-process byte allocation; per-process *rates* come from the
-        // connections themselves (populated by the packet-capture rate
-        // tracker), so interface rates are no longer used here.
-        let raw_rx_bytes: u64 = interfaces.iter().map(|i| i.rx_bytes_total).sum();
-        let raw_tx_bytes: u64 = interfaces.iter().map(|i| i.tx_bytes_total).sum();
-
-        let baseline_rx = *self.baseline_rx_bytes.get_or_insert(raw_rx_bytes);
-        let baseline_tx = *self.baseline_tx_bytes.get_or_insert(raw_tx_bytes);
-        let total_rx_bytes = raw_rx_bytes.saturating_sub(baseline_rx);
-        let total_tx_bytes = raw_tx_bytes.saturating_sub(baseline_tx);
+    pub fn update(&mut self, connections: &[Connection], _interfaces: &[InterfaceTraffic]) {
+        let now = Instant::now();
+        let elapsed = self
+            .last_tick
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        self.last_tick = Some(now);
 
         // Aggregate per-(process, pid) state from the ESTABLISHED connections.
         // Rates come from the packet capture path (conn.rx_rate / tx_rate are
         // populated by RateState in connections.rs when a stream's bytes are
-        // moving). RTT is the min across the process's TCP conns. We previously
-        // allocated bytes by `count / total_count` which gave every process
-        // with the same connection count an identical RX/TX — a fictional
-        // model that misled users. Now bytes are allocated by *rate share*
-        // instead, so the panel only shows differential numbers when there's
-        // real per-connection rate data behind them.
+        // moving). RTT is the min across the process's TCP conns.
         let mut process_conns: HashMap<(String, Option<u32>), u32> = HashMap::new();
         let mut process_rx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
         let mut process_tx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
@@ -113,13 +121,52 @@ impl ProcessBandwidthCollector {
             }
         }
 
+        // Integrate per-process rates into cumulative byte totals. Even
+        // when the current rate is 0, the previously-accumulated total
+        // persists, so the "TOP PROCESSES" panel shows historical traffic
+        // instead of flashing empty every time a flow goes idle.
+        if elapsed > 0.0 {
+            for (key, &rx_rate) in &process_rx_rate {
+                if rx_rate <= 0.0 {
+                    continue;
+                }
+                let entry =
+                    self.process_totals
+                        .entry(key.clone())
+                        .or_insert_with(|| ProcessTotals {
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            last_seen: now,
+                        });
+                entry.rx_bytes = entry.rx_bytes.saturating_add((rx_rate * elapsed) as u64);
+                entry.last_seen = now;
+            }
+            for (key, &tx_rate) in &process_tx_rate {
+                if tx_rate <= 0.0 {
+                    continue;
+                }
+                let entry =
+                    self.process_totals
+                        .entry(key.clone())
+                        .or_insert_with(|| ProcessTotals {
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            last_seen: now,
+                        });
+                entry.tx_bytes = entry.tx_bytes.saturating_add((tx_rate * elapsed) as u64);
+                entry.last_seen = now;
+            }
+        }
+
+        // Prune stale entries so the totals map doesn't grow unbounded
+        // across PID churn over a long-running session.
+        self.process_totals
+            .retain(|_, t| now.duration_since(t.last_seen) < PROCESS_TOTALS_TTL);
+
         if total_established == 0 {
             self.ranked.clear();
             return;
         }
-
-        let total_proc_rx_rate: f64 = process_rx_rate.values().sum();
-        let total_proc_tx_rate: f64 = process_tx_rate.values().sum();
 
         let cpu_cache = self.cpu_cache.lock().unwrap().clone();
 
@@ -129,20 +176,11 @@ impl ProcessBandwidthCollector {
                 let key = (process_name.clone(), pid);
                 let rx_rate = process_rx_rate.get(&key).copied().unwrap_or(0.0);
                 let tx_rate = process_tx_rate.get(&key).copied().unwrap_or(0.0);
-                // Allocate cumulative interface bytes by this process's
-                // rate share. When no rates exist (no packet capture path),
-                // every process gets 0 — honest "we don't know" rather
-                // than fake equal slices of the interface total.
-                let rx_bytes = if total_proc_rx_rate > 0.0 {
-                    (total_rx_bytes as f64 * (rx_rate / total_proc_rx_rate)) as u64
-                } else {
-                    0
-                };
-                let tx_bytes = if total_proc_tx_rate > 0.0 {
-                    (total_tx_bytes as f64 * (tx_rate / total_proc_tx_rate)) as u64
-                } else {
-                    0
-                };
+                let (rx_bytes, tx_bytes) = self
+                    .process_totals
+                    .get(&key)
+                    .map(|t| (t.rx_bytes, t.tx_bytes))
+                    .unwrap_or((0, 0));
                 let rtt_ms = process_rtt.get(&key).copied();
                 let cpu_percent = pid.and_then(|p| cpu_cache.get(&p).copied());
                 ProcessBandwidth {
@@ -352,6 +390,55 @@ mod tests {
             assert_eq!(p.tx_rate, 0.0, "{} should have 0 tx rate", p.process_name);
             assert_eq!(p.rx_bytes, 0, "{} should have 0 bytes", p.process_name);
         }
+    }
+
+    #[test]
+    fn bytes_accumulate_across_ticks_even_when_rate_drops_to_zero() {
+        // Regression for the "TOP PROCESSES flashes then empties" bug. We
+        // tick once with traffic, sleep so the next tick has measurable
+        // elapsed, tick again with the rate gone to zero. The accumulated
+        // bytes should persist instead of resetting (and the panel
+        // therefore stays populated between bursts).
+        let mut collector = ProcessBandwidthCollector::new();
+        // First tick: rate=1000 B/s; sets last_tick but no accumulation
+        // (elapsed=0 on the very first tick).
+        let conns1 = vec![make_conn_rated(
+            "firefox",
+            100,
+            "ESTABLISHED",
+            Some(1000.0),
+            Some(500.0),
+        )];
+        collector.update(&conns1, &[make_interface(0.0, 0.0)]);
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Second tick: rate still 1000; elapsed ≈ 0.1s so we accumulate
+        // ~100 bytes of RX, ~50 bytes of TX.
+        collector.update(&conns1, &[make_interface(0.0, 0.0)]);
+        let rx_bytes_after_first_burst = collector.ranked()[0].rx_bytes;
+        assert!(
+            rx_bytes_after_first_burst > 50 && rx_bytes_after_first_burst < 200,
+            "expected ~100 rx bytes, got {}",
+            rx_bytes_after_first_burst
+        );
+
+        // Third tick: rate drops to 0. Cumulative bytes must persist.
+        let conns2 = vec![make_conn_rated(
+            "firefox",
+            100,
+            "ESTABLISHED",
+            Some(0.0),
+            Some(0.0),
+        )];
+        std::thread::sleep(Duration::from_millis(50));
+        collector.update(&conns2, &[make_interface(0.0, 0.0)]);
+        let firefox_after = &collector.ranked()[0];
+        assert_eq!(
+            firefox_after.rx_bytes, rx_bytes_after_first_burst,
+            "cumulative bytes should persist when rate drops to zero",
+        );
+        assert_eq!(firefox_after.rx_rate, 0.0);
     }
 
     #[test]

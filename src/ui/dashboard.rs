@@ -235,15 +235,18 @@ fn render_active_interface(f: &mut Frame, app: &App, area: Rect) {
     let interfaces = app.traffic.interfaces();
     let actives = active_ifaces(&interfaces, &app.interface_info);
     let primary = actives.first().copied();
-    // Only call an iface "live" if it currently has traffic; everything else
-    // (including UP-but-silent and DOWN) goes to IDLE.
+    // Only call an iface "live" if it had traffic in the last few seconds.
+    // Using a small lookback into the rate history instead of the
+    // instantaneous tick rate stops the live/idle counts from flickering
+    // between bursts — `i.rx_rate` is genuinely 0 most ticks even on busy
+    // interfaces.
     let live_count = actives
         .iter()
-        .filter(|i| i.rx_rate > 0.0 || i.tx_rate > 0.0)
+        .filter(|i| widgets::interface_recently_active(i))
         .count();
     let idle: Vec<_> = interfaces
         .iter()
-        .filter(|i| i.rx_rate == 0.0 && i.tx_rate == 0.0)
+        .filter(|i| !widgets::interface_recently_active(i))
         .collect();
 
     let title_right = format!(" {} live  {} idle ", live_count, idle.len());
@@ -345,7 +348,7 @@ fn render_active_interface(f: &mut Frame, app: &App, area: Rect) {
         for other in actives
             .iter()
             .skip(1)
-            .filter(|i| i.rx_rate > 0.0 || i.tx_rate > 0.0)
+            .filter(|i| widgets::interface_recently_active(i))
             .take(3)
         {
             let other_info = app.interface_info.iter().find(|i| i.name == other.name);

@@ -35,6 +35,19 @@ pub const RATE_WIDTH: usize = 8;
 /// Fixed column width for total byte strings (e.g. "999 MB"). Right-aligned.
 pub const TOTAL_WIDTH: usize = 6;
 
+/// Returns true if the interface saw any traffic in the last few history
+/// samples (~5s at 1 Hz). Renderers use this instead of `rx_rate > 0.0`
+/// for "is this interface active" decisions so badges and counts don't
+/// flicker on/off between traffic bursts — the instantaneous rate is
+/// genuinely 0 most ticks even on a heavily-used interface, which made
+/// the "N live N idle" badge in the dashboard flap every refresh.
+pub fn interface_recently_active(iface: &crate::collectors::traffic::InterfaceTraffic) -> bool {
+    const RECENT_SAMPLES: usize = 5;
+    let rx = iface.rx_history.iter().rev().take(RECENT_SAMPLES);
+    let tx = iface.tx_history.iter().rev().take(RECENT_SAMPLES);
+    rx.chain(tx).any(|&r| r > 0)
+}
+
 /// Unpadded rate for inline use. Zero → "-", integers only.
 pub fn format_bytes_rate(bytes_per_sec: f64) -> String {
     if bytes_per_sec < 1.0 {
