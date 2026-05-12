@@ -46,7 +46,6 @@ pub struct Theme {
 
 pub const THEME_NAMES: &[&str] = &[
     "dark",
-    "minimal",
     "ocean",
     "solarized",
     "dracula",
@@ -59,12 +58,15 @@ pub const THEME_NAMES: &[&str] = &[
 
 pub fn by_name(name: &str) -> Theme {
     match name.to_lowercase().as_str() {
-        // Accept the historical "light" name as an alias for "minimal" so
-        // saved configs from earlier releases keep working. The theme is
-        // dark-text-on-terminal-default, which is only readable when the
-        // user's terminal is in a light mode — "minimal" makes that
-        // constraint explicit; "light" set the wrong expectation.
-        "minimal" | "light" => minimal(),
+        // Backwards-compat aliases. Saved configs from earlier
+        // releases shouldn't silently fall back to `dark`:
+        //   "light"   — old transparent-bg theme that only worked on
+        //               light terminals; users who picked it wanted a
+        //               light-themed UI, which `paper` actually is.
+        //   "minimal" — interim rename of "light" in v0.15.10 that
+        //               was deleted in v0.15.11 because its terminal-
+        //               deferring behaviour duplicated `dark`.
+        "light" | "minimal" => paper(),
         "ocean" => ocean(),
         "solarized" => solarized(),
         "dracula" => dracula(),
@@ -101,53 +103,6 @@ pub fn dark() -> Theme {
 }
 
 /// "Minimal" styling — defers to the terminal's palette for everything
-/// body-related. Body text and chrome use `Color::Reset` (terminal
-/// default fg / bg), and only the semantic accents (status, rates,
-/// brand) use named ANSI colors. The terminal interprets those names
-/// against its own palette, so the theme reads correctly whether the
-/// terminal is in light or dark mode.
-///
-/// Previously named "light" with explicit dark RGB text colors that
-/// only worked against a light terminal background. `by_name` still
-/// accepts the old alias so saved configs keep working. For a
-/// self-contained light-themed UI that paints its own background,
-/// use `paper` instead.
-pub fn minimal() -> Theme {
-    Theme {
-        name: "minimal",
-        brand: Color::Cyan,
-        active_tab: Color::Yellow,
-        // Chrome uses DarkGray rather than Reset so borders + tab
-        // separators remain visible against the terminal bg without
-        // dominating the view. Terminals render DarkGray as their
-        // "bright black" (palette index 8), which is a subtle neutral
-        // on both light and dark themes.
-        inactive_tab: Color::DarkGray,
-        border: Color::DarkGray,
-        separator: Color::DarkGray,
-        // Text defers to terminal default fg. Inverse is intentionally
-        // Reset too — used only for badges that also set a bg, where
-        // we want the bg's contrast pair.
-        text_primary: Color::Reset,
-        text_secondary: Color::Reset,
-        text_muted: Color::DarkGray,
-        text_inverse: Color::Reset,
-        status_good: Color::Green,
-        status_warn: Color::Yellow,
-        status_error: Color::Red,
-        status_info: Color::Cyan,
-        rx_rate: Color::Green,
-        tx_rate: Color::Blue,
-        key_hint: Color::Yellow,
-        // Selection highlight uses DarkGray as a subtle row tint that
-        // works on both light and dark terminals without picking a
-        // specific RGB that would clash with one of them.
-        selection_bg: Color::DarkGray,
-        highlight_bg: Color::DarkGray,
-        bg: Color::Reset,
-    }
-}
-
 /// For Terminal.app's "Ocean" profile (bg #224FBC).
 /// Colors are taken from Apple's Terminal.app default ANSI palette (Ocean
 /// inherits it — the profile plist only overrides bg, text, and selection).
@@ -423,7 +378,7 @@ mod tests {
 
     #[test]
     fn theme_names_count() {
-        assert_eq!(THEME_NAMES.len(), 8);
+        assert_eq!(THEME_NAMES.len(), 7);
     }
 
     #[test]
@@ -439,7 +394,7 @@ mod tests {
     fn transparent_themes_leave_bg_reset() {
         // Existing six keep terminal-default bg so users who picked
         // their terminal palette deliberately don't have it stomped.
-        for name in ["dark", "minimal", "ocean", "solarized", "dracula", "nord"] {
+        for name in ["dark", "ocean", "solarized", "dracula", "nord"] {
             assert_eq!(
                 by_name(name).bg,
                 Color::Reset,
@@ -451,12 +406,13 @@ mod tests {
     #[test]
     fn by_name_case_insensitive() {
         assert_eq!(by_name("DARK").name, "dark");
-        assert_eq!(by_name("Minimal").name, "minimal");
-        // Historical alias: configs that still say "light" resolve to
-        // the renamed theme rather than silently dropping to the
-        // dark fallback.
-        assert_eq!(by_name("light").name, "minimal");
-        assert_eq!(by_name("Light").name, "minimal");
+        // Backwards-compat aliases: configs that still say "light"
+        // (pre-v0.15.10) or "minimal" (v0.15.10 only) resolve to
+        // `paper` rather than silently dropping to the `dark` fallback.
+        assert_eq!(by_name("light").name, "paper");
+        assert_eq!(by_name("Light").name, "paper");
+        assert_eq!(by_name("minimal").name, "paper");
+        assert_eq!(by_name("Minimal").name, "paper");
         assert_eq!(by_name("DRACULA").name, "dracula");
     }
 }
