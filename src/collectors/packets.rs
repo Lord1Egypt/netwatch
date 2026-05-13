@@ -212,7 +212,12 @@ impl DnsCache {
                 queued_at: std::time::Instant::now(),
             },
         );
-        let _ = self.tx.send(ip.to_string());
+        if let Err(e) = self.tx.send(ip.to_string()) {
+            // Channel send only fails if the resolver thread has died.
+            // Symptom would be lookups silently stalled forever — log so
+            // we can tell that's what happened.
+            tracing::error!(target: "netwatch::dns_cache", error = %e, "resolver thread is gone; reverse-DNS will not progress");
+        }
         None
     }
 }
@@ -635,6 +640,7 @@ impl PacketCollector {
                     } else {
                         format!("Capture failed: {e}")
                     };
+                    tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap open failed");
                     *error.lock().unwrap() = Some(msg);
                     capturing.store(false, Ordering::SeqCst);
                     return;
@@ -644,6 +650,7 @@ impl PacketCollector {
             // Apply BPF capture filter if specified
             if let Some(filter) = bpf.as_deref() {
                 if let Err(e) = cap.filter(filter, true) {
+                    tracing::error!(target: "netwatch::capture", filter = %filter, error = %e, "BPF filter compile/install failed");
                     *error.lock().unwrap() = Some(format!("BPF filter error: {e}"));
                     capturing.store(false, Ordering::SeqCst);
                     return;

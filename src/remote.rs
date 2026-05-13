@@ -55,10 +55,17 @@ impl RemotePublisher {
                 });
 
                 let endpoint = format!("{}/api/v1/ingest", url);
-                let _ = ureq::post(&endpoint)
+                if let Err(e) = ureq::post(&endpoint)
                     .set("Authorization", &format!("Bearer {}", api_key))
                     .set("Content-Type", "application/json")
-                    .send_json(body);
+                    .send_json(body)
+                {
+                    // Fire-and-forget today; a future change in Phase 3 of the
+                    // refactoring plan adds retries + a bounded buffer. For
+                    // now, surface the failure so a user reporting "remote
+                    // streaming isn't working" can hand over a log.
+                    tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, "ingest POST failed");
+                }
             }
         });
     }

@@ -178,6 +178,7 @@ pub fn spawn() -> PktapHandle {
 }
 
 fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
+    tracing::warn!(target: "netwatch::pktap", error = %msg, "pktap startup failed; falling back to lsof attribution");
     if let Ok(mut s) = slot.lock() {
         *s = Some(msg);
     }

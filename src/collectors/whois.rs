@@ -81,7 +81,9 @@ impl WhoisCache {
             Some(WhoisEntry::Failed) | Some(WhoisEntry::Pending) => None,
             None => {
                 cache.insert(ip.to_string(), WhoisEntry::Pending);
-                let _ = self.tx.send(ip.to_string());
+                if let Err(e) = self.tx.send(ip.to_string()) {
+                    tracing::error!(target: "netwatch::whois", error = %e, "whois resolver thread is gone; lookups will not progress");
+                }
                 None
             }
         }

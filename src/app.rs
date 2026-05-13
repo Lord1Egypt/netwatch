@@ -547,11 +547,14 @@ impl App {
         // continues with lsof/ss attribution only. The failure reason is
         // captured for UI display.
         #[cfg(feature = "ebpf")]
-        let (conn_tracker_opt, ebpf_init_error) =
-            match crate::ebpf::conn_tracker::ConnTracker::new() {
-                Ok(t) => (Some(t), None),
-                Err(e) => (None, Some(e.to_string())),
-            };
+        let (conn_tracker_opt, ebpf_init_error) = match crate::ebpf::conn_tracker::ConnTracker::new(
+        ) {
+            Ok(t) => (Some(t), None),
+            Err(e) => {
+                tracing::warn!(target: "netwatch::ebpf", error = %e, "eBPF kprobe init failed; falling back to lsof/ss attribution");
+                (None, Some(e.to_string()))
+            }
+        };
 
         let mut connection_collector =
             ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));

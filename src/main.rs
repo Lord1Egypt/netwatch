@@ -76,6 +76,12 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
+    // File-only structured logging. Held until end of `main` so the
+    // non-blocking writer's worker flushes queued records on shutdown.
+    // Installed after CLI flag handling so `--version` / `--help` don't
+    // touch the cache dir.
+    let _log_guard = netwatch::logging::init();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

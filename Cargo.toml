@@ -68,6 +68,14 @@ mimalloc = { version = "0.1", default-features = false }
 # attribution. The Linux runtime path also gracefully falls back when
 # the BPF object is missing or CAP_BPF/CAP_PERFMON aren't granted.
 netwatch-sdk = { version = "0.1.2", features = ["ebpf"], optional = true }
+# File-only structured logging. The TUI owns stdout/stderr in alternate-screen
+# mode, so logs must never go to the terminal — they land in a daily-rotated
+# file under the user's cache dir. Default level is WARN; users can override
+# via `RUST_LOG=netwatch=debug` when handing us a repro for a stuck resolver,
+# pcap startup failure, or remote-stream issue.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 [features]
 # eBPF process attribution is on by default. The runtime gracefully

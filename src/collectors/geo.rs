@@ -209,7 +209,9 @@ impl GeoCache {
         // Fall back to online lookup (async via background thread)
         let mut cache = self.cache.lock().unwrap();
         cache.insert(ip.to_string(), GeoEntry::Pending);
-        let _ = self.online_tx.send(ip.to_string());
+        if let Err(e) = self.online_tx.send(ip.to_string()) {
+            tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+        }
         None
     }
 }

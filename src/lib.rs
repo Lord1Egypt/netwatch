@@ -4,6 +4,7 @@ pub mod config;
 pub mod ebpf;
 pub mod event;
 pub mod graph;
+pub mod logging;
 pub mod platform;
 pub mod remote;
 pub mod sort;
