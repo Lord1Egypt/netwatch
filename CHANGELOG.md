@@ -2,6 +2,25 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.11] - 2026-05-17
+
+### Added
+- **Two new themes: `sky` and `paper`** — both paint panel backgrounds rather than letting the terminal show through. `sky` is a calm cool-blue dark theme; `paper` is a light theme with AAA-contrast data colors tuned against off-white. Cycle themes from settings or pass `--theme paper`.
+- **Graceful recovery from poisoned mutexes** — A panic inside a critical section used to leave shared state in a `PoisonError` state and ripple downstream panics across the whole UI thread. We now `unwrap_or_else` on poisoned guards by clearing the inner state and continuing, so a single panic in a collector doesn't take the TUI with it.
+- **Structured file-only logging** — Diagnostic logging now writes to a configurable file rather than stderr (which fights the TUI for the terminal). Levels and target file controllable via env vars. Off by default so the binary still has zero non-UI output.
+
+### Changed
+- **Refactored hot-path state into snapshot pattern** — `AppCaches` and `AppUiState` extracted out of the monolithic `App` struct, with hot reads on the UI thread going through cheap snapshots instead of holding the collector lock. Eliminates the occasional input-lag stutter under bursty traffic.
+
+### Fixed
+- **Help dialog now respects the active theme** — Previously rendered with hard-coded colors that clashed on `paper` and `sky`. Now derives all colors from the theme palette like every other panel.
+- **`paper` popup backgrounds inherit the painted bg** — Settings, help, and confirmation popups were transparent on `paper`, exposing whatever sat behind them. They now paint their own background to match the theme.
+- **`paper` data colors meet AAA contrast against off-white** — Several greens and blues failed contrast checks; darkened to compliant variants.
+- **Packets tab block titles match the rest of the UI** — They were dim regular weight; now brand-color bold like every other tab's titles. Consistency fix.
+- **Default fg set alongside bg** so unstyled spans inherit the theme's text color rather than the terminal's default (which broke `paper` and looked wrong on `sky`).
+- **`minimal` theme** (previously `light`) renamed to reflect its constraint — it defers to the terminal's palette for body text, which is the right call for terminals with custom palettes but isn't truly "light." Subsequently deleted entirely after testing showed it duplicated `dark` on the only terminal where it rendered correctly.
+- **`process_bandwidth` test de-flaked** for CI — byte-accumulation test was timing-sensitive and intermittently failed under loaded runners.
+
 ## [0.15.10] - 2026-05-13
 
 ### Added
