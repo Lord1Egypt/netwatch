@@ -1,6 +1,5 @@
-use crate::app::App;
+use crate::app::{App, AttributionStatus};
 use crate::collectors::traffic::InterfaceTraffic;
-use crate::ebpf::EbpfStatus;
 use crate::sort::{SortColumn, TabSortState};
 use crate::ui::widgets;
 use ratatui::{
@@ -877,10 +876,16 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
         let interfaces = app.traffic.interfaces();
         let total_errors: u64 = interfaces.iter().map(|i| i.rx_errors + i.tx_errors).sum();
         let total_drops: u64 = interfaces.iter().map(|i| i.rx_drops + i.tx_drops).sum();
-        let ebpf_text = match &app.ebpf_status {
-            EbpfStatus::Active => "eBPF active",
-            EbpfStatus::Unavailable(_) => "eBPF off",
-            EbpfStatus::NotCompiled => "eBPF off",
+        // Read live attribution state (per-OS aware) rather than a
+        // boot-time placeholder — on macOS this surfaces "pktap active"
+        // instead of falsely claiming eBPF, and on Linux it reflects
+        // whether the conn_tracker actually loaded.
+        let ebpf_text = match app.attribution_status() {
+            AttributionStatus::Active("ebpf") => "eBPF active".to_string(),
+            AttributionStatus::Active(src) => format!("{} active", src),
+            AttributionStatus::Failed("ebpf", _) => "eBPF off".to_string(),
+            AttributionStatus::Failed(src, _) => format!("{} off", src),
+            AttributionStatus::Lsof => "lsof attr".to_string(),
         };
 
         // separator

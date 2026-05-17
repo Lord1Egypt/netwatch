@@ -12,7 +12,6 @@ use crate::collectors::traceroute::TracerouteRunner;
 use crate::collectors::traffic::TrafficCollector;
 use crate::collectors::whois::WhoisCache;
 use crate::config::NetwatchConfig;
-use crate::ebpf::EbpfStatus;
 use crate::event::{AppEvent, EventHandler};
 use crate::platform::{self, InterfaceInfo};
 use crate::state::{AppCaches, AppUiState};
@@ -411,7 +410,6 @@ pub struct App {
     pub connection_timeline: ConnectionTimeline,
     pub network_intel: NetworkIntelCollector,
     intel_last_pkt_id: u64,
-    pub ebpf_status: EbpfStatus,
     #[allow(dead_code)]
     pub rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor,
     /// Linux-only kernel attribution path. Holds the SDK's `EventSource`
@@ -585,7 +583,6 @@ impl App {
             connection_timeline: ConnectionTimeline::new(),
             network_intel,
             intel_last_pkt_id: 0,
-            ebpf_status: Self::init_ebpf_status(),
             rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor::new(),
             #[cfg(feature = "ebpf")]
             conn_tracker: conn_tracker_opt,
@@ -674,18 +671,6 @@ impl App {
         } else {
             ""
         }
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn init_ebpf_status() -> EbpfStatus {
-        // Initial placeholder. The real status is read live via
-        // `App::ebpf_status()` based on whether `conn_tracker` is Some.
-        EbpfStatus::Active
-    }
-
-    #[cfg(not(feature = "ebpf"))]
-    fn init_ebpf_status() -> EbpfStatus {
-        EbpfStatus::NotCompiled
     }
 
     fn pick_capture_interface(info: &[InterfaceInfo]) -> String {

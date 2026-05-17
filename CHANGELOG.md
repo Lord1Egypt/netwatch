@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.12] - 2026-05-17
+
+### Fixed
+- **Dashboard footer now reports the real attribution path** — The `eBPF active` / `eBPF off` indicator was reading a boot-time placeholder field that was always set to `Active` whenever the `ebpf` feature compiled in. Since the feature is `default = ["ebpf"]` and the field was never updated from the placeholder, every macOS build falsely advertised "eBPF active" even though eBPF is Linux-only. The footer now reads live state via `App::attribution_status()`, which already knows per-OS what's actually doing kernel attribution. macOS shows `pktap active` (the actual mechanism), Linux shows `eBPF active` only when the BPF object loaded successfully, and unprivileged Linux fallbacks show `eBPF off` or `lsof attr` correctly.
+
 ## [0.15.11] - 2026-05-17
 
 ### Added
