@@ -298,9 +298,12 @@ jobs:
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet Formula/netwatch.rb; then
+          # Stage first, then diff against HEAD. `git diff` (unstaged)
+          # ignores untracked files, so a brand-new formula would
+          # falsely report "no change" on the first release.
+          git add Formula/netwatch.rb
+          if git diff --cached --quiet -- Formula/netwatch.rb; then
             echo "Formula already up to date"; exit 0
           fi
-          git add Formula/netwatch.rb
           git commit -m "netwatch ${{ steps.sha.outputs.version }}: auto-update formula"
           git push origin main
