@@ -54,11 +54,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(2),  // sort chips
-            Constraint::Min(8),     // table
-            Constraint::Length(11), // drill-in panel
-            Constraint::Length(3),  // footer
+            Constraint::Length(3), // header
+            Constraint::Length(2), // sort chips
+            Constraint::Min(8),    // table (`Min` so it grows on taller terminals)
+            Constraint::Length(8), // drill-in panel — top-5 hosts + header + "others" + borders
+            Constraint::Length(3), // footer
         ])
         .split(area);
 

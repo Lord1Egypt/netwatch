@@ -2,6 +2,12 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.1] - 2026-05-23
+
+### Fixed
+- **TOP CONNECTIONS panel on the Dashboard now respects the fade setting.** v0.21.0 wired the fade through every chart and every table renderer except the dashboard's TOP CONNECTIONS rows — they're rendered through their own per-row path that bypassed the table-fade hook. Rows 1..N now fade top-bright / bottom-dim like every other table; row 0 (the visually-highlighted "rank 1" row that already carries `selection_bg`) stays at full intensity.
+- **Processes tab no longer cuts the main list to 5 rows on typical terminals.** The layout reserved a fixed 11 rows for the drill-in panel below the table, which left the table with `Min(8)` — yielding only ~5 visible rows after borders + header on a 27-row terminal. The drill-in only shows 5 host rows + header + "others" + borders (≈ 8 rows needed), so the reservation was 3 rows wasted. Dropped to `Length(8)`; the main process table now gets 3 more rows on the same terminal.
+
 ## [0.21.0] - 2026-05-23
 
 ### Fixed

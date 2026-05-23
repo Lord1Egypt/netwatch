@@ -664,6 +664,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
     });
 
     let max_rows = inner.height.saturating_sub(2) as usize;
+    let rendered_rows = rows.iter().take(max_rows).count();
     for (i, r) in rows.iter().take(max_rows).enumerate() {
         let key = (r.process.clone(), r.host.clone());
         let history_active = app
@@ -688,7 +689,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
             Some(rtt) => format!("{:.0}ms", rtt),
             None => "—".to_string(),
         };
-        let row_line = Line::from(vec![
+        let spans = vec![
             Span::styled("● ", Style::default().fg(dot_color)),
             Span::styled(
                 format!("{:<16}", truncate(&r.process, 16)),
@@ -712,7 +713,17 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
                 format!("{:>5}", rtt_str),
                 Style::default().fg(t.text_primary),
             ),
-        ]);
+        ];
+        // Row 0 is the visually-highlighted top row (selection_bg) and
+        // stays at full intensity. Rows below fade top-bright →
+        // bottom-dim like the other tables when fade is on.
+        let spans = if app.user_config.graph_fade && i > 0 {
+            let alpha = crate::graph::row_fade_alpha(i, rendered_rows);
+            crate::graph::fade_spans_fg(spans, t.bg, alpha)
+        } else {
+            spans
+        };
+        let row_line = Line::from(spans);
         let row_area = Rect {
             x: inner.x + 1,
             y: row_y,
