@@ -11,10 +11,18 @@
 //! 2. Add it to `classify_once` in priority order — cheap pattern-match
 //!    classifiers first, parser-based ones later.
 
+pub mod bittorrent;
 pub mod dns;
+pub mod ftp;
 pub mod http;
+pub mod llmnr;
+pub mod mqtt;
+pub mod netbios;
 pub mod quic;
+pub mod snmp;
+pub mod ssdp;
 pub mod ssh;
+pub mod stun;
 pub mod tls;
 
 use serde::{Deserialize, Serialize};
@@ -35,9 +43,32 @@ pub enum AppProtocol {
     Dns { qname: String, qtype: u16 },
     /// SSH server / client banner line, e.g. `SSH-2.0-OpenSSH_9.0`.
     Ssh { version: String },
-    /// QUIC Initial packet detected. SNI extraction is deferred (header
-    /// protection makes it non-trivial); `None` for now.
+    /// QUIC Initial packet detected; SNI extracted across reassembled
+    /// CRYPTO frames in `collectors::packets`.
     Quic { sni: Option<String> },
+    /// MQTT control packet. Variant carries CONNECT client-id when seen.
+    Mqtt { client_id: Option<String> },
+    /// STUN binding request / response (RFC 5389) — message method + class.
+    Stun { message_type: String },
+    /// BitTorrent peer-wire handshake (BEP 3). Info hash hex if extracted.
+    BitTorrent { info_hash: Option<String> },
+    /// NetBIOS name service / datagram / session traffic.
+    NetBios { service: String },
+    /// SNMP message — version (1/2c/3) and community string when readable.
+    Snmp {
+        version: String,
+        community: Option<String>,
+    },
+    /// SSDP control message — `NOTIFY` or `M-SEARCH` with optional ST/NT.
+    Ssdp {
+        method: String,
+        target: Option<String>,
+    },
+    /// FTP control channel command (USER / PASS / RETR / STOR / ...).
+    Ftp { command: String },
+    /// LLMNR query (RFC 4795) — wire-format-identical to DNS but on port
+    /// 5355. Carries qname + qtype like the DNS variant.
+    Llmnr { qname: String, qtype: u16 },
 }
 
 pub trait Classifier {
@@ -48,30 +79,102 @@ pub trait Classifier {
 
 /// Run all classifiers in priority order, returning the first match.
 /// Cheap pattern-match classifiers go first; parser-based ones last.
-pub fn classify_once(payload: &[u8], is_tcp: bool) -> Option<AppProtocol> {
-    if payload.len() < 16 {
+///
+/// Port hints disambiguate protocols that are wire-format-identical
+/// (LLMNR vs. DNS, SSDP vs. HTTP) or strongly port-locked (SNMP, MQTT,
+/// NetBIOS) — pass either side's port and we'll match accordingly.
+pub fn classify_once(
+    payload: &[u8],
+    is_tcp: bool,
+    src_port: u16,
+    dst_port: u16,
+) -> Option<AppProtocol> {
+    if payload.len() < 4 {
         return None;
     }
-    // Cheapest first: starts-with byte patterns.
-    if let Some(p) = ssh::SshClassifier.classify(payload, is_tcp) {
-        return Some(p);
+    let any_port = |p: u16| src_port == p || dst_port == p;
+    let any_port_in = |range: std::ops::RangeInclusive<u16>| {
+        range.contains(&src_port) || range.contains(&dst_port)
+    };
+
+    if is_tcp {
+        // BitTorrent handshake: cheap magic-byte check.
+        if let Some(p) = bittorrent::BitTorrentClassifier.classify(payload, is_tcp) {
+            return Some(p);
+        }
+        if let Some(p) = ssh::SshClassifier.classify(payload, is_tcp) {
+            return Some(p);
+        }
+        // FTP control channel: port 21 is canonical. Skip the heavy
+        // banner scan on other ports so HTTP/SMTP/IMAP traffic isn't
+        // mistaken for FTP responses ("220 ...").
+        if any_port(21) {
+            if let Some(p) = ftp::FtpClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        if let Some(p) = http::HttpClassifier.classify(payload, is_tcp) {
+            return Some(p);
+        }
+        if let Some(p) = tls::TlsClassifier.classify(payload, is_tcp) {
+            return Some(p);
+        }
+        // MQTT control packets travel over TCP, typically on 1883/8883.
+        if any_port(1883) || any_port(8883) {
+            if let Some(p) = mqtt::MqttClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        // NetBIOS session service over TCP/139 (CIFS sessions).
+        if any_port(139) {
+            if let Some(p) = netbios::NetBiosClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
     }
-    // HTTP: ASCII method prefix + httparse for confirmation.
-    if let Some(p) = http::HttpClassifier.classify(payload, is_tcp) {
-        return Some(p);
-    }
-    // TLS: 0x16 0x03 prefix gate then full handshake parse.
-    if let Some(p) = tls::TlsClassifier.classify(payload, is_tcp) {
-        return Some(p);
-    }
-    // UDP-only classifiers: QUIC first (cheap byte check), then DNS.
+
     if !is_tcp {
         if let Some(p) = quic::QuicClassifier.classify(payload, is_tcp) {
             return Some(p);
         }
+        // SSDP on UDP/1900 (HTTP-like text payload). Check before DNS
+        // because its `M-SEARCH * HTTP/1.1` looks like nothing else.
+        if any_port(1900) {
+            if let Some(p) = ssdp::SsdpClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        // LLMNR on UDP/5355 — wire-identical to DNS. Disambiguate by port
+        // so the LLMNR variant gets used.
+        if any_port(5355) {
+            if let Some(p) = llmnr::LlmnrClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        // SNMP on UDP/161 (queries) and 162 (traps).
+        if any_port(161) || any_port(162) {
+            if let Some(p) = snmp::SnmpClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        // NetBIOS name service (UDP/137) and datagram service (UDP/138).
+        if any_port_in(137..=138) {
+            if let Some(p) = netbios::NetBiosClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        // STUN on 3478 traditionally; many WebRTC stacks use ephemeral
+        // ports, but the magic cookie at offset 4 is unambiguous. Run
+        // the classifier on every UDP flow that has at least 20 bytes.
+        if let Some(p) = stun::StunClassifier.classify(payload, is_tcp) {
+            return Some(p);
+        }
+        // DNS (and mDNS, port 5353). Wire-format check is what gates it
+        // so we can leave the port filter loose.
         if let Some(p) = dns::DnsClassifier.classify(payload, is_tcp) {
             return Some(p);
         }
     }
+
     None
 }

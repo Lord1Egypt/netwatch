@@ -2,6 +2,76 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.20.0] - 2026-05-23
+
+### Added — DPI protocol breadth
+
+Nine new application-layer classifiers complete the long-tail of common
+LAN / IoT / ops protocols that previously rendered as generic "TCP" /
+"UDP" with port-number labels:
+
+- **MQTT** (TCP/1883, /8883) — IoT pub/sub. Decodes the variable-length
+  fixed header, recognizes CONNECT packets, extracts the MQTT 3.1 /
+  3.1.1 / 5.0 client-id when present.
+- **STUN** (RFC 5389, any UDP) — NAT-traversal / WebRTC. Magic-cookie
+  (0x2112A442) check at offset 4 makes detection unambiguous; surfaces
+  the message method + class (e.g. `BindingRequest`,
+  `BindingSuccessResponse`, `AllocateErrorResponse`).
+- **BitTorrent** (TCP, any port) — BEP 3 peer-wire handshake. Detects
+  the 19-byte protocol-string magic + 8 reserved bytes; extracts the
+  20-byte info-hash and renders as 40-char hex.
+- **NetBIOS** — three flavours: name service (UDP/137), datagram
+  service (UDP/138), session service (TCP/139). Surfaces the message
+  type per flavour (e.g. `Session Request`, `Name Query`,
+  `Datagram Direct Unique`).
+- **SNMP** (UDP/161, /162) — ASN.1 BER decoder for the SEQUENCE +
+  INTEGER (version) + OCTET STRING (community) prefix. Surfaces
+  version `v1` / `v2c` / `v3` and the community string for v1/v2c —
+  useful both for "what monitoring traffic is on this network" and as
+  a security tell when default communities like `public` / `private`
+  appear in plaintext.
+- **SSDP** (UDP/1900) — UPnP service discovery. HTTP-like text parser
+  recognizes `M-SEARCH`, `NOTIFY`, and 200 OK responses; extracts the
+  search target (`ST:` / `NT:` header value).
+- **FTP** (TCP/21, control channel) — recognizes 3-digit server reply
+  codes (`220`, `230`, `530`, …) and a curated allowlist of client
+  command verbs (USER, PASS, RETR, STOR, LIST, …) so HTTP/SMTP banners
+  starting with "220 …" don't get misclassified.
+- **LLMNR** (UDP/5355) — Link-Local Multicast Name Resolution.
+  Wire-format-identical to DNS so the existing DNS parser is reused,
+  rebadged as `Llmnr` when port 5355 is on the flow.
+- **IGMP** (IP protocol 2) — multicast group management. Doesn't create
+  a stream (no TCP/UDP), but the Packets-tab INFO column now decodes
+  the message type (`Membership Query`, `v2 Membership Report`, `Leave
+  Group`, etc.) and the group address.
+
+### Changed
+- `AppProtocol` enum gained 8 new variants (everything except IGMP,
+  which lives at the IP layer). Variants serialize via existing
+  `#[serde]` derives so Flight Recorder bundles remain
+  forward-compatible.
+- `classify_once` now takes `src_port` and `dst_port` so port-locked
+  classifiers (LLMNR vs. DNS, SNMP, MQTT, NetBIOS, SSDP, FTP) can
+  dispatch correctly without expanding the per-classifier signature.
+- Connections-tab `APP` column, filter prefixes (`app:mqtt`,
+  `app:snmp`, `app:ssdp`, …), Packets-tab `INFO` column + L7
+  color-coding, all updated to render the new protocols.
+
+### Notes
+
+This closes the `DPI protocol breadth` row on the netwatch-vs-rustnet
+comparison that's been red since rustnet shipped its long-tail. After
+v0.20.0 netwatch has 13 shipped classifiers (TLS / QUIC with Initial
+decrypt / DNS / HTTP / SSH / MQTT / STUN / BitTorrent / NetBIOS /
+SNMP / SSDP / FTP / LLMNR) + IGMP at the IP layer + 25 port labels.
+rustnet has 17 stream classifiers; netwatch covers all the operationally
+common ones plus the QUIC depth (Initial decryption) rustnet doesn't.
+
+37 new unit tests across the 8 classifier files cover the success
+case, the rejection of look-alike traffic (HTTP on FTP port, garbage
+bytes on STUN port, etc.), and protocol-side variation (CONNECT vs
+non-CONNECT MQTT, v1 vs v2c SNMP, M-SEARCH vs NOTIFY SSDP).
+
 ## [0.19.0] - 2026-05-23
 
 ### Added

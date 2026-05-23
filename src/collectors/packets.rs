@@ -595,7 +595,7 @@ impl StreamTracker {
 
         if !stream.app_protocol_attempted && payload.len() >= 16 {
             let slice = &payload[..payload.len().min(MAX_CLASSIFY_BYTES)];
-            stream.app_protocol = crate::dpi::classify_once(slice, is_tcp);
+            stream.app_protocol = crate::dpi::classify_once(slice, is_tcp, src_port, dst_port);
             // Settle the flag only on a confident answer. A bare
             // `Quic { sni: None }` means "we know this is QUIC but
             // haven't extracted the hostname yet" — keep trying on
@@ -1183,6 +1183,14 @@ fn parse_transport(
             let r = parse_icmp(data, src_ip, dst_ip, details);
             (r.0, r.1, r.2, r.3, data.len(), None, None)
         }
+        2 => {
+            // IGMP — IP protocol 2. Not a TCP/UDP flow; no stream is
+            // created and DPI classification doesn't run. We decode
+            // the message type here so the Packets-tab INFO column
+            // shows something more useful than just "IGMP".
+            let r = parse_igmp(data, src_ip, dst_ip, details);
+            (r.0, r.1, r.2, r.3, data.len(), None, None)
+        }
         58 => {
             let r = parse_icmpv6(data, src_ip, dst_ip, details);
             (r.0, r.1, r.2, r.3, data.len(), None, None)
@@ -1361,6 +1369,49 @@ fn parse_udp(
         "UDP".into()
     };
     (proto, Some(src_port), Some(dst_port), info, 8, None, None)
+}
+
+fn parse_igmp(
+    data: &[u8],
+    src_ip: &str,
+    dst_ip: &str,
+    details: &mut Vec<String>,
+) -> (String, Option<u16>, Option<u16>, String) {
+    if data.is_empty() {
+        return (
+            "IGMP".into(),
+            None,
+            None,
+            format!("{} → {} IGMP (truncated)", src_ip, dst_ip),
+        );
+    }
+    let msg = match data[0] {
+        0x11 => "Membership Query",
+        0x12 => "v1 Membership Report",
+        0x16 => "v2 Membership Report",
+        0x17 => "Leave Group",
+        0x22 => "v3 Membership Report",
+        _ => "Unknown",
+    };
+    // For non-v3 IGMP the group address sits at bytes 4..8.
+    let group = if data.len() >= 8 && data[0] != 0x22 {
+        Some(format!("{}.{}.{}.{}", data[4], data[5], data[6], data[7]))
+    } else {
+        None
+    };
+    details.push(format!(
+        "IGMP: {}{}",
+        msg,
+        group
+            .as_deref()
+            .map(|g| format!(" group={}", g))
+            .unwrap_or_default()
+    ));
+    let info = match &group {
+        Some(g) => format!("{} → {} IGMP {} {}", src_ip, dst_ip, msg, g),
+        None => format!("{} → {} IGMP {}", src_ip, dst_ip, msg),
+    };
+    ("IGMP".into(), None, None, info)
 }
 
 fn parse_icmp(
@@ -2783,6 +2834,14 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
             Some(crate::dpi::AppProtocol::Http { .. }) => "http" == tag.as_str(),
             Some(crate::dpi::AppProtocol::Dns { .. }) => "dns" == tag.as_str(),
             Some(crate::dpi::AppProtocol::Ssh { .. }) => "ssh" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Mqtt { .. }) => "mqtt" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Stun { .. }) => "stun" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::BitTorrent { .. }) => "bittorrent" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::NetBios { .. }) => "netbios" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Snmp { .. }) => "snmp" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Ssdp { .. }) => "ssdp" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Ftp { .. }) => "ftp" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Llmnr { .. }) => "llmnr" == tag.as_str(),
             None => false,
         },
         FilterExpr::Sni(needle) => match &pkt.app_protocol {

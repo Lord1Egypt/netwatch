@@ -230,6 +230,28 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 }) => format!("HTTP {} {}", method, h),
                 Some(crate::dpi::AppProtocol::Dns { qname, .. }) => format!("DNS {}", qname),
                 Some(crate::dpi::AppProtocol::Ssh { version }) => version.clone(),
+                Some(crate::dpi::AppProtocol::Llmnr { qname, .. }) => format!("LLMNR {}", qname),
+                Some(crate::dpi::AppProtocol::Mqtt {
+                    client_id: Some(c), ..
+                }) => format!("MQTT {}", c),
+                Some(crate::dpi::AppProtocol::Mqtt { client_id: None }) => "MQTT".to_string(),
+                Some(crate::dpi::AppProtocol::Stun { message_type }) => {
+                    format!("STUN {}", message_type)
+                }
+                Some(crate::dpi::AppProtocol::BitTorrent { .. }) => "BitTorrent".to_string(),
+                Some(crate::dpi::AppProtocol::NetBios { service }) => {
+                    format!("NetBIOS {}", service)
+                }
+                Some(crate::dpi::AppProtocol::Snmp { version, .. }) => format!("SNMP {}", version),
+                Some(crate::dpi::AppProtocol::Ssdp {
+                    method,
+                    target: Some(t),
+                }) => format!("SSDP {} {}", method, t),
+                Some(crate::dpi::AppProtocol::Ssdp {
+                    method,
+                    target: None,
+                }) => format!("SSDP {}", method),
+                Some(crate::dpi::AppProtocol::Ftp { command }) => format!("FTP {}", command),
                 _ => pkt.info.clone(),
             };
             // Color the INFO column by L7 app protocol so the eye can
@@ -238,15 +260,27 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             // result is attached.
             let info_style = match &pkt.app_protocol {
                 Some(crate::dpi::AppProtocol::Tls { .. })
-                | Some(crate::dpi::AppProtocol::Quic { .. }) => {
+                | Some(crate::dpi::AppProtocol::Quic { .. })
+                | Some(crate::dpi::AppProtocol::Mqtt { .. }) => {
                     Style::default().fg(app.theme.status_info)
                 }
-                Some(crate::dpi::AppProtocol::Http { .. }) => {
+                Some(crate::dpi::AppProtocol::Http { .. })
+                | Some(crate::dpi::AppProtocol::Ftp { .. }) => {
                     Style::default().fg(app.theme.status_good)
                 }
-                Some(crate::dpi::AppProtocol::Dns { .. }) => Style::default().fg(app.theme.brand),
-                Some(crate::dpi::AppProtocol::Ssh { .. }) => {
+                Some(crate::dpi::AppProtocol::Dns { .. })
+                | Some(crate::dpi::AppProtocol::Llmnr { .. })
+                | Some(crate::dpi::AppProtocol::Snmp { .. }) => {
+                    Style::default().fg(app.theme.brand)
+                }
+                Some(crate::dpi::AppProtocol::Ssh { .. })
+                | Some(crate::dpi::AppProtocol::Ssdp { .. })
+                | Some(crate::dpi::AppProtocol::NetBios { .. }) => {
                     Style::default().fg(app.theme.status_warn)
+                }
+                Some(crate::dpi::AppProtocol::Stun { .. })
+                | Some(crate::dpi::AppProtocol::BitTorrent { .. }) => {
+                    Style::default().fg(app.theme.text_muted)
                 }
                 None => Style::default(),
             };

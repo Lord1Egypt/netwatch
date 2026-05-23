@@ -306,6 +306,29 @@ pub(crate) fn render_app_protocol(p: &Option<crate::dpi::AppProtocol>) -> String
         Some(Ssh { version }) => format!("SSH {}", version),
         Some(Quic { sni: Some(h) }) => format!("QUIC {}", h),
         Some(Quic { sni: None }) => "QUIC".into(),
+        Some(Mqtt { client_id: Some(c) }) => format!("MQTT {}", c),
+        Some(Mqtt { client_id: None }) => "MQTT".into(),
+        Some(Stun { message_type }) => format!("STUN {}", message_type),
+        Some(BitTorrent { .. }) => "BitTorrent".into(),
+        Some(NetBios { service }) => format!("NetBIOS {}", service),
+        Some(Snmp {
+            version,
+            community: Some(c),
+        }) => format!("SNMP {} {}", version, c),
+        Some(Snmp {
+            version,
+            community: None,
+        }) => format!("SNMP {}", version),
+        Some(Ssdp {
+            method,
+            target: Some(t),
+        }) => format!("SSDP {} {}", method, t),
+        Some(Ssdp {
+            method,
+            target: None,
+        }) => format!("SSDP {}", method),
+        Some(Ftp { command }) => format!("FTP {}", command),
+        Some(Llmnr { qname, .. }) => format!("LLMNR {}", qname),
     }
 }
 
@@ -318,6 +341,14 @@ fn app_protocol_tag(p: &Option<crate::dpi::AppProtocol>) -> Option<&'static str>
         Some(Dns { .. }) => Some("dns"),
         Some(Ssh { .. }) => Some("ssh"),
         Some(Quic { .. }) => Some("quic"),
+        Some(Mqtt { .. }) => Some("mqtt"),
+        Some(Stun { .. }) => Some("stun"),
+        Some(BitTorrent { .. }) => Some("bittorrent"),
+        Some(NetBios { .. }) => Some("netbios"),
+        Some(Snmp { .. }) => Some("snmp"),
+        Some(Ssdp { .. }) => Some("ssdp"),
+        Some(Ftp { .. }) => Some("ftp"),
+        Some(Llmnr { .. }) => Some("llmnr"),
     }
 }
 
@@ -345,10 +376,11 @@ fn app_protocol_color(
     use crate::dpi::AppProtocol::*;
     match p {
         None => t.text_muted,
-        Some(Tls { .. }) | Some(Quic { .. }) => t.status_info, // cyan-ish
-        Some(Http { .. }) => t.status_good,                    // green
-        Some(Dns { .. }) => t.brand,                           // brand accent
-        Some(Ssh { .. }) => t.status_warn,                     // yellow
+        Some(Tls { .. }) | Some(Quic { .. }) | Some(Mqtt { .. }) => t.status_info, // cyan-ish
+        Some(Http { .. }) | Some(Ftp { .. }) => t.status_good,                     // green
+        Some(Dns { .. }) | Some(Llmnr { .. }) | Some(Snmp { .. }) => t.brand,      // brand accent
+        Some(Ssh { .. }) | Some(Ssdp { .. }) | Some(NetBios { .. }) => t.status_warn, // yellow
+        Some(Stun { .. }) | Some(BitTorrent { .. }) => t.text_muted, // muted (transport-level)
     }
 }
 
