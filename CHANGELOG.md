@@ -2,6 +2,19 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.18.1] - 2026-05-23
+
+### Changed
+- **Traceroute now uses a native UDP+TTL implementation on Linux** instead of shelling out to `/usr/bin/traceroute`. Same root cause as the ping rewrite in v0.18.0: Landlock sets `PR_SET_NO_NEW_PRIVS=1`, which makes the kernel ignore the setcap on the system `traceroute` binary, so the subprocess returned EPERM under sandbox and the Topology view's hop list stayed empty. The new path opens a plain UDP socket, enables `IP_RECVERR`, and reads ICMP Time Exceeded / Port Unreachable replies from the kernel's error queue via `recvmsg(MSG_ERRQUEUE)` — no capabilities required.
+- Implementation note: `SO_RCVTIMEO` does not apply to error-queue reads, so the inner loop uses `poll(POLLERR)` with a 1 s deadline per probe to wait for the kernel to queue the ICMP error. Each probe targets a unique destination port (`33434 + ttl*3 + probe`) so the kernel can correlate the response back, matching the wire-level behaviour of the classic Van Jacobson traceroute.
+- Subprocess `traceroute` / `tracert` paths are preserved for IPv6 targets (the native path is IPv4-only today; IPv6 follows similar logic with `Ipv6RecvErr` and `IPV6_UNICAST_HOPS` and is tracked for later), for macOS (which lacks `IP_RECVERR` / `MSG_ERRQUEUE` in its BSD-derived stack), and for Windows.
+
+### Fixed
+- **Topology view hops now populate under the sandbox.** Verified end-to-end on Linux against `1.1.1.1` (4 hops: orb-gateway → home-router → ISP next-hop → target, RTTs matching system `traceroute` exactly) and `192.168.0.54` (2 hops, target reached at hop 2). `examples/traceroute_under_sandbox.rs` reproduces the test.
+
+### Notes
+- Together with v0.18.0's native ICMP ping, the v0.17.x sandbox feature now has no known UX regressions versus v0.16.x. Both `health probes` and `topology` work with `Landlock ABI Vx, 4 caps dropped` active. The `--no-sandbox` workaround for either feature is no longer required.
+
 ## [0.18.0] - 2026-05-23
 
 ### Changed

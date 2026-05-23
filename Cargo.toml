@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -93,7 +93,7 @@ default = ["ebpf"]
 ebpf = ["dep:netwatch-sdk"]
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["net", "ioctl", "hostname"] }
+nix = { version = "0.29", features = ["net", "ioctl", "hostname", "uio", "poll"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
 # pcap + eBPF are up, then restrict filesystem and network via Landlock.
