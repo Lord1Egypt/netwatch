@@ -9,12 +9,23 @@
 //! - Read `/etc/shadow`         → expected EACCES (Landlock or DAC)
 //! - Open new raw socket        → expected EPERM (caps dropped)
 //!
-//! Exits 0 on success, 1 on unexpected outcome.
+//! Exits 0 on success, 1 on unexpected outcome. Linux-only — the
+//! sandbox backend is Linux-only, so the example compiles to a no-op
+//! stub on macOS / Windows so CI can build the workspace `--all-targets`.
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    println!("sandbox_smoke is Linux-only; no-op on this platform.");
+}
+
+#[cfg(target_os = "linux")]
 use netwatch::config::NetwatchConfig;
+#[cfg(target_os = "linux")]
 use netwatch::sandbox::{self, Mode, SandboxPaths};
+#[cfg(target_os = "linux")]
 use std::fs;
 
+#[cfg(target_os = "linux")]
 fn main() {
     let cfg = NetwatchConfig::default();
     let paths = SandboxPaths::from_config(&cfg);
