@@ -2,6 +2,12 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.6] - 2026-05-26
+
+### Fixed
+- **Saving settings under the Linux sandbox no longer fails with "Permission denied (os error 13)".** The Landlock allow-list put the config dir (`~/.config/netwatch/`) in the *read-only* bucket, but `NetwatchConfig::save()` writes `config.toml` here whenever a user changes a setting in the overlay (`S` → edit → `S` to save). On kernels new enough to enforce Landlock (≥5.13) the write was rejected and the user saw EACCES — worst of all, this blocked them from flipping the Sandbox setting itself to escape the restriction. Moved the config dir to the read-write list. Found on a Linux NUC trying to disable the sandbox via the Settings overlay.
+- **Gateway probe no longer reports a fake 100% loss on systems with restrictive `ping_group_range`.** Even after v0.21.5 fixed the DNS probe, Gateway stayed on ICMP — which is unreachable on kernels with `net.ipv4.ping_group_range = 1 0` once the sandbox has dropped `CAP_NET_RAW` and Landlock has set `NO_NEW_PRIVS` (causing the kernel to ignore the file-cap on `/usr/bin/ping`). Added a TCP-connect fallback that runs *only* when ICMP returns 100% loss: tries port 80, 443, 53 in order (stopping at the first one to respond), counts `ConnectionRefused` as success because a RST proves the host is up. Steady-state cost is one port × 3 probes (cheap); only the genuinely-down-or-firewalled case pays the worst-case 9 connect attempts. ICMP-rich environments (default kernels, no sandbox) keep the old behavior — the TCP path doesn't run at all when ICMP succeeds even partially.
+
 ## [0.21.5] - 2026-05-26
 
 ### Fixed

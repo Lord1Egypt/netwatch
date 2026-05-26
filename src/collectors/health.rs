@@ -68,7 +68,7 @@ impl HealthProber {
             // published snapshot, then swaps it in. The deep-clone is cheap:
             // `HealthStatus` contains at most ~60 history entries per series.
             if let Some(gw) = gw.as_deref() {
-                let (rtt, loss) = run_ping(gw);
+                let (rtt, loss) = run_gateway_probe(gw);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_gw")).clone();
                 next.gateway_rtt_ms = rtt;
                 next.gateway_loss_pct = loss;
@@ -101,6 +101,99 @@ impl HealthProber {
             busy.store(false, Ordering::SeqCst);
         });
     }
+}
+
+/// Gateway probe: try ICMP first (works in the normal case), fall back to
+/// TCP-connect if ICMP comes back at 100% loss.
+///
+/// Why the fallback: on Linux hosts with `net.ipv4.ping_group_range = 1 0`
+/// the kernel refuses unprivileged SOCK_DGRAM ICMP outright. Combined with
+/// the sandbox dropping CAP_NET_RAW and Landlock setting NO_NEW_PRIVS
+/// (which makes `/usr/bin/ping`'s file-cap get ignored on exec), every
+/// ICMP path is blocked and the Gateway card sits at 100% loss even when
+/// the router is up. A 1-RTT TCP connect to a port the router is almost
+/// certain to be listening on (admin UI on 80/443, DNS forwarder on 53)
+/// answers the same question — is the gateway responsive? — without any
+/// privileges. `ConnectionRefused` counts as success because the host
+/// returned a RST, which proves it's up.
+///
+/// We only fall back when ICMP returns 100% loss; partial ICMP success
+/// (e.g. 1/3 probes) is a real signal we should preserve. This also means
+/// the extra TCP work only runs on hosts that actually need it.
+fn run_gateway_probe(target: &str) -> (Option<f64>, f64) {
+    let (rtt, loss) = run_ping(target);
+    if loss < 100.0 {
+        return (rtt, loss);
+    }
+    // ICMP completely failed — could be sandbox/kernel restrictions,
+    // could be a genuinely-firewalled host. Try TCP.
+    run_tcp_probe(target)
+}
+
+/// TCP-connect probe used as the gateway-ICMP fallback. Walks a small list
+/// of ports that home/SOHO routers almost always have something listening
+/// on, returning the first port that gets *any* response (3WHS success or
+/// RST). The "probes per port" loop matches the ICMP path's 3-probe
+/// averaging so the RTT history widget gets comparable numbers.
+fn run_tcp_probe(target: &str) -> (Option<f64>, f64) {
+    use std::net::IpAddr;
+
+    let addr: IpAddr = match target.parse() {
+        Ok(a) => a,
+        Err(_) => return (None, 100.0),
+    };
+
+    // 80 / 443 / 53 covers ≥95% of home + SOHO gateways. Ordered by how
+    // commonly each is exposed on the gateway interface itself: most
+    // routers serve the admin UI on 80 (or redirect to 443) and many
+    // forward DNS on 53. We stop on the first port that yields a non-
+    // 100%-loss result so the steady-state cost is one port × 3 probes.
+    const PORTS: &[u16] = &[80, 443, 53];
+    for &port in PORTS {
+        let (rtt, loss) = run_tcp_probe_port(addr, port);
+        if loss < 100.0 {
+            return (rtt, loss);
+        }
+    }
+    (None, 100.0)
+}
+
+fn run_tcp_probe_port(addr: std::net::IpAddr, port: u16) -> (Option<f64>, f64) {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    const PROBES: usize = 3;
+    let dest = SocketAddr::new(addr, port);
+    let mut rtts = Vec::with_capacity(PROBES);
+
+    for _ in 0..PROBES {
+        let send_t = Instant::now();
+        match TcpStream::connect_timeout(&dest, Duration::from_secs(1)) {
+            Ok(_) => {
+                // 3-way handshake completed — host is alive and the port
+                // is open. Drop the stream immediately; we don't want to
+                // hold connections to the gateway.
+                rtts.push(send_t.elapsed().as_secs_f64() * 1000.0);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                // RST received — host is alive but the port is closed.
+                // For "is the gateway up?" this is just as good as a
+                // successful connect.
+                rtts.push(send_t.elapsed().as_secs_f64() * 1000.0);
+            }
+            // TimedOut / NetworkUnreachable / HostUnreachable / etc. all
+            // count as loss — silent or routing-level rejection.
+            Err(_) => {}
+        }
+    }
+
+    let avg = if rtts.is_empty() {
+        None
+    } else {
+        Some(rtts.iter().sum::<f64>() / rtts.len() as f64)
+    };
+    let loss = (PROBES - rtts.len()) as f64 / PROBES as f64 * 100.0;
+    (avg, loss)
 }
 
 /// Probe a DNS server by sending a real DNS query over UDP/53 and timing
@@ -588,5 +681,67 @@ Approximate round trip times in milli-seconds:
             let parsed = u16::from_be_bytes([q[0], q[1]]);
             assert_eq!(parsed, id, "id round-trip failed for {id:#x}");
         }
+    }
+
+    // ── TCP gateway-probe tests ───────────────────────────────────────
+
+    #[test]
+    fn tcp_probe_port_succeeds_against_local_listener() {
+        // Bind an ephemeral TCP port, leave it accept-able, then probe it.
+        // We expect 0% loss + a small but non-None RTT because all three
+        // probes complete the 3WHS.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+
+        // Drain accept() in a background thread so connect() doesn't
+        // block on listen backlog quirks.
+        let _t = std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            }
+        });
+
+        let (rtt, loss) = run_tcp_probe_port("127.0.0.1".parse().unwrap(), port);
+        assert_eq!(loss, 0.0, "expected 0% loss against a live local listener");
+        assert!(rtt.is_some(), "expected an RTT measurement");
+    }
+
+    #[test]
+    fn tcp_probe_port_treats_connection_refused_as_success() {
+        // Find a port nothing is listening on by binding then dropping.
+        // The follow-up `connect()` should get ECONNREFUSED, which the
+        // probe treats as "host alive" (RST proves the host responded).
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let (rtt, loss) = run_tcp_probe_port("127.0.0.1".parse().unwrap(), port);
+        assert_eq!(
+            loss, 0.0,
+            "ECONNREFUSED should count as success (host responded with RST)"
+        );
+        assert!(rtt.is_some());
+    }
+
+    #[test]
+    fn tcp_probe_port_times_out_to_unrouted_address() {
+        // 192.0.2.0/24 is reserved for documentation (RFC 5737) and
+        // should be unrouted — connect_timeout will hit the 1s timer.
+        // Mark as #[ignore] in CI if your environment proxies / blocks
+        // outbound to TEST-NET addresses with custom routing; locally
+        // this hits ETIMEDOUT.
+        let (rtt, loss) = run_tcp_probe_port("192.0.2.1".parse().unwrap(), 80);
+        // Either 100% loss (timeout) or some flavor of NetworkUnreachable
+        // — both are acceptable. The test guards against the probe
+        // *succeeding* against an unrouted host, which would mean the
+        // success detection is too permissive.
+        assert!(
+            loss > 0.0,
+            "probe must report loss for unrouted host (got rtt={rtt:?}, loss={loss})"
+        );
     }
 }

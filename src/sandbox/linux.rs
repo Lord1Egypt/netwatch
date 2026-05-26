@@ -147,9 +147,6 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
         out.push(PathBuf::from(path));
     }
 
-    if let Some(p) = &paths.config_dir {
-        out.push(p.clone());
-    }
     if let Some(p) = &paths.geoip_db_dir {
         out.push(p.clone());
     }
@@ -165,6 +162,16 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
 /// read-only list.
 fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
     let mut out = Vec::new();
+
+    // The config dir needs write access too — `NetwatchConfig::save()`
+    // writes config.toml here when the user changes a setting in the
+    // overlay. If this is read-only the user gets "Permission denied
+    // (os error 13)" and, worst of all, can't even flip the sandbox
+    // setting itself to escape. Found on a Linux NUC trying to disable
+    // the sandbox via the Settings overlay.
+    if let Some(p) = &paths.config_dir {
+        out.push(p.clone());
+    }
 
     if let Some(p) = &paths.cache_dir {
         out.push(p.clone());
