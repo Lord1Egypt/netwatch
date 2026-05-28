@@ -15,6 +15,8 @@ pub mod bittorrent;
 pub mod dns;
 pub mod ftp;
 pub mod http;
+pub mod ja4;
+pub mod ja4_db;
 pub mod llmnr;
 pub mod mqtt;
 pub mod netbios;
@@ -41,6 +43,11 @@ pub enum AppProtocol {
         alpn: Option<String>,
         #[serde(default)]
         ech: bool,
+        /// JA4 fingerprint (Foxio spec) of the ClientHello. `None` when
+        /// the ClientHello was malformed enough that fingerprinting
+        /// couldn't run; otherwise always Some(_).
+        #[serde(default)]
+        ja4: Option<String>,
     },
     /// HTTP/1.x request line + `Host:` header.
     Http {
@@ -60,6 +67,11 @@ pub enum AppProtocol {
         sni: Option<String>,
         #[serde(default)]
         ech: bool,
+        /// JA4Q fingerprint (Foxio spec, `q` protocol prefix) of the
+        /// reassembled QUIC ClientHello. `None` when reassembly /
+        /// decryption fell short of producing a parseable ClientHello.
+        #[serde(default)]
+        ja4: Option<String>,
     },
     /// MQTT control packet. Variant carries CONNECT client-id when seen.
     Mqtt { client_id: Option<String> },

@@ -291,6 +291,11 @@ fn matches_filter(conn: &crate::collectors::connections::Connection, filter: &st
             _ => false,
         };
     }
+    if let Some(stripped) = needle.strip_prefix("ja4:") {
+        return app_protocol_ja4(&conn.app_protocol)
+            .map(|j| j.to_lowercase().contains(stripped))
+            .unwrap_or(false);
+    }
 
     let process = conn.process_name.as_deref().unwrap_or("").to_lowercase();
     let state = conn.state.to_lowercase();
@@ -304,6 +309,28 @@ fn matches_filter(conn: &crate::collectors::connections::Connection, filter: &st
 
 /// Short cell text for the APP column. Empty when no DPI result.
 pub(crate) fn render_app_protocol(p: &Option<crate::dpi::AppProtocol>) -> String {
+    use crate::dpi::AppProtocol::*;
+    let base = render_app_protocol_base(p);
+    // Append the decoded JA4 client name when the bundled DB knows
+    // the fingerprint, so the APP column shows "HTTPS host (Chromium
+    // Browser)" without requiring the user to drill into a per-packet
+    // details view. Covers both TLS-over-TCP and QUIC (JA4Q). Unknown
+    // JA4s stay quiet — the column already gets crowded on narrow
+    // terminals.
+    let ja4 = match p {
+        Some(Tls { ja4: Some(j), .. }) => Some(j.as_str()),
+        Some(Quic { ja4: Some(j), .. }) => Some(j.as_str()),
+        _ => None,
+    };
+    if let Some(j) = ja4 {
+        if let Some(label) = crate::dpi::ja4_db::lookup(j) {
+            return format!("{base} ({label})");
+        }
+    }
+    base
+}
+
+fn render_app_protocol_base(p: &Option<crate::dpi::AppProtocol>) -> String {
     use crate::dpi::AppProtocol::*;
     match p {
         None => "—".into(),
@@ -334,10 +361,12 @@ pub(crate) fn render_app_protocol(p: &Option<crate::dpi::AppProtocol>) -> String
         Some(Quic {
             sni: Some(h),
             ech: true,
+            ..
         }) => format!("QUIC-ECH {}", h),
         Some(Quic {
             sni: None,
             ech: true,
+            ..
         }) => "QUIC-ECH".into(),
         Some(Quic { sni: Some(h), .. }) => format!("QUIC {}", h),
         Some(Quic { sni: None, .. }) => "QUIC".into(),
@@ -401,6 +430,14 @@ fn app_protocol_ech(p: &Option<crate::dpi::AppProtocol>) -> Option<bool> {
     match p {
         Some(Tls { ech, .. }) => Some(*ech),
         Some(Quic { ech, .. }) => Some(*ech),
+        _ => None,
+    }
+}
+
+fn app_protocol_ja4(p: &Option<crate::dpi::AppProtocol>) -> Option<&str> {
+    use crate::dpi::AppProtocol::*;
+    match p {
+        Some(Tls { ja4: Some(j), .. }) => Some(j.as_str()),
         _ => None,
     }
 }

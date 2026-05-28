@@ -96,6 +96,11 @@ pub struct AppUiState {
 
     // ── Packet-tab specifics ──
     pub packet_follow: bool,
+    /// When true, the detail pane grows to fill most of the visible
+    /// area (and the packet list shrinks). Toggled with `d`. Useful
+    /// when the selected packet has a lot of DPI/JA4 output that
+    /// doesn't fit in the default 16-line pane.
+    pub packet_detail_expanded: bool,
     pub stream_view_open: bool,
     pub stream_view_index: Option<u32>,
     pub stream_direction_filter: StreamDirectionFilter,
@@ -150,6 +155,7 @@ impl AppUiState {
             connection_filter_active: None,
 
             packet_follow: cfg.packet_follow,
+            packet_detail_expanded: false,
             stream_view_open: false,
             stream_view_index: None,
             stream_direction_filter: StreamDirectionFilter::Both,

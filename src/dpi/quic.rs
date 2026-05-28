@@ -101,25 +101,27 @@ impl Classifier for QuicClassifier {
         // host.com" via the file log. Levels: trace = single line per
         // Initial we touch; debug = stage-by-stage outcome.
         let result = try_extract_handshake_metadata(payload, &header);
-        let (sni, ech) = match &result {
+        let (sni, ech, ja4) = match &result {
             Ok(meta) if meta.sni.is_some() => {
                 tracing::trace!(
                     target: "netwatch::dpi::quic",
                     version = ?header.version_kind.map(version_label),
                     host = ?meta.sni,
                     ech = meta.ech,
+                    ja4 = ?meta.ja4,
                     "SNI extracted"
                 );
-                (meta.sni.clone(), meta.ech)
+                (meta.sni.clone(), meta.ech, meta.ja4.clone())
             }
             Ok(meta) => {
                 tracing::trace!(
                     target: "netwatch::dpi::quic",
                     version = ?header.version_kind.map(version_label),
                     ech = meta.ech,
+                    ja4 = ?meta.ja4,
                     "Initial decrypted but ClientHello has no SNI extension"
                 );
-                (None, meta.ech)
+                (None, meta.ech, meta.ja4.clone())
             }
             Err(reason) => {
                 tracing::trace!(
@@ -128,10 +130,10 @@ impl Classifier for QuicClassifier {
                     reason = %reason,
                     "SNI extraction failed; emitting bare QUIC tag"
                 );
-                (None, false)
+                (None, false, None)
             }
         };
-        Some(AppProtocol::Quic { sni, ech })
+        Some(AppProtocol::Quic { sni, ech, ja4 })
     }
 }
 

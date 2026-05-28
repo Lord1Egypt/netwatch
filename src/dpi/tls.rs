@@ -25,6 +25,7 @@ use tls_parser::{
     TlsMessage, TlsMessageHandshake,
 };
 
+use super::ja4::{self, Ja4Input};
 use super::{AppProtocol, Classifier};
 
 /// IANA TLS ExtensionType code point for `encrypted_client_hello`
@@ -43,18 +44,25 @@ pub fn has_ech(exts: &[TlsExtension]) -> bool {
 }
 
 /// Fields extracted from a bare TLS 1.3 ClientHello in a single
-/// extension-walk. Used by `dpi::quic` to read both SNI and ECH-presence
-/// out of a QUIC Initial's reassembled CRYPTO frames without parsing
-/// the extension list twice.
+/// extension-walk. Used by `dpi::quic` to read SNI, ECH-presence,
+/// and JA4Q out of a QUIC Initial's reassembled CRYPTO frames
+/// without parsing the extension list multiple times.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HandshakeMetadata {
     pub sni: Option<String>,
     pub ech: bool,
+    /// JA4Q (JA4 with `q` protocol prefix) computed from the
+    /// reassembled QUIC ClientHello. `None` if the handshake bytes
+    /// weren't a parseable ClientHello.
+    pub ja4: Option<String>,
 }
 
 /// Walk a bare TLS 1.3 handshake (no TLS record wrapper) and extract
-/// the SNI hostname and `encrypted_client_hello` flag. Returns all
-/// defaults (None / false) if the bytes aren't a parseable ClientHello.
+/// SNI, ECH flag, and JA4Q. Returns all defaults if the bytes aren't
+/// a parseable ClientHello. Always emits the `q` protocol prefix on
+/// JA4 because the only caller for bare-handshake input is the QUIC
+/// reassembly path; TLS-over-TCP runs through `TlsClassifier` which
+/// has its own JA4 computation with the `t` prefix.
 pub fn extract_handshake_metadata(handshake_bytes: &[u8]) -> HandshakeMetadata {
     let Ok((_, msg)) = parse_tls_message_handshake(handshake_bytes) else {
         return HandshakeMetadata::default();
@@ -70,15 +78,49 @@ pub fn extract_handshake_metadata(handshake_bytes: &[u8]) -> HandshakeMetadata {
     };
     let mut meta = HandshakeMetadata::default();
     meta.ech = has_ech(&exts);
+    let mut alpn_first_bytes: Option<&[u8]> = None;
+    let mut sig_algs: Vec<u16> = Vec::new();
+    let mut tls_version: u16 = ch.version.0;
     for ext in &exts {
-        if let TlsExtension::SNI(entries) = ext {
-            meta.sni = entries
-                .first()
-                .and_then(|(_, host)| std::str::from_utf8(host).ok())
-                .map(|s| s.to_string());
-            break;
+        match ext {
+            TlsExtension::SNI(entries) => {
+                meta.sni = entries
+                    .first()
+                    .and_then(|(_, host)| std::str::from_utf8(host).ok())
+                    .map(|s| s.to_string());
+            }
+            TlsExtension::ALPN(protos) => {
+                if let Some(first) = protos.first() {
+                    alpn_first_bytes = Some(*first);
+                }
+            }
+            TlsExtension::SignatureAlgorithms(algs) => {
+                sig_algs = algs.clone();
+            }
+            TlsExtension::SupportedVersions(vers) => {
+                let highest = vers
+                    .iter()
+                    .map(|v| v.0)
+                    .filter(|v| !ja4::is_grease(*v))
+                    .max();
+                if let Some(v) = highest {
+                    tls_version = v;
+                }
+            }
+            _ => {}
         }
     }
+    let cipher_codes: Vec<u16> = ch.ciphers.iter().map(|c| c.0).collect();
+    let ext_type_codes = ja4::extension_type_codes(ext_data);
+    meta.ja4 = Some(ja4::compute_ja4(&ja4::Ja4Input {
+        is_quic: true,
+        tls_version,
+        sni_present: meta.sni.is_some(),
+        alpn_first: alpn_first_bytes,
+        ciphers: &cipher_codes,
+        extensions: &ext_type_codes,
+        signature_algorithms: &sig_algs,
+    }));
     meta
 }
 
@@ -101,8 +143,17 @@ impl Classifier for TlsClassifier {
             if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
                 let mut sni: Option<String> = None;
                 let mut alpn: Option<String> = None;
+                let mut alpn_first_bytes: Option<&[u8]> = None;
                 let mut ech = false;
+                // Collected for JA4: extension type codes (in wire order),
+                // signature algorithms (wire order), and the negotiated
+                // TLS version (highest from supported_versions if present,
+                // else falls back to the ClientHello legacy version).
+                let mut ext_type_codes: Vec<u16> = Vec::new();
+                let mut sig_algs: Vec<u16> = Vec::new();
+                let mut tls_version: u16 = ch.version.0;
                 if let Some(ext_data) = ch.ext {
+                    ext_type_codes = ja4::extension_type_codes(ext_data);
                     if let Ok((_, exts)) = parse_tls_extensions(ext_data) {
                         ech = has_ech(&exts);
                         for ext in &exts {
@@ -114,17 +165,49 @@ impl Classifier for TlsClassifier {
                                         .map(|s| s.to_string());
                                 }
                                 TlsExtension::ALPN(protos) => {
-                                    alpn = protos
-                                        .first()
-                                        .and_then(|p| std::str::from_utf8(p).ok())
-                                        .map(|s| s.to_string());
+                                    if let Some(first) = protos.first() {
+                                        alpn_first_bytes = Some(*first);
+                                        alpn = std::str::from_utf8(first).ok().map(String::from);
+                                    }
+                                }
+                                TlsExtension::SignatureAlgorithms(algs) => {
+                                    sig_algs = algs.clone();
+                                }
+                                TlsExtension::SupportedVersions(vers) => {
+                                    // The TLS 1.3 ClientHello carries
+                                    // legacy_version = 0x0303 and the real
+                                    // version list in this extension. Pick
+                                    // the highest non-GREASE entry.
+                                    let highest = vers
+                                        .iter()
+                                        .map(|v| v.0)
+                                        .filter(|v| !ja4::is_grease(*v))
+                                        .max();
+                                    if let Some(v) = highest {
+                                        tls_version = v;
+                                    }
                                 }
                                 _ => {}
                             }
                         }
                     }
                 }
-                return Some(AppProtocol::Tls { sni, alpn, ech });
+                let cipher_codes: Vec<u16> = ch.ciphers.iter().map(|c| c.0).collect();
+                let ja4 = Some(ja4::compute_ja4(&Ja4Input {
+                    is_quic: false,
+                    tls_version,
+                    sni_present: sni.is_some(),
+                    alpn_first: alpn_first_bytes,
+                    ciphers: &cipher_codes,
+                    extensions: &ext_type_codes,
+                    signature_algorithms: &sig_algs,
+                }));
+                return Some(AppProtocol::Tls {
+                    sni,
+                    alpn,
+                    ech,
+                    ja4,
+                });
             }
         }
         None
@@ -191,12 +274,31 @@ mod tests {
     fn extracts_sni_from_clienthello() {
         let result = TlsClassifier.classify(CLIENT_HELLO_EXAMPLE_COM, true);
         match result {
-            Some(AppProtocol::Tls { sni, alpn, ech }) => {
+            Some(AppProtocol::Tls {
+                sni,
+                alpn,
+                ech,
+                ja4,
+            }) => {
                 assert_eq!(sni.as_deref(), Some("example.com"));
                 // No ALPN in this particular fixture (Python ssl default).
                 assert!(alpn.is_none(), "didn't expect ALPN in this fixture");
                 // Vanilla Python ssl does not send the ECH extension.
                 assert!(!ech, "vanilla fixture should not be flagged as ECH");
+                // JA4 must be present and structurally well-formed; we
+                // don't pin the exact hash here because Python's ssl
+                // stack can shift cipher/extension ordering across
+                // releases. Detailed JA4 verification lives in the
+                // synthetic-input tests in dpi::ja4.
+                let s = ja4.expect("JA4 should be computed for any parseable ClientHello");
+                let parts: Vec<&str> = s.split('_').collect();
+                assert_eq!(parts.len(), 3, "JA4 = JA4_a_JA4_b_JA4_c; got {}", s);
+                assert_eq!(parts[0].len(), 10, "JA4_a must be 10 chars; got {}", s);
+                assert!(
+                    parts[0].starts_with("t13d"),
+                    "Python ssl fixture is TLS 1.3 with SNI; got {}",
+                    s
+                );
             }
             other => panic!("expected Tls{{..}}, got {:?}", other),
         }

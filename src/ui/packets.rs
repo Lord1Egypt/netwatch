@@ -8,13 +8,24 @@ use ratatui::{
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // Detail-pane sizing: in default mode the packet list takes most
+    // of the screen and the detail pane is a fixed 16-line slot at the
+    // bottom; in expanded mode (toggled with `d`) the detail pane
+    // grows to ~75% of the middle area (with the list shrunk to 25%),
+    // which is necessary when a packet has lots of DPI / JA4 / geo
+    // output that overflows the default slot.
+    let (list_constraint, detail_constraint) = if app.ui.packet_detail_expanded {
+        (Constraint::Percentage(25), Constraint::Percentage(75))
+    } else {
+        (Constraint::Min(10), Constraint::Length(16))
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(10),    // packet list
-            Constraint::Length(16), // detail pane
-            Constraint::Length(3),  // footer
+            Constraint::Length(3), // header
+            list_constraint,       // packet list
+            detail_constraint,     // detail pane
+            Constraint::Length(3), // footer
         ])
         .split(area);
 
@@ -93,6 +104,95 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
         f.render_widget(header, area);
     } else {
         crate::ui::widgets::render_header_with_extra(f, app, area, extra);
+    }
+}
+
+/// Build a plain-text representation of a packet's full detail block
+/// suitable for clipboard paste. Mirrors what the on-screen Protocol
+/// Detail pane shows, plus the JA4/ECH lines we surface for TLS/QUIC,
+/// so a user can `y` a packet and paste the full breakdown into a
+/// Slack/Jira/notes without screen-scraping the TUI.
+pub fn format_packet_for_clipboard(pkt: &CapturedPacket) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(512);
+    let _ = writeln!(
+        s,
+        "Packet #{} — {}  {}",
+        pkt.id, pkt.timestamp, pkt.protocol
+    );
+    let src = match pkt.src_port {
+        Some(p) => format!("{}:{}", pkt.src_ip, p),
+        None => pkt.src_ip.clone(),
+    };
+    let dst = match pkt.dst_port {
+        Some(p) => format!("{}:{}", pkt.dst_ip, p),
+        None => pkt.dst_ip.clone(),
+    };
+    let _ = writeln!(s, "{src} → {dst}  ({} bytes)", pkt.length);
+    s.push('\n');
+    for line in &pkt.details {
+        let _ = writeln!(s, "  {line}");
+    }
+    // DPI signal: SNI / ALPN / JA4 / ECH for TLS or QUIC.
+    if let Some(app_proto) = &pkt.app_protocol {
+        s.push('\n');
+        let _ = writeln!(s, "  App: {}", app_protocol_summary(app_proto));
+        let (ja4, ech) = match app_proto {
+            crate::dpi::AppProtocol::Tls { ja4, ech, .. } => (ja4.as_deref(), *ech),
+            crate::dpi::AppProtocol::Quic { ja4, ech, .. } => (ja4.as_deref(), *ech),
+            _ => (None, false),
+        };
+        if let Some(j) = ja4 {
+            let line = match crate::dpi::ja4_db::lookup(j) {
+                Some(name) => format!("  JA4: {j} ({name})"),
+                None => format!("  JA4: {j}"),
+            };
+            let _ = writeln!(s, "{line}");
+        }
+        if ech {
+            let _ = writeln!(s, "  ECH: present (inner SNI hidden from observer)");
+        }
+    }
+    s
+}
+
+fn app_protocol_summary(p: &crate::dpi::AppProtocol) -> String {
+    use crate::dpi::AppProtocol::*;
+    match p {
+        Tls {
+            sni: Some(h), alpn, ..
+        } => match alpn {
+            Some(a) => format!("HTTPS {h} (ALPN: {a})"),
+            None => format!("HTTPS {h}"),
+        },
+        Tls { sni: None, .. } => "HTTPS (no SNI)".into(),
+        Quic { sni: Some(h), .. } => format!("QUIC {h}"),
+        Quic { sni: None, .. } => "QUIC (no SNI)".into(),
+        Http {
+            method,
+            host: Some(h),
+        } => format!("HTTP {method} {h}"),
+        Http { method, .. } => format!("HTTP {method}"),
+        Dns { qname, qtype } => format!("DNS {qname} (qtype={qtype})"),
+        Ssh { version } => format!("SSH {version}"),
+        Llmnr { qname, qtype } => format!("LLMNR {qname} (qtype={qtype})"),
+        Mqtt { client_id: Some(c) } => format!("MQTT client_id={c}"),
+        Mqtt { client_id: None } => "MQTT".into(),
+        Stun { message_type } => format!("STUN {message_type}"),
+        BitTorrent { info_hash: Some(h) } => format!("BitTorrent info_hash={h}"),
+        BitTorrent { info_hash: None } => "BitTorrent".into(),
+        NetBios { service } => format!("NetBIOS {service}"),
+        Snmp {
+            version,
+            community: Some(c),
+        } => format!("SNMP {version} community={c}"),
+        Snmp { version, .. } => format!("SNMP {version}"),
+        Ssdp {
+            method,
+            target: Some(t),
+        } => format!("SSDP {method} {t}"),
+        Ssdp { method, .. } => format!("SSDP {method}"),
+        Ftp { command } => format!("FTP {command}"),
     }
 }
 
@@ -259,10 +359,12 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 Some(crate::dpi::AppProtocol::Quic {
                     sni: Some(host),
                     ech: true,
+                    ..
                 }) => format!("QUIC-ECH {}", host),
                 Some(crate::dpi::AppProtocol::Quic {
                     sni: None,
                     ech: true,
+                    ..
                 }) => "QUIC-ECH".to_string(),
                 Some(crate::dpi::AppProtocol::Quic {
                     sni: Some(host), ..
@@ -298,6 +400,22 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 }) => format!("SSDP {}", method),
                 Some(crate::dpi::AppProtocol::Ftp { command }) => format!("FTP {}", command),
                 _ => pkt.info.clone(),
+            };
+            // Append the decoded JA4 client name when known, so users
+            // scanning the packet list see "HTTPS google.com (Chromium
+            // Browser)" without having to select the packet. Covers
+            // both TLS-over-TCP and QUIC (JA4Q). Only fires when the
+            // bundled DB recognizes the fingerprint; unknown JA4s stay
+            // quiet rather than dumping the raw 30-char hash into
+            // every row.
+            let ja4 = match &pkt.app_protocol {
+                Some(crate::dpi::AppProtocol::Tls { ja4: Some(j), .. }) => Some(j.as_str()),
+                Some(crate::dpi::AppProtocol::Quic { ja4: Some(j), .. }) => Some(j.as_str()),
+                _ => None,
+            };
+            let info_text = match ja4.and_then(crate::dpi::ja4_db::lookup) {
+                Some(label) => format!("{info_text} ({label})"),
+                None => info_text,
             };
             // Color the INFO column by L7 app protocol so the eye can
             // group rows at a glance: HTTPS/QUIC cyan, HTTP green, DNS
@@ -346,7 +464,13 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 Cell::from(pkt.protocol.clone()).style(fade(proto_style)),
                 Cell::from(pkt.length.to_string()).style(unstyled_fg),
                 Cell::from(stream_label).style(fade(Style::default().fg(app.theme.text_muted))),
-                Cell::from(truncate_info(&info_text, 40)).style(fade(info_style)),
+                // Truncate well above the typical narrow-terminal column
+                // width so ratatui's own column clipping handles narrow
+                // cases, and wide terminals show the full string —
+                // including the decoded JA4 client label suffix like
+                // " (Chromium Browser)" which the older 40-char limit
+                // cut off mid-word.
+                Cell::from(truncate_info(&info_text, 120)).style(fade(info_style)),
             ])
             .style(row_style)
         })
@@ -400,24 +524,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
 
     match selected_pkt {
         Some(pkt) => {
-            let detail_height = (pkt.details.len() as u16 + 2).min(area.height.saturating_sub(4));
             let has_payload = !pkt.payload_text.is_empty();
-
-            let rows = if has_payload {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(detail_height),
-                        Constraint::Min(3),
-                        Constraint::Min(3),
-                    ])
-                    .split(area)
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(detail_height), Constraint::Min(4)])
-                    .split(area)
-            };
 
             // Geo info lines (if enabled)
             let mut geo_lines: Vec<Line> = Vec::new();
@@ -500,6 +607,48 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
             detail_lines.extend(geo_lines);
             detail_lines.extend(whois_lines);
 
+            // DPI-derived details: JA4 fingerprint + ECH flag for both
+            // TLS-over-TCP and QUIC. The Info column already shows
+            // SNI/ALPN; this section surfaces the per-flow fingerprint,
+            // which is the part operators use for threat hunting and
+            // matching against IOC feeds.
+            let dpi_signal: Option<(Option<&str>, bool)> = match &pkt.app_protocol {
+                Some(crate::dpi::AppProtocol::Tls { ja4, ech, .. }) => Some((ja4.as_deref(), *ech)),
+                Some(crate::dpi::AppProtocol::Quic { ja4, ech, .. }) => {
+                    Some((ja4.as_deref(), *ech))
+                }
+                _ => None,
+            };
+            if let Some((ja4, ech)) = dpi_signal {
+                if ja4.is_some() || ech {
+                    detail_lines.push(Line::from(Span::styled(
+                        "  ── TLS decoded ──",
+                        Style::default().fg(app.theme.status_info).bold(),
+                    )));
+                    if let Some(j) = ja4 {
+                        // Append a friendly client name when the
+                        // bundled JA4 DB knows this fingerprint, e.g.
+                        // "JA4: t13d... (Chromium Browser)". Unknown
+                        // fingerprints stay raw — empty label would be
+                        // worse than no label.
+                        let line = match crate::dpi::ja4_db::lookup(j) {
+                            Some(name) => format!("  JA4: {j} ({name})"),
+                            None => format!("  JA4: {j}"),
+                        };
+                        detail_lines.push(Line::from(Span::styled(
+                            line,
+                            Style::default().fg(app.theme.status_info),
+                        )));
+                    }
+                    if ech {
+                        detail_lines.push(Line::from(Span::styled(
+                            "  ECH: present (inner SNI hidden from observer)",
+                            Style::default().fg(app.theme.status_info),
+                        )));
+                    }
+                }
+            }
+
             // QUIC frame breakdown — for UDP packets that look like a
             // v1/v2 Initial, decrypt and surface CRYPTO / PADDING /
             // PING frames as a quick decode of what's inside.
@@ -547,6 +696,38 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
+            // Size the detail pane to the lines we *actually have* —
+            // including geo, whois, TLS-decoded, QUIC-decoded, and
+            // handshake-timing extras appended above. The previous
+            // implementation sized from `pkt.details.len()` only, so
+            // the appended lines (JA4, ECH) were rendered into the
+            // Paragraph but immediately clipped off the bottom.
+            let detail_height = (detail_lines.len() as u16 + 2).min(area.height.saturating_sub(4));
+            // In expanded mode (`d` toggle) give the protocol detail
+            // the whole pane and skip the payload / hex / ASCII
+            // sub-sections — the user explicitly asked for an
+            // uncluttered "just protocol" view.
+            let rows = if app.ui.packet_detail_expanded {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0)])
+                    .split(area)
+            } else if has_payload {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(detail_height),
+                        Constraint::Min(3),
+                        Constraint::Min(3),
+                    ])
+                    .split(area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(detail_height), Constraint::Min(4)])
+                    .split(area)
+            };
+
             let proto_detail = Paragraph::new(detail_lines).block(
                 Block::default()
                     .title(Line::from(Span::styled(
@@ -557,6 +738,14 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     .border_style(Style::default().fg(app.theme.border)),
             );
             f.render_widget(proto_detail, rows[0]);
+
+            // Expanded mode: only the protocol detail; skip the
+            // payload / hex / ASCII sub-sections entirely. `rows` has
+            // only one element in this mode so the indexing below
+            // would panic without the guard.
+            if app.ui.packet_detail_expanded {
+                return;
+            }
 
             if has_payload {
                 // Payload content (readable text)

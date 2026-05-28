@@ -2318,9 +2318,49 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.packet_filter_active = None;
             app.ui.packet_filter_text.clear();
         }
+        // `y` (yank) on a selected packet → copy its detail block to
+        // the system clipboard. Useful for grabbing JA4 strings, SNI
+        // hostnames, or the full protocol breakdown without screen-
+        // scraping the TUI. Status feedback rides the existing
+        // export_status banner so the user sees confirmation.
+        KeyCode::Char('y') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
+            yank_selected_packet(app);
+        }
+        // `d` toggles the detail pane between default (16 lines) and
+        // expanded (fills remaining space). The default slot is too
+        // tight for packets with JA4 + ECH + geo + whois all populated.
+        KeyCode::Char('d') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
+            app.ui.packet_detail_expanded = !app.ui.packet_detail_expanded;
+        }
         _ => {}
     }
     false
+}
+
+fn yank_selected_packet(app: &mut App) {
+    let Some(pid) = app.ui.scroll.packet_selected else {
+        app.ui.export_status = Some("No packet selected — move the cursor onto a row first".into());
+        app.ui.export_status_tick = 0;
+        return;
+    };
+    let packets = app.packet_collector.get_packets();
+    let Some(pkt) = packets.iter().find(|p| p.id == pid) else {
+        app.ui.export_status = Some(format!("Packet #{pid} not found in current view"));
+        app.ui.export_status_tick = 0;
+        return;
+    };
+    let text = crate::ui::packets::format_packet_for_clipboard(pkt);
+    match crate::clipboard::copy(&text) {
+        Ok(tool) => {
+            app.ui.export_status = Some(format!(
+                "Copied packet #{pid} detail to clipboard via {tool}"
+            ));
+        }
+        Err(e) => {
+            app.ui.export_status = Some(format!("Clipboard copy failed: {e}"));
+        }
+    }
+    app.ui.export_status_tick = 0;
 }
 
 /// Returns remote IPs ranked by connection count, used by Topology tab actions.

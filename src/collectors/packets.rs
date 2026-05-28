@@ -634,12 +634,14 @@ impl StreamTracker {
                         target: "netwatch::dpi::quic",
                         host = %host,
                         ech = meta.ech,
+                        ja4 = ?meta.ja4,
                         buf_len = stream.quic_crypto_buf.len(),
                         "SNI extracted after cross-packet reassembly"
                     );
                     stream.app_protocol = Some(crate::dpi::AppProtocol::Quic {
                         sni: Some(host),
                         ech: meta.ech,
+                        ja4: meta.ja4,
                     });
                     stream.app_protocol_attempted = true;
                     // Release the buffer; we have what we need.
@@ -655,6 +657,7 @@ impl StreamTracker {
                         stream.app_protocol = Some(crate::dpi::AppProtocol::Quic {
                             sni: None,
                             ech: false,
+                            ja4: None,
                         });
                     }
                 }
@@ -2625,6 +2628,11 @@ pub enum FilterExpr {
     /// observer cannot see the inner SNI; `false` selects vanilla TLS/QUIC
     /// connections only (non-TLS/QUIC packets never match either way).
     Ech(bool),
+    /// `ja4:<value>` — substring match against the TLS JA4 fingerprint.
+    /// Lets the user pivot from "I saw a suspicious JA4 in the details
+    /// panel" to "show me every other connection with the same JA4"
+    /// — the core threat-hunting move JA4 enables.
+    Ja4(String),
     Not(Box<FilterExpr>),
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
@@ -2807,6 +2815,12 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
         };
         return Some((FilterExpr::Ech(want), &tokens[1..]));
     }
+    if let Some(val) = word.strip_prefix("ja4:") {
+        return Some((
+            FilterExpr::Ja4(val.trim_matches('"').to_lowercase()),
+            &tokens[1..],
+        ));
+    }
 
     // Bare IP address (contains a dot and digits)
     if word.contains('.') && word.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -2884,6 +2898,15 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
         FilterExpr::Ech(want) => match &pkt.app_protocol {
             Some(crate::dpi::AppProtocol::Tls { ech, .. }) => ech == want,
             Some(crate::dpi::AppProtocol::Quic { ech, .. }) => ech == want,
+            _ => false,
+        },
+        FilterExpr::Ja4(needle) => match &pkt.app_protocol {
+            Some(crate::dpi::AppProtocol::Tls { ja4: Some(j), .. }) => {
+                j.to_lowercase().contains(needle.as_str())
+            }
+            Some(crate::dpi::AppProtocol::Quic { ja4: Some(j), .. }) => {
+                j.to_lowercase().contains(needle.as_str())
+            }
             _ => false,
         },
         FilterExpr::Not(inner) => !matches_packet(inner, pkt),
@@ -3365,6 +3388,7 @@ mod tests {
             sni: Some("cloudflare-ech.com".into()),
             alpn: None,
             ech: true,
+            ja4: None,
         });
         assert!(matches_packet(&parse_filter("ech:true").unwrap(), &pkt));
         assert!(!matches_packet(&parse_filter("ech:false").unwrap(), &pkt));
@@ -3375,6 +3399,7 @@ mod tests {
         pkt.app_protocol = Some(crate::dpi::AppProtocol::Quic {
             sni: Some("cloudflare-ech.com".into()),
             ech: true,
+            ja4: None,
         });
         assert!(matches_packet(&parse_filter("ech:true").unwrap(), &pkt));
     }
@@ -3385,6 +3410,7 @@ mod tests {
             sni: Some("example.com".into()),
             alpn: None,
             ech: false,
+            ja4: None,
         });
         assert!(matches_packet(&parse_filter("ech:false").unwrap(), &pkt));
         assert!(!matches_packet(&parse_filter("ech:true").unwrap(), &pkt));
@@ -3404,6 +3430,72 @@ mod tests {
         // whose outer SNI mentions cloudflare. Tests parser glue.
         let f = parse_filter("ech:true and sni:cloudflare").unwrap();
         assert!(matches!(f, FilterExpr::And(_, _)));
+    }
+
+    #[test]
+    fn test_filter_ja4_substring_match() {
+        let f = parse_filter("ja4:t13d").unwrap();
+        assert!(matches!(f, FilterExpr::Ja4(ref s) if s == "t13d"));
+    }
+    #[test]
+    fn test_matches_ja4_substring() {
+        let mut pkt = make_packet("TCP", "1.1.1.1", "2.2.2.2", Some(1234), Some(443), "");
+        pkt.app_protocol = Some(crate::dpi::AppProtocol::Tls {
+            sni: Some("example.com".into()),
+            alpn: None,
+            ech: false,
+            ja4: Some("t13d1517h2_8daaf6152771_b1ff8ab2d16f".into()),
+        });
+        // Substring match — pivot from one observed JA4 to all similar.
+        assert!(matches_packet(
+            &parse_filter("ja4:t13d1517h2").unwrap(),
+            &pkt
+        ));
+        assert!(matches_packet(
+            &parse_filter("ja4:8daaf6152771").unwrap(),
+            &pkt
+        ));
+        // Case-insensitive (we lowercase both sides).
+        assert!(matches_packet(
+            &parse_filter("ja4:T13D1517H2").unwrap(),
+            &pkt
+        ));
+        // Non-matching JA4.
+        assert!(!matches_packet(
+            &parse_filter("ja4:t12d0301").unwrap(),
+            &pkt
+        ));
+    }
+    #[test]
+    fn test_matches_ja4_misses_when_ja4_is_none() {
+        // A QUIC packet whose ja4 field is None (reassembly hadn't
+        // produced a parseable ClientHello yet) must not match the
+        // ja4: filter regardless of needle.
+        let mut pkt = make_packet("UDP", "1.1.1.1", "2.2.2.2", Some(1234), Some(443), "");
+        pkt.app_protocol = Some(crate::dpi::AppProtocol::Quic {
+            sni: Some("example.com".into()),
+            ech: false,
+            ja4: None,
+        });
+        assert!(!matches_packet(
+            &parse_filter("ja4:anything").unwrap(),
+            &pkt
+        ));
+    }
+    #[test]
+    fn test_matches_ja4_on_quic_when_ja4_populated() {
+        // JA4Q populated on a QUIC stream should match the same way as TLS-TCP JA4.
+        let mut pkt = make_packet("UDP", "1.1.1.1", "2.2.2.2", Some(1234), Some(443), "");
+        pkt.app_protocol = Some(crate::dpi::AppProtocol::Quic {
+            sni: Some("crypto.cloudflare.com".into()),
+            ech: false,
+            ja4: Some("q13d0312h3_55b375c5d22e_06cda9e17597".into()),
+        });
+        assert!(matches_packet(
+            &parse_filter("ja4:q13d0312h3").unwrap(),
+            &pkt
+        ));
+        assert!(matches_packet(&parse_filter("ja4:q13d").unwrap(), &pkt));
     }
 
     #[test]
