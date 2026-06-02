@@ -935,7 +935,7 @@ fn overlay_proc_attribution(connections: &mut [Connection]) {
 /// only way to attribute connections that predate netwatch when sandboxed.
 /// (eBPF covers connections opened after startup.)
 #[cfg(target_os = "linux")]
-type ProcSnapshot = HashMap<((std::net::IpAddr, u16), (std::net::IpAddr, u16)), (u32, String)>;
+pub type ProcSnapshot = HashMap<((std::net::IpAddr, u16), (std::net::IpAddr, u16)), (u32, String)>;
 
 /// Capture the snapshot. Must be called before `sandbox::apply`. As root this
 /// sees every process; unprivileged it sees the caller's own — same visibility
