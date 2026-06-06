@@ -1148,10 +1148,15 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(header, chunks[0]);
 
-    // Build content lines
+    // Build content lines. Once a stream has decrypted content, follow only the
+    // decrypted conversation (the plaintext app-data segments) — the encrypted
+    // handshake is omitted so the request/response flow reads cleanly, the way
+    // Wireshark's "Follow HTTP Stream" does. The header still shows the 🔓
+    // indicator and handshake timing, so that context isn't lost.
     let filtered_segments: Vec<_> = stream
         .segments
         .iter()
+        .filter(|seg| !stream_has_decrypted || seg.decrypted.is_some())
         .filter(|seg| match app.ui.stream_direction_filter {
             StreamDirectionFilter::Both => true,
             StreamDirectionFilter::AtoB => seg.direction == StreamDirection::AtoB,
