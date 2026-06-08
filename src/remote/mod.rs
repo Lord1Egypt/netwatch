@@ -256,7 +256,7 @@ impl RemotePublisher {
 
         let conn_count = connections.connections().len() as u32;
 
-        let tcp_states = collect_tcp_states(&connections);
+        let tcp_states = collect_tcp_states(connections);
         let system = collect_system_metrics();
         let disk_usage = collect_disk_usage();
 
@@ -484,7 +484,7 @@ fn collect_system_macos() -> serde_json::Value {
         parts
             .get(1)
             .and_then(|s| s.split_whitespace().next())
-            .and_then(|v| parse_size(v))
+            .and_then(parse_size)
     };
 
     json!({
