@@ -1232,6 +1232,145 @@ pub async fn run<B: Backend>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Headless daemon mode (Workstream B)
+// ---------------------------------------------------------------------------
+
+/// Set true the first time any thread panics. Background collector panics are
+/// otherwise masked by [`safe_lock`]'s poison recovery (the UI keeps rendering
+/// stale data); this gives the daemon a real liveness signal to attest to the
+/// backend so a stalled agent surfaces as "data degraded" instead of going
+/// silently quiet.
+static COLLECTOR_PANICKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook (idempotently) that records thread panics, then chains
+/// to the previous hook so existing logging/abort behavior is preserved.
+fn install_collector_panic_flag() {
+    PANIC_HOOK_INIT.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            COLLECTOR_PANICKED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(target: "netwatch::daemon", panic = %info, "a thread panicked; marking collectors degraded");
+            prev(info);
+        }));
+    });
+}
+
+fn collectors_panicked() -> bool {
+    COLLECTOR_PANICKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve when the process is asked to terminate: SIGTERM (unix) or Ctrl-C
+/// (any platform). Used to trigger a graceful flush of the remote queue.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            // If we can't install the SIGTERM handler, Ctrl-C still works.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Run netwatch as a headless agent: the same collectors as the TUI, no
+/// rendering. Streams to the remote backend (if configured) and flushes its
+/// durable queue on SIGTERM/Ctrl-C before exiting. This is the fleet-agent
+/// entry point — `netwatch daemon`.
+pub async fn run_headless(
+    remote: Option<&crate::remote::RemotePublisher>,
+    sandbox_mode: crate::sandbox::Mode,
+) -> Result<()> {
+    install_collector_panic_flag();
+
+    let mut app = App::new();
+
+    // Same post-init sandbox application as the TUI path: pcap/eBPF/PKTAP are
+    // up by now, so we can drop caps and restrict the filesystem.
+    {
+        let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
+        let report = crate::sandbox::apply(sandbox_mode, &paths);
+        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) && !report.mode.warnings.is_empty()
+        {
+            anyhow::bail!(
+                "sandbox: strict mode could not be enforced: {}",
+                report.mode.warnings.join("; ")
+            );
+        }
+        for w in &report.mode.warnings {
+            tracing::warn!(target: "netwatch::sandbox", "{w}");
+        }
+        app.sandbox_report = report;
+    }
+
+    let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
+
+    // Prime the collectors so the first published snapshot isn't empty.
+    app.traffic.update();
+    app.connection_collector.update();
+    {
+        let conns = app.connection_collector.connections();
+        app.connection_timeline.update(&conns);
+    }
+    let gateway = app.config_collector.config.gateway.clone();
+    let dns = app.config_collector.config.primary_dns();
+    app.health_prober.probe(gateway.as_deref(), dns.as_deref());
+
+    tracing::info!(
+        target: "netwatch::daemon",
+        tick_rate_ms = tick_rate,
+        remote = remote.is_some(),
+        "netwatch daemon started"
+    );
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_rate));
+    // If a tick is missed (e.g. a long collector cycle), skip rather than
+    // burst-fire to catch up — we want steady cadence, not backlog replay.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                app.tick();
+                if let Some(publisher) = remote {
+                    publisher.update(
+                        &app.traffic.interfaces(),
+                        &app.health_prober,
+                        &app.connection_collector,
+                    );
+                    publisher.set_collectors_ok(!collectors_panicked());
+                }
+            }
+            _ = shutdown_signal() => {
+                tracing::info!(target: "netwatch::daemon", "shutdown signal received; draining");
+                break;
+            }
+        }
+    }
+
+    // Graceful shutdown: stop capture, then flush whatever is still buffered.
+    app.packet_collector.stop_capture();
+    if let Some(publisher) = remote {
+        publisher.shutdown(std::time::Duration::from_secs(8));
+    }
+    tracing::info!(target: "netwatch::daemon", "netwatch daemon stopped");
+    Ok(())
+}
+
 /// Clamp a scroll position after applying a signed delta.
 /// `max` is the highest allowed index (inclusive).
 fn clamp_scroll(current: usize, delta: isize, max: usize) -> usize {

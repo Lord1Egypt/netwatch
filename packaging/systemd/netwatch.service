@@ -1,0 +1,41 @@
+[Unit]
+Description=netwatch fleet agent (headless network forensics)
+Documentation=https://github.com/matthart1983/netwatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Endpoint + API key live here, not in the unit or argv (keeps the key out of
+# `ps`). Create /etc/netwatch/agent.env with:
+#   NETWATCH_REMOTE_URL=https://cloud.example.com
+#   NETWATCH_API_KEY=...
+EnvironmentFile=/etc/netwatch/agent.env
+# dirs::cache_dir() honors XDG_CACHE_HOME on Linux; point logs at the
+# systemd-managed CacheDirectory so a service user without $HOME still logs.
+Environment=XDG_CACHE_HOME=/var/cache/netwatch
+ExecStart=/usr/bin/netwatch daemon
+
+Restart=on-failure
+RestartSec=5s
+
+# Run unprivileged with only the capabilities the collectors need. eBPF
+# attribution needs CAP_BPF + CAP_PERFMON; raw packet capture needs CAP_NET_RAW.
+User=netwatch
+Group=netwatch
+AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON
+NoNewPrivileges=yes
+
+# Defense in depth — netwatch also applies its own Landlock sandbox post-init.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CacheDirectory=netwatch
+
+# The daemon flushes its durable queue on SIGTERM (bounded ~8s); give it room.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

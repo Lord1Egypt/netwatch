@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -81,6 +82,14 @@ pub struct RemotePublisher {
     snapshot_data: Arc<Mutex<Option<serde_json::Value>>>,
     /// Durable backlog drained by the sender thread.
     queue: Arc<SnapshotQueue>,
+    /// Liveness attestation included in each envelope. The daemon supervisor
+    /// flips this false when a collector thread has panicked.
+    collectors_ok: Arc<AtomicBool>,
+    /// Set by [`shutdown`](Self::shutdown) to ask the sender thread to do a
+    /// final bounded drain and exit.
+    shutdown: Arc<AtomicBool>,
+    /// Sender-thread handle, joined on shutdown for a clean flush.
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RemotePublisher {
@@ -90,7 +99,17 @@ impl RemotePublisher {
             host_id: Uuid::new_v4(),
             snapshot_data: Arc::new(Mutex::new(None)),
             queue: Arc::new(SnapshotQueue::new(QUEUE_CAP)),
+            collectors_ok: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handle: Mutex::new(None),
         }
+    }
+
+    /// Report collector liveness to the backend. The daemon calls this each
+    /// tick (false once a collector thread has panicked) so a stalled agent
+    /// surfaces as "data stale" rather than silently going quiet.
+    pub fn set_collectors_ok(&self, ok: bool) {
+        self.collectors_ok.store(ok, Ordering::Relaxed);
     }
 
     pub fn start(&self) {
@@ -99,8 +118,10 @@ impl RemotePublisher {
         let host_id = self.host_id;
         let data = self.snapshot_data.clone();
         let queue = self.queue.clone();
+        let collectors_ok = self.collectors_ok.clone();
+        let shutdown = self.shutdown.clone();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let host_info = collect_host_info(host_id);
             let endpoint = format!("{}/api/v1/ingest", url);
             let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(60));
@@ -113,6 +134,20 @@ impl RemotePublisher {
             loop {
                 thread::sleep(LOOP_TICK);
                 let now = Instant::now();
+
+                // Graceful shutdown: one final bounded drain, then exit so the
+                // daemon's join() returns promptly even if the backend is slow.
+                if shutdown.load(Ordering::Relaxed) {
+                    final_drain(
+                        &endpoint,
+                        &api_key,
+                        &host_info,
+                        &collectors_ok,
+                        &queue,
+                        Duration::from_secs(5),
+                    );
+                    return;
+                }
 
                 // 1. Sample the latest snapshot into the durable queue on cadence.
                 let due = match last_enqueue {
@@ -135,58 +170,52 @@ impl RemotePublisher {
                     continue;
                 }
 
-                let batch = queue.peek_batch(BATCH_MAX);
-                let body = json!({
-                    "schema_version": SCHEMA_VERSION,
-                    "agent_version": format!("netwatch-tui/{}", env!("CARGO_PKG_VERSION")),
-                    "host": host_info,
-                    "snapshots": batch,
-                    "agent_health": {
-                        // TODO(Workstream B): wire real collector liveness from the
-                        // daemon supervisor. Until then we only attest delivery health.
-                        "collectors_ok": true,
-                        "dropped_count": queue.dropped(),
-                        "queue_depth": queue.len(),
-                    },
-                });
-
-                let result = ureq::post(&endpoint)
-                    .set("Authorization", &format!("Bearer {}", api_key))
-                    .set("Content-Type", "application/json")
-                    .send_json(body);
-
-                let outcome = match &result {
-                    Ok(_) => SendOutcome::Ack,
-                    Err(ureq::Error::Status(code, _)) => outcome_for_status(*code),
-                    // Transport-level (DNS, connect, TLS, timeout) — transient.
-                    Err(ureq::Error::Transport(_)) => SendOutcome::Retry,
-                };
-
-                match outcome {
-                    SendOutcome::Ack => {
-                        queue.remove(batch.len());
+                match try_flush_once(&endpoint, &api_key, &host_info, &collectors_ok, &queue) {
+                    Some(SendOutcome::Ack) => {
                         backoff.reset();
                         next_send_at = now;
                     }
-                    SendOutcome::Poison => {
-                        if let Err(e) = &result {
-                            tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, batch = batch.len(), "dropping unacceptable ingest batch (4xx)");
-                        }
-                        // Drop the poison batch so it can't wedge the queue, but
-                        // pace the drain so we don't hammer on a persistent 4xx.
-                        queue.remove(batch.len());
+                    // Poison batch is dropped inside try_flush_once; pace the drain
+                    // so a persistent 4xx doesn't spin.
+                    Some(SendOutcome::Poison) | Some(SendOutcome::Retry) => {
                         next_send_at = now + backoff.fail(jitter_entropy());
                     }
-                    SendOutcome::Retry => {
-                        let delay = backoff.fail(jitter_entropy());
-                        next_send_at = now + delay;
-                        if let Err(e) = &result {
-                            tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, retry_in_ms = delay.as_millis(), queued = queue.len(), "ingest POST failed; will retry");
-                        }
-                    }
+                    None => {}
                 }
             }
         });
+
+        *self.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Ask the sender thread to flush and stop, blocking until it finishes its
+    /// final drain (bounded by its own internal deadline) or `timeout` elapses.
+    pub fn shutdown(&self, timeout: Duration) {
+        // Make sure the most recent snapshot is in the durable queue first.
+        let latest = {
+            let lock = safe_lock(&self.snapshot_data, "remote::shutdown");
+            lock.clone()
+        };
+        if let Some(snapshot) = latest {
+            self.queue.push(snapshot);
+        }
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = handle {
+            // The sender thread caps its own drain at 5s; we wait a touch longer
+            // before giving up so a slow-but-working backend can finish.
+            let deadline = Instant::now() + timeout;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                let queued = self.queue.len();
+                tracing::warn!(target: "netwatch::remote", queued, "shutdown drain timed out; abandoning buffered snapshots");
+            }
+        }
     }
 
     pub fn update(
@@ -243,6 +272,90 @@ impl RemotePublisher {
         });
 
         *safe_lock(&self.snapshot_data, "remote::collect_snapshot::store") = Some(snapshot);
+    }
+}
+
+/// Attempt to send one batch from the head of the queue.
+///
+/// Returns `None` if there was nothing to send, otherwise the classified
+/// outcome. On `Ack` the batch is removed; on `Poison` it is dropped (and
+/// logged) so a bad payload can't wedge the queue; on `Retry` it is left in
+/// place for the next attempt. Shared by the steady-state loop and the
+/// shutdown drain so both speak the identical wire format.
+fn try_flush_once(
+    endpoint: &str,
+    api_key: &str,
+    host_info: &serde_json::Value,
+    collectors_ok: &AtomicBool,
+    queue: &SnapshotQueue,
+) -> Option<SendOutcome> {
+    if queue.is_empty() {
+        return None;
+    }
+    let batch = queue.peek_batch(BATCH_MAX);
+    let body = json!({
+        "schema_version": SCHEMA_VERSION,
+        "agent_version": format!("netwatch-tui/{}", env!("CARGO_PKG_VERSION")),
+        "host": host_info,
+        "snapshots": batch,
+        "agent_health": {
+            "collectors_ok": collectors_ok.load(Ordering::Relaxed),
+            "dropped_count": queue.dropped(),
+            "queue_depth": queue.len(),
+        },
+    });
+
+    let result = ureq::post(endpoint)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .set("Content-Type", "application/json")
+        .send_json(body);
+
+    let outcome = match &result {
+        Ok(_) => SendOutcome::Ack,
+        Err(ureq::Error::Status(code, _)) => outcome_for_status(*code),
+        // Transport-level (DNS, connect, TLS, timeout) — transient.
+        Err(ureq::Error::Transport(_)) => SendOutcome::Retry,
+    };
+
+    match outcome {
+        SendOutcome::Ack => queue.remove(batch.len()),
+        SendOutcome::Poison => {
+            if let Err(e) = &result {
+                tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, batch = batch.len(), "dropping unacceptable ingest batch (4xx)");
+            }
+            queue.remove(batch.len());
+        }
+        SendOutcome::Retry => {
+            if let Err(e) = &result {
+                tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, queued = queue.len(), "ingest POST failed; will retry");
+            }
+        }
+    }
+    Some(outcome)
+}
+
+/// Best-effort final flush on shutdown: send batches back-to-back until the
+/// queue empties or `budget` elapses. Retries here are short and unjittered —
+/// we're racing a deadline to avoid losing the last few snapshots, not pacing a
+/// reconnecting fleet.
+fn final_drain(
+    endpoint: &str,
+    api_key: &str,
+    host_info: &serde_json::Value,
+    collectors_ok: &AtomicBool,
+    queue: &SnapshotQueue,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    while !queue.is_empty() && Instant::now() < deadline {
+        if let Some(SendOutcome::Retry) =
+            try_flush_once(endpoint, api_key, host_info, collectors_ok, queue)
+        {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    if !queue.is_empty() {
+        tracing::warn!(target: "netwatch::remote", queued = queue.len(), "final drain incomplete at shutdown deadline");
     }
 }
 

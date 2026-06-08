@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "netwatch {} — real-time network diagnostics in your terminal\n\n\
-             USAGE:\n    netwatch [OPTIONS]\n    sudo netwatch       Full mode (health probes + packet capture)\n\n\
+             USAGE:\n    netwatch [OPTIONS]\n    sudo netwatch              Full mode (health probes + packet capture)\n    netwatch daemon [OPTIONS]  Headless agent (no TUI); streams to --remote\n\n\
              OPTIONS:\n    --generate-config         Write a default config file and exit\n    \
              --remote <url>            Stream metrics to a NetWatch Core instance\n    \
              --api-key <key>           API key for remote streaming\n    \
@@ -51,15 +51,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Parse --remote and --api-key for optional metrics streaming
+    // Parse --remote and --api-key for optional metrics streaming. Fall back to
+    // env vars so the daemon (e.g. under systemd) can take its endpoint and key
+    // from an EnvironmentFile instead of argv — keeping the API key out of `ps`.
     let remote_url = args
         .windows(2)
         .find(|w| w[0] == "--remote")
-        .map(|w| w[1].clone());
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
     let api_key = args
         .windows(2)
         .find(|w| w[0] == "--api-key")
-        .map(|w| w[1].clone());
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("NETWATCH_API_KEY").ok());
 
     let sandbox_mode = if args.iter().any(|a| a == "--no-sandbox") {
         netwatch::sandbox::Mode::Disabled
@@ -94,6 +98,20 @@ async fn main() -> Result<()> {
     // Installed after CLI flag handling so `--version` / `--help` don't
     // touch the cache dir.
     let _log_guard = netwatch::logging::init();
+
+    // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
+    // Runs the same collectors as the TUI with no rendering, streams to the
+    // remote backend, and flushes its durable queue on SIGTERM before exiting.
+    let daemon_mode = args
+        .iter()
+        .skip(1)
+        .any(|a| a == "daemon" || a == "--daemon" || a == "--headless");
+    if daemon_mode {
+        if let Err(e) = app::run_headless(remote_publisher.as_ref(), sandbox_mode).await {
+            eprintln!("Error: {e:?}");
+        }
+        return Ok(());
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

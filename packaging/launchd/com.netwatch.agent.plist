@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  netwatch fleet agent (macOS LaunchDaemon).
+
+  Install:
+    sudo cp packaging/launchd/com.netwatch.agent.plist /Library/LaunchDaemons/
+    sudo cp target/release/netwatch /usr/local/bin/netwatch
+    # edit the endpoint + key below, then:
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.netwatch.agent.plist
+
+  The daemon flushes its durable queue on SIGTERM; launchd sends SIGTERM on
+  unload and waits ExitTimeOut seconds before SIGKILL.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.netwatch.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/netwatch</string>
+        <string>daemon</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NETWATCH_REMOTE_URL</key>
+        <string>https://cloud.example.com</string>
+        <key>NETWATCH_API_KEY</key>
+        <string>replace-me</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Graceful stop: SIGTERM, then allow the queue flush to complete. -->
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/netwatch-agent.err.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
