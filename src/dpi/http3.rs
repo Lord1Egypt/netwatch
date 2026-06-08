@@ -14,12 +14,14 @@
 //!    decode — instead we detect gzip / zlib by magic bytes and attempt
 //!    brotli (which has no magic) as a fallback.
 //!
-//! ## Scope (Phase 3a)
-//! Single-packet, offset-0 bodies — i.e. responses small enough that the
-//! whole HTTP/3 stream fits in one 1-RTT packet. Mid-stream packets (a
-//! STREAM frame at a non-zero offset) can't be decompressed on their own:
-//! a gzip/brotli stream must be fed from byte 0. Cross-packet STREAM
-//! reassembly is Phase 3b. zstd is out of scope.
+//! ## Scope
+//! [`try_decode_single_packet`] handles the single-packet, offset-0 case (a
+//! response small enough to fit one 1-RTT packet). For responses spanning
+//! multiple packets, [`H3StreamReassembler`] (Phase 3b) accumulates STREAM-frame
+//! bytes per stream id, by offset, across packets and decodes the contiguous
+//! prefix from byte 0 — a gzip/brotli stream must be fed from the start, so a
+//! body is only recovered once its head and a contiguous run are present. zstd
+//! and identity (uncompressed) bodies are out of scope.
 
 use std::io::Read;
 
@@ -349,6 +351,121 @@ pub fn try_decode_single_packet(frames: &[u8]) -> Option<DecodedBody> {
     None
 }
 
+/// Per-stream byte cap and concurrent-stream cap, to bound memory on a busy
+/// QUIC flow. A 2 MiB body is already far beyond what any single 1-RTT packet
+/// carries; past it we keep the decodable prefix and drop the overflow.
+const MAX_H3_STREAM_BYTES: usize = 2 * 1024 * 1024;
+const MAX_H3_STREAMS: usize = 64;
+
+/// Cross-packet HTTP/3 stream reassembly (Phase 3b).
+///
+/// Feed each decrypted 1-RTT packet's frame bytes to [`ingest`]; it routes the
+/// STREAM-frame data into a per–stream-id buffer at the frame's offset and
+/// re-decodes the **contiguous prefix from offset 0** whenever it grows. Only
+/// the contiguous prefix is decoded: feeding a gzip/brotli decompressor across a
+/// gap (a not-yet-received range) would corrupt it, and a body can't be
+/// recovered until its head plus a contiguous run are present anyway. Read
+/// recovered bodies via [`decoded_bodies`].
+#[derive(Debug, Clone, Default)]
+pub struct H3StreamReassembler {
+    streams: std::collections::BTreeMap<u64, H3Stream>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct H3Stream {
+    /// Offset-indexed byte buffer (zero-filled across not-yet-received gaps).
+    data: Vec<u8>,
+    /// Merged received byte ranges, sorted by start, so we know how far the
+    /// contiguous prefix from offset 0 reaches.
+    received: Vec<(u64, u64)>,
+    fin: bool,
+    /// Contiguous-prefix length last decoded, so we only re-run the
+    /// decompressor when more contiguous bytes have arrived.
+    decoded_len: usize,
+    decoded: Option<DecodedBody>,
+}
+
+impl H3Stream {
+    /// Length of the contiguous prefix starting at offset 0.
+    fn contiguous_len(&self) -> usize {
+        match self.received.first() {
+            Some(&(0, end)) => end as usize,
+            _ => 0,
+        }
+    }
+
+    /// Record `[start, end)` as received, merging into the sorted range set.
+    fn mark_received(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        self.received.push((start, end));
+        self.received.sort_unstable_by_key(|r| r.0);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.received.len());
+        for &(s, e) in &self.received {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.received = merged;
+    }
+}
+
+impl H3StreamReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one decrypted 1-RTT packet's frame bytes. Writes each STREAM frame's
+    /// data into its stream's buffer at the frame offset and re-decodes the
+    /// contiguous prefix if it grew.
+    pub fn ingest(&mut self, frames: &[u8]) {
+        for chunk in extract_stream_chunks(frames) {
+            if !self.streams.contains_key(&chunk.stream_id) && self.streams.len() >= MAX_H3_STREAMS
+            {
+                continue;
+            }
+            let start = chunk.offset;
+            let end = start.saturating_add(chunk.data.len() as u64);
+            // Drop chunks that would push the buffer past the per-stream cap;
+            // the decodable prefix below the cap is still useful.
+            if end as usize > MAX_H3_STREAM_BYTES {
+                continue;
+            }
+            let st = self.streams.entry(chunk.stream_id).or_default();
+            if end as usize > st.data.len() {
+                st.data.resize(end as usize, 0);
+            }
+            st.data[start as usize..end as usize].copy_from_slice(&chunk.data);
+            st.mark_received(start, end);
+            if chunk.fin {
+                st.fin = true;
+            }
+            let clen = st.contiguous_len();
+            if clen > st.decoded_len {
+                st.decoded_len = clen;
+                st.decoded = h3_data_payload(&st.data[..clen])
+                    .and_then(|body| decompress_body(&body))
+                    .map(|(encoding, bytes)| DecodedBody {
+                        encoding,
+                        stream_id: chunk.stream_id,
+                        bytes,
+                    });
+            }
+        }
+    }
+
+    /// Bodies recovered so far — one per HTTP/3 stream whose contiguous prefix
+    /// has decoded, in ascending stream-id order.
+    pub fn decoded_bodies(&self) -> Vec<DecodedBody> {
+        self.streams
+            .values()
+            .filter_map(|s| s.decoded.clone())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +602,69 @@ mod tests {
         stream.extend(h3_data_frame(b"real-body"));
         let body = h3_data_payload(&stream).expect("must find DATA after HEADERS");
         assert_eq!(body, b"real-body");
+    }
+
+    #[test]
+    fn reassembler_decodes_body_split_across_three_packets() {
+        let body = b"the quick brown fox jumps over the lazy dog ".repeat(40);
+        let h3 = h3_data_frame(&gzip(&body)); // the HTTP/3 stream bytes
+        let n = h3.len();
+        let (a, b, c) = (&h3[..n / 3], &h3[n / 3..2 * n / 3], &h3[2 * n / 3..]);
+
+        let mut r = H3StreamReassembler::new();
+        r.ingest(&stream_frame(0, 0, a));
+        assert!(
+            r.decoded_bodies().is_empty(),
+            "a partial gzip stream must not decode yet"
+        );
+        r.ingest(&stream_frame(0, (n / 3) as u64, b));
+        r.ingest(&stream_frame(0, (2 * n / 3) as u64, c));
+
+        let bodies = r.decoded_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].encoding, BodyEncoding::Gzip);
+        assert_eq!(bodies[0].stream_id, 0);
+        assert_eq!(bodies[0].bytes, body);
+    }
+
+    #[test]
+    fn reassembler_handles_out_of_order_fragments() {
+        let body = b"compressible payload ".repeat(64);
+        let h3 = h3_data_frame(&gzip(&body));
+        let mid = h3.len() / 2;
+
+        let mut r = H3StreamReassembler::new();
+        // Tail fragment arrives first — no contiguous prefix from 0 yet.
+        r.ingest(&stream_frame(7, mid as u64, &h3[mid..]));
+        assert!(r.decoded_bodies().is_empty(), "no head yet");
+        // Head fills the gap; now the whole prefix is contiguous.
+        r.ingest(&stream_frame(7, 0, &h3[..mid]));
+
+        let bodies = r.decoded_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].stream_id, 7);
+        assert_eq!(bodies[0].bytes, body);
+    }
+
+    #[test]
+    fn reassembler_never_decodes_a_gap() {
+        // Only a mid-stream fragment (offset > 0, no head): must not decode.
+        let body = b"x".repeat(200);
+        let h3 = h3_data_frame(&gzip(&body));
+        let mut r = H3StreamReassembler::new();
+        r.ingest(&stream_frame(3, 4096, &h3));
+        assert!(r.decoded_bodies().is_empty());
+    }
+
+    #[test]
+    fn reassembler_single_packet_parity() {
+        // A body that fits one packet decodes the same as try_decode_single_packet.
+        let body = b"single packet body ".repeat(8);
+        let h3 = h3_data_frame(&gzip(&body));
+        let mut r = H3StreamReassembler::new();
+        r.ingest(&stream_frame(0, 0, &h3));
+        let bodies = r.decoded_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].bytes, body);
     }
 }

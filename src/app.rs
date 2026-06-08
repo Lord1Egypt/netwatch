@@ -2377,7 +2377,11 @@ fn yank_selected_packet(app: &mut App) {
         app.ui.export_status_tick = 0;
         return;
     };
-    let text = crate::ui::packets::format_packet_for_clipboard(pkt);
+    let h3_bodies = pkt
+        .stream_index
+        .map(|i| app.packet_collector.quic_h3_bodies(i))
+        .unwrap_or_default();
+    let text = crate::ui::packets::format_packet_for_clipboard(pkt, &h3_bodies);
     match crate::clipboard::copy(&text) {
         Ok(tool) => {
             app.ui.export_status = Some(format!(

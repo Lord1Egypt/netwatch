@@ -113,7 +113,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
 /// Detail pane shows, plus the JA4/ECH lines we surface for TLS/QUIC,
 /// so a user can `y` a packet and paste the full breakdown into a
 /// Slack/Jira/notes without screen-scraping the TUI.
-pub fn format_packet_for_clipboard(pkt: &CapturedPacket) -> String {
+pub fn format_packet_for_clipboard(
+    pkt: &CapturedPacket,
+    h3_bodies: &[crate::dpi::http3::DecodedBody],
+) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(512);
     let _ = writeln!(
@@ -168,9 +171,9 @@ pub fn format_packet_for_clipboard(pkt: &CapturedPacket) -> String {
         if !s.ends_with('\n') {
             s.push('\n');
         }
-        // Include the decompressed HTTP/3 body when we can recover one.
+        // Include any decompressed HTTP/3 bodies (reassembled across packets).
         if is_quic {
-            if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+            for decoded in h3_bodies {
                 let _ = writeln!(
                     s,
                     "  ── HTTP/3 stream {} · {} body ({} bytes) ──",
@@ -805,11 +808,15 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     format!("  {} bytes plaintext", pt.len()),
                     Style::default().fg(app.theme.status_good),
                 )));
-                // Phase 3a: note when this QUIC packet carries an offset-0
-                // HTTP/3 DATA body we decompressed (gzip/deflate/br). The
-                // decoded bytes render in the Payload Content pane.
+                // Note any HTTP/3 bodies recovered for this flow — reassembled
+                // across packets when the body spans more than one (Phase 3b).
+                // The decoded bytes render in the Payload Content pane.
                 if is_quic {
-                    if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+                    let bodies = pkt
+                        .stream_index
+                        .map(|i| app.packet_collector.quic_h3_bodies(i))
+                        .unwrap_or_default();
+                    for decoded in &bodies {
                         detail_lines.push(Line::from(Span::styled(
                             format!(
                                 "  HTTP/3 stream {} · {} body → {} bytes",
@@ -930,7 +937,14 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                         // readable content is right here in one pane.
                         let mut body = preview_decrypted_bytes(pt, 16384);
                         let title = if is_quic {
-                            if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+                            // Surface the decompressed HTTP/3 body (reassembled
+                            // across packets, Phase 3b) beneath the raw frames so
+                            // the readable content is in one pane.
+                            let bodies = pkt
+                                .stream_index
+                                .map(|i| app.packet_collector.quic_h3_bodies(i))
+                                .unwrap_or_default();
+                            for decoded in &bodies {
                                 body.push_str(&format!(
                                     "\n── HTTP/3 stream {} · {} body ({} bytes) ──\n",
                                     decoded.stream_id,
@@ -1489,7 +1503,7 @@ mod tests {
         // on the clipboard — `y` is the "see the whole thing" affordance.
         let mut body = b"GET /verify HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
         body.extend(std::iter::repeat(b'Z').take(4000));
-        let out = format_packet_for_clipboard(&pkt_with_decrypted(Some(body.clone())));
+        let out = format_packet_for_clipboard(&pkt_with_decrypted(Some(body.clone())), &[]);
         assert!(out.contains("── TLS decrypted (4043 bytes) ──"));
         assert!(out.contains("GET /verify HTTP/1.1"));
         assert!(out.contains("Host: example.com"));
@@ -1498,7 +1512,7 @@ mod tests {
 
     #[test]
     fn clipboard_omits_section_without_decryption() {
-        let out = format_packet_for_clipboard(&pkt_with_decrypted(None));
+        let out = format_packet_for_clipboard(&pkt_with_decrypted(None), &[]);
         assert!(!out.contains("TLS decrypted"));
     }
 

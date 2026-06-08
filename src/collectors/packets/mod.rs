@@ -283,6 +283,10 @@ pub struct Stream {
     /// QUIC 1-RTT decryption state (cipher suite, per-direction DCID length
     /// and largest packet number) discovered/tracked across the flow.
     pub quic_decrypt: QuicDecryptState,
+    /// Cross-packet HTTP/3 stream reassembly (Phase 3b): accumulates decrypted
+    /// STREAM-frame data per HTTP/3 stream id so response bodies larger than one
+    /// 1-RTT packet decode/decompress instead of truncating.
+    pub quic_h3: crate::dpi::http3::H3StreamReassembler,
     /// Monotonic ns timestamp of the last packet seen on this flow. Drives LRU
     /// eviction when the tracker exceeds MAX_STREAMS.
     last_seen_ns: u64,
@@ -455,6 +459,7 @@ impl StreamTracker {
                     quic_crypto_buf: Vec::new(),
                     quic_client_random: None,
                     quic_decrypt: QuicDecryptState::default(),
+                    quic_h3: crate::dpi::http3::H3StreamReassembler::new(),
                     highest_seq_a_to_b: None,
                     highest_seq_b_to_a: None,
                     retransmits_a_to_b: 0,
@@ -969,6 +974,9 @@ impl StreamTracker {
                             s.quic_decrypt.dcid_len_s2c = Some(dcid_len as u8);
                             s.quic_decrypt.largest_pn_s2c = s.quic_decrypt.largest_pn_s2c.max(pn);
                         }
+                        // Feed the decrypted frames into cross-packet HTTP/3
+                        // reassembly so multi-packet bodies decode (Phase 3b).
+                        s.quic_h3.ingest(&plain);
                     }
                     tracing::trace!(target: "netwatch::dpi::quic", stream_index, client_to_server, dcid_len, pn, plain_len = plain.len(), "decrypted QUIC 1-RTT packet");
                     return Some(plain);
@@ -1356,6 +1364,17 @@ impl PacketCollector {
             .unwrap()
             .get_stream(index)
             .cloned()
+    }
+
+    /// Reassembled HTTP/3 bodies for a flow (Phase 3b). Clones only the decoded
+    /// bodies, not the whole `Stream`, so the UI can call it per render frame.
+    pub fn quic_h3_bodies(&self, index: u32) -> Vec<crate::dpi::http3::DecodedBody> {
+        self.stream_tracker
+            .lock()
+            .unwrap()
+            .get_stream(index)
+            .map(|s| s.quic_h3.decoded_bodies())
+            .unwrap_or_default()
     }
 }
 
