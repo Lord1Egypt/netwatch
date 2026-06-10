@@ -74,6 +74,29 @@ pub fn extract_server_hello_cipher_suite(payload: &[u8]) -> Option<u16> {
     None
 }
 
+/// Pull the 32-byte `server_random` out of a TLS ServerHello. Required by
+/// the TLS 1.2 decryption path: unlike TLS 1.3 (whose key schedule keys
+/// entirely off the keylog traffic secrets), the TLS 1.2 PRF seed is
+/// `server_random || client_random`, so we read the server random off the
+/// wire — it's plaintext, sent before the cipher is activated.
+/// Returns `None` for non-TLS, non-ServerHello, or malformed input.
+pub fn extract_server_hello_random(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() < 5 || payload[0] != 0x16 || payload[1] != 0x03 {
+        return None;
+    }
+    let (_, record) = parse_tls_plaintext(payload).ok()?;
+    for msg in record.msg {
+        if let TlsMessage::Handshake(TlsMessageHandshake::ServerHello(sh)) = msg {
+            if sh.random.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(sh.random);
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
 /// `true` when the extension list contains an `encrypted_client_hello`
 /// extension. Used by both the TLS classifier and any downstream caller
 /// (e.g. QUIC ECH detection if added) that has already parsed
@@ -455,6 +478,16 @@ mod tests {
         // ClientHello is content_type 0x16 + handshake_type 0x01;
         // our extractor only returns Some for ServerHellos (0x02).
         assert!(extract_server_hello_cipher_suite(CLIENT_HELLO_EXAMPLE_COM).is_none());
+    }
+
+    #[test]
+    fn extract_server_hello_random_rejects_clienthello_and_junk() {
+        // A ClientHello (handshake_type 0x01) carries a client_random, not a
+        // server_random — the ServerHello extractor must not return it.
+        assert!(extract_server_hello_random(CLIENT_HELLO_EXAMPLE_COM).is_none());
+        assert!(extract_server_hello_random(b"GET / HTTP/1.1\r\n\r\n").is_none());
+        assert!(extract_server_hello_random(&[]).is_none());
+        assert!(extract_server_hello_random(&[0x16, 0x03]).is_none());
     }
 
     #[test]

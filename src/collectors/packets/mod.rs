@@ -316,10 +316,15 @@ pub struct Stream {
     /// handshake record on this stream is observed. Used to look
     /// up secrets in the SSLKEYLOGFILE-backed `KeylogStore`.
     pub tls_client_random: Option<[u8; 32]>,
-    /// Negotiated TLS 1.3 cipher suite (raw u16 from ServerHello).
-    /// The keylog provides AEAD secrets but not the chosen cipher,
-    /// so we read it off the wire.
+    /// Negotiated TLS cipher suite (raw u16 from ServerHello). The keylog
+    /// provides AEAD secrets but not the chosen cipher, so we read it off
+    /// the wire. Used by both the TLS 1.3 and TLS 1.2 decrypt paths.
     pub tls_cipher_suite: Option<u16>,
+    /// TLS ServerHello random (32 bytes). Needed only by the TLS 1.2
+    /// decrypt path, whose PRF seed is `server_random || client_random`;
+    /// the TLS 1.3 path keys off the keylog traffic secrets and ignores
+    /// it. Plaintext on the wire (sent before the cipher is activated).
+    pub tls_server_random: Option<[u8; 32]>,
     /// Set once we've concluded this stream can *never* be decrypted —
     /// the ClientHello was missed (no `client_random`) or the cipher
     /// suite is outside our TLS 1.3 support set. A keylog miss does NOT
@@ -357,12 +362,19 @@ pub struct StreamTracker {
     pub keylog: std::sync::Arc<crate::dpi::tls_decrypt::KeylogStore>,
 }
 
-/// Per-stream AEAD state for TLS 1.3 application data. Held in
-/// `StreamTracker.tls_keys` rather than on `Stream` because the
-/// underlying `aead::LessSafeKey` isn't `Clone`.
-pub struct TlsStreamKeys {
-    pub client: crate::dpi::tls_decrypt::DirectionKeys,
-    pub server: crate::dpi::tls_decrypt::DirectionKeys,
+/// Per-stream AEAD state for TLS application data, tagged by protocol
+/// version (the key schedule and record framing differ). Held in
+/// `StreamTracker.tls_keys` rather than on `Stream` because the underlying
+/// `aead::LessSafeKey` isn't `Clone`.
+pub enum TlsStreamKeys {
+    V13 {
+        client: crate::dpi::tls_decrypt::DirectionKeys,
+        server: crate::dpi::tls_decrypt::DirectionKeys,
+    },
+    V12 {
+        client: crate::dpi::tls_decrypt::Tls12DirectionKeys,
+        server: crate::dpi::tls_decrypt::Tls12DirectionKeys,
+    },
 }
 
 /// How many record sequence numbers `try_decrypt_tls_record` will search
@@ -468,6 +480,7 @@ impl StreamTracker {
                     out_of_order_b_to_a: 0,
                     tls_client_random: None,
                     tls_cipher_suite: None,
+                    tls_server_random: None,
                     tls_decrypt_disabled: false,
                 },
             );
@@ -620,12 +633,12 @@ impl StreamTracker {
             };
         }
 
-        // TLS 1.3 decryption: opportunistically capture client_random
-        // from any ClientHello we see, and cipher_suite from any
-        // ServerHello. Both are plaintext on TLS 1.3 (handshakes start
-        // unencrypted). Both can land on the same flow but on
-        // different packets, so we check on every payload until both
-        // are populated.
+        // TLS decryption (1.3 and 1.2): opportunistically capture
+        // client_random from any ClientHello we see, and cipher_suite +
+        // server_random from any ServerHello. All are plaintext at the
+        // record layer (handshakes start unencrypted in both versions).
+        // They can land on the same flow but on different packets, so we
+        // check on every handshake payload until they're populated.
         if is_tcp && !payload.is_empty() && payload[0] == 0x16 {
             if stream.tls_client_random.is_none() {
                 let extracted = crate::dpi::tls::extract_client_random(payload);
@@ -650,6 +663,11 @@ impl StreamTracker {
                     );
                 }
                 stream.tls_cipher_suite = extracted;
+            }
+            if stream.tls_server_random.is_none() {
+                // Only consumed by the TLS 1.2 path; harmless to capture
+                // for 1.3 flows (their decrypt path ignores it).
+                stream.tls_server_random = crate::dpi::tls::extract_server_hello_random(payload);
             }
         }
 
@@ -816,11 +834,15 @@ impl StreamTracker {
         let aad = &payload[..5];
         let ciphertext_src = &payload[5..5 + length];
 
-        // Lazy-derive AEAD keys once the keylog has this flow's secrets.
+        // Lazy-derive AEAD keys once the keylog has this flow's secrets. The
+        // TLS version is inferred from which secret the keylog holds for this
+        // client_random: a `*_TRAFFIC_SECRET_0` pair ⇒ 1.3, a `CLIENT_RANDOM`
+        // master secret ⇒ 1.2. We can't tell from the wire alone — both carry
+        // application data as outer type 0x17 with record version 0x0303.
         if !self.tls_keys.contains_key(&stream_index) {
-            // First, pull the handshake-derived inputs off the stream and
-            // latch off streams that can never be decrypted.
-            let (cr, suite) = {
+            // Pull the handshake-derived inputs off the stream. Latch off
+            // streams that can never be decrypted; leave retryable ones be.
+            let (cr, cs_raw, server_random) = {
                 let stream = self.all_streams.get_mut(&stream_index)?;
                 if stream.tls_decrypt_disabled {
                     return None;
@@ -837,70 +859,127 @@ impl StreamTracker {
                     tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: cipher_suite not observed yet");
                     return None;
                 };
-                let Some(suite) = crate::dpi::tls_decrypt::CipherSuite::from_wire(cs_raw) else {
-                    stream.tls_decrypt_disabled = true;
-                    tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cs=%format!("0x{:04x}", cs_raw), "disable: cipher_suite not in TLS 1.3 support list");
-                    return None;
-                };
-                (cr, suite)
+                (cr, cs_raw, stream.tls_server_random)
             };
 
             // A keylog miss (or a half-written entry) is retryable — the
             // watcher may not have ingested the secret yet. Do NOT latch.
             let secrets = self.keylog.lookup(&cr)?;
-            let (Some(client_app), Some(server_app)) =
-                (secrets.client_application, secrets.server_application)
-            else {
-                tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: keylog hit but app-traffic secrets incomplete");
+
+            let derived = if let (Some(client_app), Some(server_app)) = (
+                secrets.client_application.as_ref(),
+                secrets.server_application.as_ref(),
+            ) {
+                // TLS 1.3 — key off the application traffic secrets.
+                let Some(suite) = crate::dpi::tls_decrypt::CipherSuite::from_wire(cs_raw) else {
+                    self.disable_tls_stream(stream_index);
+                    tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cs=%format!("0x{:04x}", cs_raw), "disable: cipher_suite not in TLS 1.3 support list");
+                    return None;
+                };
+                let client =
+                    crate::dpi::tls_decrypt::DirectionKeys::from_traffic_secret(suite, client_app);
+                let server =
+                    crate::dpi::tls_decrypt::DirectionKeys::from_traffic_secret(suite, server_app);
+                TlsStreamKeys::V13 { client, server }
+            } else if let Some(master) = secrets.master_secret.as_ref() {
+                // TLS 1.2 — derive the key block from the master secret. Needs
+                // the server_random (PRF seed); retry until the ServerHello is
+                // parsed.
+                let Some(suite) = crate::dpi::tls_decrypt::Tls12Suite::from_wire(cs_raw) else {
+                    self.disable_tls_stream(stream_index);
+                    tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cs=%format!("0x{:04x}", cs_raw), "disable: TLS 1.2 cipher suite not an AEAD suite we support");
+                    return None;
+                };
+                let Some(sr) = server_random else {
+                    tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: server_random not observed yet");
+                    return None;
+                };
+                let (client, server) = crate::dpi::tls_decrypt::Tls12DirectionKeys::derive(
+                    suite, master, &cr, &sr,
+                );
+                TlsStreamKeys::V12 { client, server }
+            } else {
+                tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: keylog hit but secrets incomplete");
                 return None;
             };
-            let client =
-                crate::dpi::tls_decrypt::DirectionKeys::from_traffic_secret(suite, &client_app);
-            let server =
-                crate::dpi::tls_decrypt::DirectionKeys::from_traffic_secret(suite, &server_app);
             tracing::debug!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "derived AEAD keys — decryption ready");
-            self.tls_keys
-                .insert(stream_index, TlsStreamKeys { client, server });
+            self.tls_keys.insert(stream_index, derived);
         }
 
-        let keys = self.tls_keys.get_mut(&stream_index)?;
-        let dir = if client_to_server {
-            &mut keys.client
-        } else {
-            &mut keys.server
-        };
-        match dir.decrypt_record_resync(aad, ciphertext_src, TLS_RESYNC_WINDOW) {
-            Ok(inner) => {
-                tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, plain_len=inner.content.len(), inner_type=inner.content_type, "decrypted record");
-                // A TLS 1.3 KeyUpdate (handshake type 24, RFC 8446 §4.6.3) is the
-                // last record under the current key; the sender then rekeys its
-                // sending direction. Derive generation N+1 so the records that
-                // follow keep decrypting (this is where long sessions otherwise
-                // "fell off the rails").
-                if inner.content_type == 22 && inner.content.first() == Some(&24) {
-                    dir.advance_generation();
-                    tracing::debug!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, "TLS KeyUpdate — advanced to next key generation");
-                }
-                // Only surface application_data (type 23) as decrypted plaintext.
-                // Post-handshake handshake messages (NewSessionTicket, type 22)
-                // and alerts (21) decrypt fine but are binary control records, not
-                // the conversation — dropping them keeps the detail pane and the
-                // "follow decrypted stream" view clean. The record's sequence was
-                // already advanced inside decrypt_record_resync, so returning None
-                // here does not desync the stream.
-                if inner.content_type == 23 {
-                    Some(inner.content)
-                } else {
-                    None
+        match self.tls_keys.get_mut(&stream_index)? {
+            TlsStreamKeys::V13 { client, server } => {
+                let dir = if client_to_server { client } else { server };
+                match dir.decrypt_record_resync(aad, ciphertext_src, TLS_RESYNC_WINDOW) {
+                    Ok(inner) => {
+                        tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, plain_len=inner.content.len(), inner_type=inner.content_type, "decrypted record (1.3)");
+                        // A TLS 1.3 KeyUpdate (handshake type 24, RFC 8446 §4.6.3)
+                        // is the last record under the current key; the sender then
+                        // rekeys its sending direction. Derive generation N+1 so the
+                        // records that follow keep decrypting (this is where long
+                        // sessions otherwise "fell off the rails").
+                        if inner.content_type == 22 && inner.content.first() == Some(&24) {
+                            dir.advance_generation();
+                            tracing::debug!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, "TLS KeyUpdate — advanced to next key generation");
+                        }
+                        // Only surface application_data (type 23) as decrypted
+                        // plaintext. Post-handshake handshake messages
+                        // (NewSessionTicket, type 22) and alerts (21) decrypt fine
+                        // but are binary control records, not the conversation —
+                        // dropping them keeps the detail pane and the "follow
+                        // decrypted stream" view clean. The record's sequence was
+                        // already advanced inside decrypt_record_resync, so
+                        // returning None here does not desync the stream.
+                        if inner.content_type == 23 {
+                            Some(inner.content)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        // Expected for handshake-secret records carried with outer
+                        // type 0x17 (EncryptedExtensions, Certificate, Finished),
+                        // which won't authenticate under the application keys.
+                        tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, error=?e, "decrypt miss (handshake record or sequence gap beyond window)");
+                        None
+                    }
                 }
             }
-            Err(e) => {
-                // Expected for handshake-secret records carried with outer
-                // type 0x17 (EncryptedExtensions, Certificate, Finished),
-                // which won't authenticate under the application keys.
-                tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, error=?e, "decrypt miss (handshake record or sequence gap beyond window)");
-                None
+            TlsStreamKeys::V12 { client, server } => {
+                let dir = if client_to_server { client } else { server };
+                // In TLS 1.2 the outer record content type is the real type, so
+                // an application_data (0x17) record decrypts directly to the
+                // cleartext — no inner content-type byte to strip, and no
+                // KeyUpdate mechanism to track.
+                let content_type = payload[0];
+                let version = [payload[1], payload[2]];
+                match dir.decrypt_record_resync(
+                    content_type,
+                    version,
+                    ciphertext_src,
+                    TLS_RESYNC_WINDOW,
+                ) {
+                    Ok(plaintext) => {
+                        tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, plain_len=plaintext.len(), "decrypted record (1.2)");
+                        Some(plaintext)
+                    }
+                    Err(e) => {
+                        // Expected for the encrypted Finished / NewSessionTicket
+                        // records (outer type 0x16, not reaching here) and for
+                        // sequence gaps beyond the resync window.
+                        tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, error=?e, "decrypt miss (1.2 — sequence gap beyond window)");
+                        None
+                    }
+                }
             }
+        }
+    }
+
+    /// Latch a stream as permanently undecryptable. Used when we have the
+    /// keylog secret but the negotiated cipher suite is outside our support
+    /// set (e.g. a TLS 1.2 CBC suite) — retrying can never succeed.
+    fn disable_tls_stream(&mut self, stream_index: u32) {
+        if let Some(s) = self.all_streams.get_mut(&stream_index) {
+            s.tls_decrypt_disabled = true;
         }
     }
 

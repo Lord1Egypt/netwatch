@@ -1,4 +1,5 @@
-//! Passive TLS 1.3 Application-Data decryption via NSS SSLKEYLOGFILE.
+//! Passive TLS 1.3 and TLS 1.2 Application-Data decryption via NSS
+//! SSLKEYLOGFILE.
 //!
 //! When a cooperating client process (Chrome, Firefox, Node, curl with
 //! the right env var, etc.) is launched with `SSLKEYLOGFILE=/path/to/keylog`,
@@ -21,9 +22,17 @@
 //!   derives generation N+1 ("traffic upd") and resets the record sequence, so
 //!   long-lived sessions keep decrypting after a re-key.
 //!
+//! ## TLS 1.2 (also in scope)
+//!
+//! - Master secret from the `CLIENT_RANDOM` keylog line; key block via the
+//!   TLS 1.2 PRF (RFC 5246 §5). AEAD suites only: AES-128/256-GCM
+//!   (RFC 5288) and ChaCha20-Poly1305 (RFC 7905). Legacy CBC
+//!   mac-then-encrypt suites are out of scope. See the TLS 1.2 section
+//!   lower in this file ([`Tls12Suite`], [`Tls12DirectionKeys`]).
+//!
 //! ## What's not in scope (deferred to later phases)
 //!
-//! - TLS 1.2 (different key schedule + AEAD modes).
+//! - TLS 1.2 CBC (mac-then-encrypt) suites.
 //! - QUIC application-data decryption (different secret labels, same
 //!   AEAD primitives — Phase 2).
 //! - 0-RTT (`EARLY_TRAFFIC_SECRET`).
@@ -50,6 +59,7 @@ use std::time::Duration;
 
 use ring::aead;
 use ring::hkdf;
+use ring::hmac;
 
 /// TLS 1.3 cipher suite IDs we support.
 /// Other suites parse as unknown and decryption fails fast.
@@ -128,6 +138,11 @@ pub struct Secrets {
     pub server_application: Option<Vec<u8>>,
     pub client_handshake: Option<Vec<u8>>,
     pub server_handshake: Option<Vec<u8>>,
+    /// TLS 1.2 master secret (48 bytes) from a `CLIENT_RANDOM` keylog
+    /// line. `None` for TLS 1.3 connections (which log traffic secrets
+    /// instead). Its presence is what routes a flow to the TLS 1.2
+    /// decrypt path in `try_decrypt_tls_record`.
+    pub master_secret: Option<Vec<u8>>,
 }
 
 /// In-memory keylog index: `client_random` (32 bytes) → Secrets.
@@ -177,10 +192,12 @@ impl KeylogStore {
             KeylogLabel::ServerApplicationTrafficSecret0 => entry.server_application = Some(secret),
             KeylogLabel::ClientHandshakeTrafficSecret => entry.client_handshake = Some(secret),
             KeylogLabel::ServerHandshakeTrafficSecret => entry.server_handshake = Some(secret),
+            // TLS 1.2: the CLIENT_RANDOM line carries the 48-byte master
+            // secret. Routes the flow to the TLS 1.2 decrypt path.
+            KeylogLabel::ClientRandom => entry.master_secret = Some(secret),
             // The remaining variants are recognized but not yet stored
-            // — Phase 1 only needs the application-data secrets. We
-            // accept them so we don't log noise for normal keylog
-            // files that contain them.
+            // (EARLY_TRAFFIC_SECRET, EXPORTER_SECRET). We accept them so
+            // we don't log noise for normal keylog files that contain them.
             _ => {}
         }
         tracing::trace!(
@@ -540,6 +557,258 @@ pub enum DecryptError {
     AeadAuthFailed,
     SeqOverflow,
     AllZeroPlaintext,
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// TLS 1.2 Application-Data decryption.
+//
+// TLS 1.2 differs from the 1.3 path above in three ways, all handled here:
+//
+//   1. Key schedule. 1.3 derives per-direction keys straight from the keylog
+//      traffic secrets via HKDF-Expand-Label. 1.2 instead runs the PRF
+//      (HMAC-based P_hash, RFC 5246 §5) over the 48-byte *master secret* with
+//      label "key expansion" and seed `server_random || client_random` to
+//      produce a key block, which is sliced into the per-direction write keys
+//      and fixed IVs. So 1.2 needs the master secret (CLIENT_RANDOM keylog
+//      line) plus the server_random read off the ServerHello.
+//
+//   2. Nonce. 1.2-GCM (RFC 5288) prepends an 8-byte *explicit* nonce to each
+//      record; the AEAD nonce is `fixed_iv(4) || explicit(8)`. 1.2-ChaCha
+//      (RFC 7905) has no explicit nonce and builds it like 1.3:
+//      `fixed_iv(12) XOR seq`.
+//
+//   3. AAD. 1.2 authenticates `seq(8) || type(1) || version(2) ||
+//      plaintext_len(2)` (RFC 5246 §6.2.3.3), where plaintext_len excludes the
+//      explicit nonce and tag — not the 5-byte record header 1.3 uses. And
+//      there is no inner content-type byte: the outer record type is the real
+//      type, so no `strip_inner_plaintext` step.
+// ────────────────────────────────────────────────────────────────────────
+
+/// AEAD TLS 1.2 cipher suites we can decrypt. Legacy CBC mac-then-encrypt
+/// suites are intentionally excluded — only AEAD (GCM / ChaCha20-Poly1305)
+/// suites are modelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls12Suite {
+    Aes128Gcm,
+    Aes256Gcm,
+    Chacha20Poly1305,
+}
+
+impl Tls12Suite {
+    pub fn from_wire(id: u16) -> Option<Self> {
+        match id {
+            // ECDHE / DHE / static-RSA, AES-128-GCM, SHA-256 PRF.
+            0xc02b | 0xc02f | 0x009c | 0x009e => Some(Self::Aes128Gcm),
+            // ECDHE / DHE / static-RSA, AES-256-GCM, SHA-384 PRF.
+            0xc02c | 0xc030 | 0x009d | 0x009f => Some(Self::Aes256Gcm),
+            // ECDHE ChaCha20-Poly1305, SHA-256 PRF (RFC 7905).
+            0xcca8 | 0xcca9 => Some(Self::Chacha20Poly1305),
+            _ => None,
+        }
+    }
+
+    fn aead_alg(self) -> &'static aead::Algorithm {
+        match self {
+            Self::Aes128Gcm => &aead::AES_128_GCM,
+            Self::Aes256Gcm => &aead::AES_256_GCM,
+            Self::Chacha20Poly1305 => &aead::CHACHA20_POLY1305,
+        }
+    }
+
+    fn prf_hmac(self) -> hmac::Algorithm {
+        match self {
+            Self::Aes128Gcm | Self::Chacha20Poly1305 => hmac::HMAC_SHA256,
+            Self::Aes256Gcm => hmac::HMAC_SHA384,
+        }
+    }
+
+    fn key_len(self) -> usize {
+        self.aead_alg().key_len()
+    }
+
+    /// Implicit ("fixed") IV from the key block: 4 bytes for GCM (the rest of
+    /// the 12-byte nonce is the explicit per-record nonce), 12 for ChaCha.
+    fn fixed_iv_len(self) -> usize {
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm => 4,
+            Self::Chacha20Poly1305 => 12,
+        }
+    }
+
+    /// Explicit per-record nonce length carried on the wire ahead of the
+    /// ciphertext: 8 for GCM, 0 for ChaCha20-Poly1305.
+    fn record_iv_len(self) -> usize {
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm => 8,
+            Self::Chacha20Poly1305 => 0,
+        }
+    }
+
+    fn key_block_len(self) -> usize {
+        // 2 * (mac_key_len + enc_key_len + fixed_iv_len); mac_key_len = 0 for AEAD.
+        2 * (self.key_len() + self.fixed_iv_len())
+    }
+}
+
+/// TLS 1.2 PRF `P_hash` (RFC 5246 §5): expand `secret` over `seed` to
+/// `out_len` bytes using the suite's HMAC.
+fn p_hash(alg: hmac::Algorithm, secret: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
+    let key = hmac::Key::new(alg, secret);
+    // A(1) = HMAC(secret, seed); A(i) = HMAC(secret, A(i-1)).
+    let mut a = hmac::sign(&key, seed).as_ref().to_vec();
+    let mut out = Vec::with_capacity(out_len);
+    while out.len() < out_len {
+        let mut ctx = hmac::Context::with_key(&key);
+        ctx.update(&a);
+        ctx.update(seed);
+        out.extend_from_slice(ctx.sign().as_ref());
+        a = hmac::sign(&key, &a).as_ref().to_vec();
+    }
+    out.truncate(out_len);
+    out
+}
+
+/// TLS 1.2 PRF (RFC 5246 §5): `PRF(secret, label, seed) = P_hash(secret,
+/// label || seed)`.
+fn tls12_prf(alg: hmac::Algorithm, secret: &[u8], label: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
+    let mut label_seed = Vec::with_capacity(label.len() + seed.len());
+    label_seed.extend_from_slice(label);
+    label_seed.extend_from_slice(seed);
+    p_hash(alg, secret, &label_seed, out_len)
+}
+
+/// Per-direction TLS 1.2 AEAD state: the write key, the fixed IV, and the
+/// record sequence number (only the AAD — and, for ChaCha, the nonce —
+/// depend on it).
+pub struct Tls12DirectionKeys {
+    aead: aead::LessSafeKey,
+    suite: Tls12Suite,
+    fixed_iv: Vec<u8>,
+    next_seq: u64,
+}
+
+impl Tls12DirectionKeys {
+    /// Derive both directions' keys from the master secret. Returns
+    /// `(client_write, server_write)`. Per RFC 5246 §6.3 the key block is
+    /// `client_write_key || server_write_key || client_write_IV ||
+    /// server_write_IV` (MAC keys are empty for AEAD suites).
+    pub fn derive(
+        suite: Tls12Suite,
+        master_secret: &[u8],
+        client_random: &[u8; 32],
+        server_random: &[u8; 32],
+    ) -> (Self, Self) {
+        let mut seed = Vec::with_capacity(64);
+        seed.extend_from_slice(server_random);
+        seed.extend_from_slice(client_random);
+        let key_block = tls12_prf(
+            suite.prf_hmac(),
+            master_secret,
+            b"key expansion",
+            &seed,
+            suite.key_block_len(),
+        );
+
+        let k = suite.key_len();
+        let iv = suite.fixed_iv_len();
+        let client_key = &key_block[0..k];
+        let server_key = &key_block[k..2 * k];
+        let client_iv = &key_block[2 * k..2 * k + iv];
+        let server_iv = &key_block[2 * k + iv..2 * k + 2 * iv];
+
+        let mk = |key: &[u8], fixed_iv: &[u8]| {
+            let unbound = aead::UnboundKey::new(suite.aead_alg(), key).unwrap();
+            Self {
+                aead: aead::LessSafeKey::new(unbound),
+                suite,
+                fixed_iv: fixed_iv.to_vec(),
+                next_seq: 0,
+            }
+        };
+        (mk(client_key, client_iv), mk(server_key, server_iv))
+    }
+
+    /// Build the 12-byte AEAD nonce for a record at sequence `seq`.
+    /// GCM (RFC 5288): `fixed_iv(4) || explicit_nonce(8)`. ChaCha (RFC 7905):
+    /// `fixed_iv(12) XOR seq` (seq right-aligned), so no explicit nonce.
+    fn nonce_for(&self, seq: u64, explicit_nonce: &[u8]) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        match self.suite {
+            Tls12Suite::Aes128Gcm | Tls12Suite::Aes256Gcm => {
+                nonce[..4].copy_from_slice(&self.fixed_iv);
+                nonce[4..].copy_from_slice(explicit_nonce);
+            }
+            Tls12Suite::Chacha20Poly1305 => {
+                nonce.copy_from_slice(&self.fixed_iv);
+                let seq_be = seq.to_be_bytes();
+                for i in 0..8 {
+                    nonce[4 + i] ^= seq_be[i];
+                }
+            }
+        }
+        nonce
+    }
+
+    /// TLS 1.2 AAD (RFC 5246 §6.2.3.3): `seq(8) || type(1) || version(2) ||
+    /// plaintext_len(2)`.
+    fn aad(seq: u64, content_type: u8, version: [u8; 2], plaintext_len: usize) -> [u8; 13] {
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&seq.to_be_bytes());
+        aad[8] = content_type;
+        aad[9] = version[0];
+        aad[10] = version[1];
+        aad[11..].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
+        aad
+    }
+
+    /// Decrypt one TLS 1.2 record's payload (the bytes after the 5-byte record
+    /// header). `content_type` and `version` come from that header.
+    ///
+    /// Like the 1.3 [`DirectionKeys::decrypt_record_resync`], this tries
+    /// sequence numbers in `[next_seq, next_seq + max_skip]` and uses whichever
+    /// authenticates, so a flow whose master secret arrived late (the keylog
+    /// watcher race) or that skipped an unreassembled record re-locks onto the
+    /// correct sequence. Returns the cleartext (no inner content-type byte in
+    /// TLS 1.2) on success.
+    pub fn decrypt_record_resync(
+        &mut self,
+        content_type: u8,
+        version: [u8; 2],
+        record_payload: &[u8],
+        max_skip: u64,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let tag_len = self.aead.algorithm().tag_len();
+        let rec_iv = self.suite.record_iv_len();
+        if record_payload.len() < rec_iv + tag_len {
+            return Err(DecryptError::ShortCiphertext);
+        }
+        let explicit_nonce = &record_payload[..rec_iv];
+        let ct_and_tag = &record_payload[rec_iv..];
+        let plaintext_len = ct_and_tag.len() - tag_len;
+
+        let start = self.next_seq;
+        let end = start.saturating_add(max_skip);
+        let mut seq = start;
+        loop {
+            let nonce_bytes = self.nonce_for(seq, explicit_nonce);
+            let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+            let aad = Self::aad(seq, content_type, version, plaintext_len);
+            let mut buf = ct_and_tag.to_vec();
+            if self
+                .aead
+                .open_in_place(nonce, aead::Aad::from(&aad), &mut buf)
+                .is_ok()
+            {
+                buf.truncate(plaintext_len);
+                self.next_seq = seq.checked_add(1).ok_or(DecryptError::SeqOverflow)?;
+                return Ok(buf);
+            }
+            if seq >= end {
+                return Err(DecryptError::AeadAuthFailed);
+            }
+            seq = seq.checked_add(1).ok_or(DecryptError::SeqOverflow)?;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -963,5 +1232,158 @@ mod tests {
             .expect("gen-1 record must decrypt after KeyUpdate advance");
         assert_eq!(inner.content, plaintext);
         assert_eq!(inner.content_type, 0x17);
+    }
+
+    // ── TLS 1.2 ─────────────────────────────────────────────────
+
+    /// TLS 1.2 master secret stored from a CLIENT_RANDOM keylog line —
+    /// this is what routes a flow to the 1.2 decrypt path.
+    #[test]
+    fn ingest_line_stores_tls12_master_secret() {
+        let store = KeylogStore::default();
+        let cr = "ab".repeat(32);
+        // The master secret is 48 bytes (96 hex chars).
+        let ms = "cd".repeat(48);
+        assert!(store.ingest_line(&format!("CLIENT_RANDOM {cr} {ms}")));
+        let s = store.lookup(&[0xab; 32]).unwrap();
+        assert_eq!(s.master_secret, Some(vec![0xcd; 48]));
+        // And it does not populate the 1.3 traffic-secret slots.
+        assert!(s.client_application.is_none());
+    }
+
+    /// Independent known-answer for the TLS 1.2 PRF (P_SHA256), inputs from
+    /// the IETF TLS WG test vector (Michael D'Errico, 2010):
+    ///   secret = 9bbe436ba940f017b17652849a71db35
+    ///   label  = "test label"
+    ///   seed   = a0ba9f936cda311827a6f796ffd5198c
+    /// The expected prefix below was cross-checked against an independent
+    /// Python stdlib `hmac`/`hashlib` implementation of the RFC 5246 PRF (a
+    /// different HMAC than ring's), so this catches a PRF that is
+    /// self-consistent but non-interoperable — something the round-trip
+    /// tests below, which use the PRF on both sides, cannot.
+    #[test]
+    fn tls12_prf_sha256_matches_ietf_vector() {
+        let secret = [
+            0x9b, 0xbe, 0x43, 0x6b, 0xa9, 0x40, 0xf0, 0x17, 0xb1, 0x76, 0x52, 0x84, 0x9a, 0x71,
+            0xdb, 0x35,
+        ];
+        let seed = [
+            0xa0, 0xba, 0x9f, 0x93, 0x6c, 0xda, 0x31, 0x18, 0x27, 0xa6, 0xf7, 0x96, 0xff, 0xd5,
+            0x19, 0x8c,
+        ];
+        let out = tls12_prf(hmac::HMAC_SHA256, &secret, b"test label", &seed, 100);
+        assert_eq!(out.len(), 100);
+        assert_eq!(
+            &out[..16],
+            &[
+                0xe3, 0xf2, 0x29, 0xba, 0x72, 0x7b, 0xe1, 0x7b, 0x8d, 0x12, 0x26, 0x20, 0x55, 0x7c,
+                0xd4, 0x53,
+            ]
+        );
+    }
+
+    /// Seal `plaintext` as a TLS 1.2 application_data record's payload (the
+    /// bytes after the 5-byte header) under the *client* write keys at
+    /// sequence `seq`, using the same derivation the decrypter uses. For GCM
+    /// this prepends the 8-byte explicit nonce; for ChaCha there is none.
+    fn seal_tls12_client(
+        suite: Tls12Suite,
+        master: &[u8],
+        cr: &[u8; 32],
+        sr: &[u8; 32],
+        seq: u64,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let (dir, _server) = Tls12DirectionKeys::derive(suite, master, cr, sr);
+        let rec_iv = suite.record_iv_len();
+        let explicit = seq.to_be_bytes();
+        let nonce_bytes = dir.nonce_for(seq, &explicit[..rec_iv]);
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+        let aad = Tls12DirectionKeys::aad(seq, 0x17, [0x03, 0x03], plaintext.len());
+        let mut buf = plaintext.to_vec();
+        dir.aead
+            .seal_in_place_append_tag(nonce, aead::Aad::from(&aad), &mut buf)
+            .unwrap();
+        let mut payload = Vec::with_capacity(rec_iv + buf.len());
+        payload.extend_from_slice(&explicit[..rec_iv]);
+        payload.extend_from_slice(&buf);
+        payload
+    }
+
+    // A throwaway master secret / randoms for round-trip tests. Values are
+    // arbitrary — the round-trip only needs seal and open to agree.
+    const TLS12_MASTER: [u8; 48] = [0x5a; 48];
+    const TLS12_CR: [u8; 32] = [0x11; 32];
+    const TLS12_SR: [u8; 32] = [0x22; 32];
+
+    fn tls12_roundtrip(suite: Tls12Suite) {
+        let plaintext = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let payload = seal_tls12_client(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR, 0, plaintext);
+        let (mut client, _server) =
+            Tls12DirectionKeys::derive(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR);
+        let out = client
+            .decrypt_record_resync(0x17, [0x03, 0x03], &payload, 16)
+            .expect("record sealed under client keys must decrypt");
+        assert_eq!(out, plaintext);
+        assert_eq!(client.next_seq, 1);
+    }
+
+    #[test]
+    fn tls12_aes128_gcm_roundtrip() {
+        tls12_roundtrip(Tls12Suite::Aes128Gcm); // 0xc02f etc.
+    }
+
+    #[test]
+    fn tls12_aes256_gcm_roundtrip() {
+        tls12_roundtrip(Tls12Suite::Aes256Gcm); // SHA-384 PRF, 0xc030 etc.
+    }
+
+    #[test]
+    fn tls12_chacha20_poly1305_roundtrip() {
+        tls12_roundtrip(Tls12Suite::Chacha20Poly1305); // 0xcca8/0xcca9 — no explicit nonce
+    }
+
+    #[test]
+    fn tls12_resync_recovers_late_sequence() {
+        // The first application_data record we see is the client's seq 4 (the
+        // Finished and a few records flowed before the keylog secret landed).
+        // The receiver starts at next_seq=0 and searches forward.
+        let suite = Tls12Suite::Aes128Gcm;
+        let pt = b"late but recoverable";
+        let payload = seal_tls12_client(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR, 4, pt);
+        let (mut client, _server) =
+            Tls12DirectionKeys::derive(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR);
+        let out = client
+            .decrypt_record_resync(0x17, [0x03, 0x03], &payload, 16)
+            .expect("forward search within window must find seq 4");
+        assert_eq!(out, pt);
+        assert_eq!(client.next_seq, 5);
+    }
+
+    #[test]
+    fn tls12_wrong_direction_key_fails() {
+        // A record sealed under the client write keys must NOT authenticate
+        // under the server write keys — proves the key block is sliced per
+        // direction, not shared.
+        let suite = Tls12Suite::Aes128Gcm;
+        let payload = seal_tls12_client(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR, 0, b"hi");
+        let (_client, mut server) =
+            Tls12DirectionKeys::derive(suite, &TLS12_MASTER, &TLS12_CR, &TLS12_SR);
+        assert_eq!(
+            server.decrypt_record_resync(0x17, [0x03, 0x03], &payload, 16),
+            Err(DecryptError::AeadAuthFailed)
+        );
+    }
+
+    #[test]
+    fn tls12_suite_rejects_cbc_and_tls13_suites() {
+        assert!(Tls12Suite::from_wire(0x002f).is_none()); // RSA_AES_128_CBC_SHA
+        assert!(Tls12Suite::from_wire(0x1301).is_none()); // TLS 1.3 suite
+        assert_eq!(Tls12Suite::from_wire(0xc02f), Some(Tls12Suite::Aes128Gcm));
+        assert_eq!(Tls12Suite::from_wire(0xc030), Some(Tls12Suite::Aes256Gcm));
+        assert_eq!(
+            Tls12Suite::from_wire(0xcca8),
+            Some(Tls12Suite::Chacha20Poly1305)
+        );
     }
 }
