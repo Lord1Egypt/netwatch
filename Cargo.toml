@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.25.6"
+version = "0.25.7"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -21,6 +21,7 @@ exclude = [
     "demo-all.tape",
     "demo-linkedin.gif",
     "demo-linkedin.tape",
+    "demo-tls12-decrypt.gif",
     "demo-slides.txt",
     "netwatch-demo.mov",
     "*.tape",

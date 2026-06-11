@@ -4,6 +4,11 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.7] - 2026-06-11
+
+### Added
+- **Passive TLS 1.2 application-data decryption.** Extends the SSLKEYLOGFILE-driven decryptor (previously TLS 1.3 + QUIC) to TLS 1.2 AEAD flows. The 48-byte master secret from a `CLIENT_RANDOM` keylog line, plus the `server_random` read off the ServerHello, feed the TLS 1.2 PRF (RFC 5246 §5) to derive the key block; records are then decrypted for AES-128/256-GCM (RFC 5288 — 8-byte explicit nonce + 4-byte fixed IV) and ChaCha20-Poly1305 (RFC 7905). It reuses the shared keylog store, background watcher, `decrypted:` display filter, and stream/detail rendering, so 1.2 flows surface through the same UI as 1.3. A flow's version is inferred from which keylog secret is present (`CLIENT_RANDOM` ⇒ 1.2, `*_TRAFFIC_SECRET_0` ⇒ 1.3), and per-direction sequence resync recovers when the keylog secret is ingested after the first records flow. Legacy CBC mac-then-encrypt suites remain out of scope. A live verification harness ships as `examples/tls12_decrypt_live.rs` (with `scripts/verify-tls12-decrypt.sh`).
+
 ## [0.25.6] - 2026-06-08
 
 ### Added
