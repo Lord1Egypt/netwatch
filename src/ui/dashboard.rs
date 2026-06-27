@@ -636,7 +636,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
         });
         entry.rx_rate += c.rx_rate.unwrap_or(0.0);
         entry.tx_rate += c.tx_rate.unwrap_or(0.0);
-        if let Some(rtt_us) = c.kernel_rtt_us {
+        if let Some(rtt_us) = c.handshake_rtt_us {
             let rtt_ms = rtt_us / 1000.0;
             entry.rtt_ms_min = Some(match entry.rtt_ms_min {
                 Some(prev) => prev.min(rtt_ms),

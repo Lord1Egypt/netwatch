@@ -31,7 +31,7 @@ pub struct ProcessBandwidth {
     pub tx_rate: f64,
     pub connection_count: u32,
     /// Min RTT (ms) across this process's TCP connections — derived from
-    /// `Connection.kernel_rtt_us`. None when no kernel RTT data is available.
+    /// `Connection.handshake_rtt_us`. None when no handshake RTT is available.
     pub rtt_ms: Option<f64>,
     /// CPU%, populated from a background `ps` poll. None until the first
     /// poll completes (or when the platform doesn't support the sampler).
@@ -115,7 +115,7 @@ impl ProcessBandwidthCollector {
             if let Some(tx) = conn.tx_rate {
                 *process_tx_rate.entry(key.clone()).or_insert(0.0) += tx;
             }
-            if let Some(rtt_us) = conn.kernel_rtt_us {
+            if let Some(rtt_us) = conn.handshake_rtt_us {
                 let rtt_ms = rtt_us / 1000.0;
                 process_rtt
                     .entry(key)
@@ -286,7 +286,7 @@ mod tests {
             state: state.into(),
             pid: Some(pid),
             process_name: Some(name.into()),
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: rx,
             tx_rate: tx,
             attribution: Default::default(),

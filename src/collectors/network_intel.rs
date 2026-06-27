@@ -8,9 +8,11 @@ const PORT_SCAN_THRESHOLD: usize = 20;
 const BEACON_MIN_SAMPLES: usize = 5;
 const BEACON_MAX_SAMPLES: usize = 8;
 const BEACON_JITTER_THRESHOLD: f64 = 0.15;
+const BEACON_REALERT_COOLDOWN_SECS: u64 = 300; // re-surface a live beacon at most this often
 const DNS_TUNNEL_QNAME_LEN: usize = 80;
 const DNS_TUNNEL_QUERY_RATE: u32 = 50; // per minute per base domain
 const DNS_TUNNEL_UNIQUE_SUBS: usize = 30;
+const DNS_TUNNEL_ALERT_COOLDOWN_SECS: u64 = 60; // one alert per base domain per window
 const DNS_OUTSTANDING_TIMEOUT_SECS: u64 = 5;
 const STALE_ENTRY_SECS: u64 = 300;
 pub(crate) const MAX_TRACKED_IPS: usize = 1000;
@@ -84,6 +86,15 @@ pub struct InterfaceRateEvent {
     pub tx_bps: u64,
 }
 
+/// A data-carrying packet observed on an already-established flow, used to
+/// detect persistent-connection (single-socket) C2 beaconing that emits no
+/// new SYNs. Fed from the packet pump in `App::feed_network_intel`.
+pub struct FlowActivityEvent {
+    pub src_ip: String,
+    pub dst_ip: String,
+    pub dst_port: u16,
+}
+
 // ── Anomaly detection state ────────────────────────────────
 
 struct ScanState {
@@ -103,7 +114,10 @@ struct BeaconKey {
 struct BeaconState {
     last_seen: Instant,
     deltas: VecDeque<Duration>,
-    alerted: bool,
+    /// Last time this beacon raised an alert, gating a re-alert cooldown
+    /// so a persistent beacon resurfaces periodically rather than firing
+    /// once and never again.
+    last_alert: Option<Instant>,
 }
 
 // ── DNS analytics state ────────────────────────────────────
@@ -152,6 +166,10 @@ struct DomainStats {
     max_qname_len: usize,
     unique_prefixes: HashSet<String>,
     window_start: Instant,
+    /// Last time we raised a DNS-tunnel alert for this base domain.
+    /// Gates a per-domain cooldown so a flood of tunneled queries
+    /// collapses to one alert instead of one-per-query.
+    last_alert: Option<Instant>,
 }
 
 // ── Bandwidth alert state ──────────────────────────────────
@@ -283,8 +301,29 @@ impl NetworkIntelCollector {
 
     pub fn on_conn_attempt(&mut self, event: ConnAttemptEvent) {
         let now = Instant::now();
+        let key = BeaconKey {
+            src: event.src_ip.clone(),
+            dst: event.dst_ip.clone(),
+            dst_port: event.dst_port,
+        };
         self.detect_port_scan(&event, now);
-        self.detect_beacon(&event, now);
+        self.detect_beacon(key, now);
+    }
+
+    /// Feed a data-carrying packet on an established flow. This catches the
+    /// dominant modern C2 shape — a single persistent TCP/TLS connection
+    /// that heartbeats on a fixed interval — which emits no new SYNs and is
+    /// therefore invisible to `on_conn_attempt`. Routes into the same
+    /// beacon jitter analysis; the detector's 5s–3600s delta window means a
+    /// chatty download (sub-5s gaps) never registers as a beacon.
+    pub fn on_flow_activity(&mut self, event: FlowActivityEvent) {
+        let now = Instant::now();
+        let key = BeaconKey {
+            src: event.src_ip,
+            dst: event.dst_ip,
+            dst_port: event.dst_port,
+        };
+        self.detect_beacon(key, now);
     }
 
     pub fn on_dns_query(&mut self, event: DnsQueryEvent) {
@@ -295,6 +334,23 @@ impl NetworkIntelCollector {
         let base_domain = extract_base_domain(&event.qname);
         *self.domain_counts.entry(base_domain.clone()).or_insert(0) += 1;
 
+        // Bound domain_tunnel_stats: a DNS flood with endlessly unique base
+        // domains would otherwise grow it without limit inside the 5-minute
+        // prune window. Evict the oldest-window entry on a genuinely new key
+        // at cap (same LRU pattern as scan/beacon state).
+        if self.domain_tunnel_stats.len() >= MAX_TRACKED_DOMAINS
+            && !self.domain_tunnel_stats.contains_key(&base_domain)
+        {
+            if let Some(oldest) = self
+                .domain_tunnel_stats
+                .iter()
+                .min_by_key(|(_, s)| s.window_start)
+                .map(|(k, _)| k.clone())
+            {
+                self.domain_tunnel_stats.remove(&oldest);
+            }
+        }
+
         // Track for tunnel detection
         let stats = self
             .domain_tunnel_stats
@@ -304,6 +360,7 @@ impl NetworkIntelCollector {
                 max_qname_len: 0,
                 unique_prefixes: HashSet::new(),
                 window_start: now,
+                last_alert: None,
             });
         stats.count += 1;
         if event.qname.len() > stats.max_qname_len {
@@ -469,13 +526,13 @@ impl NetworkIntelCollector {
         }
     }
 
-    fn detect_beacon(&mut self, event: &ConnAttemptEvent, now: Instant) {
-        let key = BeaconKey {
-            src: event.src_ip.clone(),
-            dst: event.dst_ip.clone(),
-            dst_port: event.dst_port,
-        };
-
+    /// Feed one timing sample for a `(src, dst, dst_port)` flow into the
+    /// beacon detector. Called both from new-SYN connection attempts and
+    /// from per-flow data bursts on already-established connections, so a
+    /// single long-lived heartbeat C2 (no new SYNs) is still caught. The
+    /// 5s–3600s delta filter coalesces the packets of one burst into a
+    /// single sample and ignores continuous transfers (sub-5s deltas).
+    fn detect_beacon(&mut self, key: BeaconKey, now: Instant) {
         // Same LRU-evict-on-overflow pattern as detect_port_scan. A
         // sufficiently noisy set of beaconing flows shouldn't lock us
         // out of detecting newer ones.
@@ -497,7 +554,7 @@ impl NetworkIntelCollector {
             .or_insert_with(|| BeaconState {
                 last_seen: now,
                 deltas: VecDeque::new(),
-                alerted: false,
+                last_alert: None,
             });
 
         let delta = now.duration_since(state.last_seen);
@@ -511,7 +568,14 @@ impl NetworkIntelCollector {
             }
         }
 
-        if state.deltas.len() >= BEACON_MIN_SAMPLES && !state.alerted {
+        // Re-arm after a cooldown instead of firing once and going silent
+        // forever. A live beacon that keeps ticking should resurface
+        // periodically — the recorder may have been re-armed since — but
+        // not on every interval. Mirrors the DNS-tunnel cooldown.
+        let cooled_down = state.last_alert.is_none_or(|t| {
+            now.duration_since(t) >= Duration::from_secs(BEACON_REALERT_COOLDOWN_SECS)
+        });
+        if state.deltas.len() >= BEACON_MIN_SAMPLES && cooled_down {
             let mean = state.deltas.iter().map(|d| d.as_secs_f64()).sum::<f64>()
                 / state.deltas.len() as f64;
             let variance = state
@@ -527,7 +591,7 @@ impl NetworkIntelCollector {
             let jitter = if mean > 0.0 { stddev / mean } else { 1.0 };
 
             if jitter < BEACON_JITTER_THRESHOLD {
-                state.alerted = true;
+                state.last_alert = Some(now);
                 let msg = format!("Beaconing: {} → {}:{}", key.src, key.dst, key.dst_port);
                 let detail = format!(
                     "Regular interval {:.1}s (jitter {:.1}%), {} samples",
@@ -535,8 +599,11 @@ impl NetworkIntelCollector {
                     jitter * 100.0,
                     state.deltas.len()
                 );
+                // Critical so the Flight Recorder auto-freezes on it — a
+                // low-jitter periodic beacon is the canonical C2 signature
+                // and is exactly the incident the recorder exists to capture.
                 self.push_alert(
-                    AlertSeverity::Warning,
+                    AlertSeverity::Critical,
                     AlertCategory::Beaconing,
                     msg,
                     detail,
@@ -546,28 +613,34 @@ impl NetworkIntelCollector {
     }
 
     fn detect_dns_tunnel(&mut self, event: &DnsQueryEvent, now: Instant) {
-        // Check 1: very long qname
-        if event.qname.len() > DNS_TUNNEL_QNAME_LEN {
-            let msg = format!("Suspicious DNS: long query name ({}b)", event.qname.len());
-            let detail = format!("Query: {}", &event.qname[..event.qname.len().min(120)]);
-            self.push_alert(
-                AlertSeverity::Warning,
-                AlertCategory::DnsTunnel,
-                msg,
-                detail,
-            );
-            return;
+        let base = extract_base_domain(&event.qname);
+
+        // Per-base-domain cooldown. A live tunnel sprays thousands of
+        // queries; without this gate each one would inject its own alert
+        // and bury everything else in `active_alerts`/`alert_history`.
+        // Suppress repeats for the same base domain inside the window.
+        if let Some(stats) = self.domain_tunnel_stats.get(&base) {
+            if let Some(last) = stats.last_alert {
+                if now.duration_since(last) < Duration::from_secs(DNS_TUNNEL_ALERT_COOLDOWN_SECS) {
+                    return;
+                }
+            }
         }
 
-        // Check 2: high rate + many unique subdomains to one base domain
-        let base = extract_base_domain(&event.qname);
-        if let Some(stats) = self.domain_tunnel_stats.get(&base) {
+        // Evaluate both heuristics without holding a mutable borrow, so we
+        // can update the cooldown and push the alert afterward.
+        let alert = if event.qname.len() > DNS_TUNNEL_QNAME_LEN {
+            // Check 1: very long qname.
+            let msg = format!("Suspicious DNS: long query name ({}b)", event.qname.len());
+            let detail = format!("Query: {}", &event.qname[..event.qname.len().min(120)]);
+            Some((AlertSeverity::Warning, msg, detail))
+        } else if let Some(stats) = self.domain_tunnel_stats.get(&base) {
+            // Check 2: high rate + many unique subdomains to one base domain.
             let elapsed = now
                 .duration_since(stats.window_start)
                 .as_secs_f64()
                 .max(1.0);
             let rate_per_min = stats.count as f64 / elapsed * 60.0;
-
             if rate_per_min > DNS_TUNNEL_QUERY_RATE as f64
                 && stats.unique_prefixes.len() > DNS_TUNNEL_UNIQUE_SUBS
             {
@@ -577,13 +650,19 @@ impl NetworkIntelCollector {
                     rate_per_min,
                     stats.unique_prefixes.len()
                 );
-                self.push_alert(
-                    AlertSeverity::Critical,
-                    AlertCategory::DnsTunnel,
-                    msg,
-                    detail,
-                );
+                Some((AlertSeverity::Critical, msg, detail))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some((severity, msg, detail)) = alert {
+            if let Some(stats) = self.domain_tunnel_stats.get_mut(&base) {
+                stats.last_alert = Some(now);
+            }
+            self.push_alert(severity, AlertCategory::DnsTunnel, msg, detail);
         }
     }
 
@@ -629,13 +708,30 @@ impl NetworkIntelCollector {
 
 // ── Helpers ────────────────────────────────────────────────
 
+/// Common two-label public suffixes. Not a full Public Suffix List (that
+/// would mean a data file + dependency), but enough that `a.example.co.uk`
+/// buckets as `example.co.uk` rather than collapsing every `*.co.uk` domain
+/// into one `co.uk` bucket — which would smear unrelated domains together
+/// and skew the DNS-tunnel heuristics.
+const MULTI_LABEL_SUFFIXES: &[&str] = &[
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "co.jp", "or.jp", "ne.jp", "com.au", "net.au",
+    "org.au", "edu.au", "gov.au", "co.nz", "org.nz", "co.za", "com.br", "com.cn", "com.mx",
+    "co.in", "co.kr", "com.sg", "com.tr", "co.il", "com.hk", "com.tw",
+];
+
 fn extract_base_domain(qname: &str) -> String {
     let parts: Vec<&str> = qname.trim_end_matches('.').split('.').collect();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        qname.to_string()
+    if parts.len() < 2 {
+        return qname.to_string();
     }
+    let last_two = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+    // If the final two labels form a known multi-label suffix and a third
+    // label exists, keep that third label so the registrable domain — not
+    // the public suffix — becomes the bucket key.
+    if parts.len() >= 3 && MULTI_LABEL_SUFFIXES.contains(&last_two.as_str()) {
+        return format!("{}.{}", parts[parts.len() - 3], last_two);
+    }
+    last_two
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -657,7 +753,13 @@ mod tests {
     #[test]
     fn test_extract_base_domain() {
         assert_eq!(extract_base_domain("www.example.com"), "example.com");
-        assert_eq!(extract_base_domain("sub.deep.example.co.uk"), "co.uk");
+        // Multi-label public suffix: keep the registrable label, don't
+        // collapse to the bare suffix.
+        assert_eq!(
+            extract_base_domain("sub.deep.example.co.uk"),
+            "example.co.uk"
+        );
+        assert_eq!(extract_base_domain("example.com.au"), "example.com.au");
         assert_eq!(extract_base_domain("localhost"), "localhost");
         assert_eq!(extract_base_domain("a.b.c.d.example.com."), "example.com");
     }
@@ -859,6 +961,92 @@ mod tests {
             .keys()
             .any(|k| k.src == newcomer_src && k.dst_port == 53));
         assert_eq!(intel.beacon_states.len(), MAX_TRACKED_BEACONS);
+    }
+
+    #[test]
+    fn persistent_flow_beacon_fires_critical() {
+        // H2: a single long-lived connection that heartbeats on a fixed
+        // interval emits no new SYNs, so it reaches the beacon detector
+        // only through the flow-activity path. Drive `detect_beacon`
+        // directly with synthetic timestamps (the public entry points use
+        // a real clock) to exercise the shared jitter analysis.
+        let mut intel = NetworkIntelCollector::new();
+        let key = BeaconKey {
+            src: "192.168.1.50".into(),
+            dst: "203.0.113.9".into(),
+            dst_port: 443,
+        };
+        let base = Instant::now();
+        // 6 bursts exactly 60s apart → 5 deltas, zero jitter.
+        for i in 0..6 {
+            intel.detect_beacon(key.clone(), base + Duration::from_secs(60 * i));
+        }
+        assert_eq!(intel.active_alerts.len(), 1, "one beacon alert expected");
+        assert!(matches!(
+            intel.active_alerts[0].category,
+            AlertCategory::Beaconing
+        ));
+        assert!(
+            matches!(intel.active_alerts[0].severity, AlertSeverity::Critical),
+            "beacon must be Critical so the recorder auto-freezes"
+        );
+    }
+
+    #[test]
+    fn beacon_re_alerts_after_cooldown() {
+        // A persistent beacon must resurface periodically, not fire once and
+        // go silent forever. First alert at the 6th sample; after the
+        // cooldown elapses, a continuing beacon alerts again.
+        let mut intel = NetworkIntelCollector::new();
+        let key = BeaconKey {
+            src: "192.168.1.50".into(),
+            dst: "203.0.113.9".into(),
+            dst_port: 443,
+        };
+        // Beacon continuously every 60s. First alert lands at the 6th
+        // sample (t=300s). Re-alert is gated by the cooldown, so it fires
+        // again once `now - last_alert >= cooldown` while jitter stays low.
+        let base = Instant::now();
+        let realert_at = 5 + BEACON_REALERT_COOLDOWN_SECS / 60; // sample index
+        for i in 0..6 {
+            intel.detect_beacon(key.clone(), base + Duration::from_secs(60 * i));
+        }
+        assert_eq!(intel.active_alerts.len(), 1, "first beacon alert");
+
+        for i in 6..=realert_at {
+            intel.detect_beacon(key.clone(), base + Duration::from_secs(60 * i));
+        }
+        assert_eq!(
+            intel.active_alerts.len(),
+            2,
+            "beacon should re-alert once the cooldown has passed"
+        );
+    }
+
+    #[test]
+    fn dns_tunnel_alerts_are_deduped_per_domain() {
+        // H6: a live tunnel sprays thousands of queries; without the
+        // per-domain cooldown each long-qname query would inject its own
+        // alert. A flood to one base domain must collapse to one alert.
+        let mut intel = NetworkIntelCollector::new();
+        for i in 0..500 {
+            let qname = format!("{}{}.tunnel.example.com", "a".repeat(90), i);
+            intel.on_dns_query(DnsQueryEvent {
+                txid: i as u16,
+                client_ip: "192.168.1.1".into(),
+                server_ip: "8.8.8.8".into(),
+                qname,
+            });
+        }
+        assert_eq!(
+            intel.active_alerts.len(),
+            1,
+            "500 tunneled queries to one domain must collapse to a single alert"
+        );
+        assert!(matches!(
+            intel.active_alerts[0].category,
+            AlertCategory::DnsTunnel
+        ));
     }
 
     #[test]

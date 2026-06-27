@@ -209,9 +209,30 @@ fn app_protocol_summary(p: &crate::dpi::AppProtocol) -> String {
         Http {
             method,
             host: Some(h),
-        } => format!("HTTP {method} {h}"),
+            path,
+            ..
+        } => format!("HTTP {method} {h}{}", path.as_deref().unwrap_or("")),
+        Http {
+            status: Some(code), ..
+        } => format!("HTTP {code}"),
+        Http {
+            method,
+            host: None,
+            path: Some(p),
+            ..
+        } => format!("HTTP {method} {p}"),
         Http { method, .. } => format!("HTTP {method}"),
-        Dns { qname, qtype } => format!("DNS {qname} (qtype={qtype})"),
+        Dns {
+            qname,
+            qtype,
+            rcode,
+        } => match rcode {
+            Some(rc) => format!(
+                "DNS {qname} (qtype={qtype}, {})",
+                crate::dpi::dns::rcode_label(*rc)
+            ),
+            None => format!("DNS {qname} (qtype={qtype})"),
+        },
         Ssh { version } => format!("SSH {version}"),
         Llmnr { qname, qtype } => format!("LLMNR {qname} (qtype={qtype})"),
         Mqtt { client_id: Some(c) } => format!("MQTT client_id={c}"),
@@ -502,9 +523,20 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                     format!("QUIC {}", host)
                 }
                 Some(crate::dpi::AppProtocol::Http {
+                    status: Some(code), ..
+                }) => format!("HTTP {}", code),
+                Some(crate::dpi::AppProtocol::Http {
                     method,
                     host: Some(h),
-                }) => format!("HTTP {} {}", method, h),
+                    path,
+                    ..
+                }) => format!("HTTP {} {}{}", method, h, path.as_deref().unwrap_or("")),
+                Some(crate::dpi::AppProtocol::Http {
+                    method,
+                    host: None,
+                    path: Some(p),
+                    ..
+                }) => format!("HTTP {} {}", method, p),
                 Some(crate::dpi::AppProtocol::Dns { qname, .. }) => format!("DNS {}", qname),
                 Some(crate::dpi::AppProtocol::Ssh { version }) => version.clone(),
                 Some(crate::dpi::AppProtocol::Llmnr { qname, .. }) => format!("LLMNR {}", qname),

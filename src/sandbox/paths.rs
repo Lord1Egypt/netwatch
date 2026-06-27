@@ -24,6 +24,12 @@ pub struct SandboxPaths {
     pub geoip_db_dir: Option<PathBuf>,
     /// Parent dir of `config.geoip_asn_db` (MaxMind ASN mmdb). Read-only.
     pub geoip_asn_db_dir: Option<PathBuf>,
+    /// Parent dir of `config.tls_keylog_path` (the `SSLKEYLOGFILE` the
+    /// watcher tails for TLS/QUIC secrets). Read-only. The default
+    /// `/tmp/sslkeylog.txt` lives under the already-allowed `/tmp`, but a
+    /// custom path elsewhere needs its own rule or the sandbox blocks the
+    /// keylog watcher and decryption silently goes dark.
+    pub keylog_dir: Option<PathBuf>,
     /// Current working directory at startup — PCAP exports and ad-hoc
     /// file dumps land here. Captured eagerly so post-startup `cd`
     /// inside a shell doesn't expand the allow-list.
@@ -43,6 +49,7 @@ impl SandboxPaths {
 
         let geoip_db_dir = parent_dir_if_set(&cfg.geoip_db);
         let geoip_asn_db_dir = parent_dir_if_set(&cfg.geoip_asn_db);
+        let keylog_dir = parent_dir_if_set(&cfg.tls_keylog_path);
 
         let cwd = std::env::current_dir().ok();
 
@@ -51,6 +58,7 @@ impl SandboxPaths {
             config_dir,
             geoip_db_dir,
             geoip_asn_db_dir,
+            keylog_dir,
             cwd,
         }
     }

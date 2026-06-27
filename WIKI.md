@@ -122,7 +122,7 @@ The main loop is tick-driven.
 - `src/collectors/health.rs` performs gateway and DNS probe collection
 - `src/collectors/packets/` owns capture, decode orchestration, the filter DSL, dns cache, and PCAP export
 - `src/dpi/` holds the 15 L7 classifiers plus `tls_decrypt.rs` (SSLKEYLOGFILE) and `ja4.rs`
-- `src/ebpf/` holds the Linux kprobe connection tracker and RTT monitor
+- `src/ebpf/` holds the Linux kprobe connection tracker (process attribution)
 - `src/sandbox/` implements the Landlock filesystem + capability sandbox
 - `src/collectors/process_bandwidth.rs` ranks processes by RX/TX activity
 - `src/collectors/traceroute.rs` runs traceroute jobs for overlays

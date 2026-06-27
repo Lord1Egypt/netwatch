@@ -7,7 +7,6 @@
 
 #[cfg(feature = "ebpf")]
 pub mod conn_tracker;
-pub mod rtt_monitor;
 
 /// Status of the eBPF subsystem, used by the UI status indicator.
 #[derive(Debug, Clone)]

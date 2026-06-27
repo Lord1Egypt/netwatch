@@ -4,6 +4,33 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.9] - 2026-06-27
+
+Deeper protocol decoding, broader threat-detection coverage, and a round of reliability and
+documentation improvements.
+
+### Added
+- **HTTP request path and response status** in the Packets view and connection labels.
+- **DNS response codes** (`NOERROR`, `NXDOMAIN`, `SERVFAIL`, …) in DNS decode output, e.g.
+  `example.com (type=1, NXDOMAIN)`.
+- **Per-connection TCP handshake RTT** (SYN→SYN-ACK), measured per flow.
+- **Persistent-connection C2 detection** — beaconing analysis now also covers long-lived
+  single-connection heartbeats, in addition to new-connection patterns.
+- **Fuzz coverage** across the L7 protocol parsers.
+
+### Improved
+- More reliable DNS analytics — query/response latency, NXDOMAIN counts, and per-domain metrics.
+- Greater packet-capture resilience under worker-thread failure.
+- Quieter beaconing and DNS-tunnel alerting, with de-duplication and cooldowns; C2 beaconing now
+  raises a Critical alert, which triggers the Flight Recorder auto-freeze.
+- Memory-bounded detection caches.
+- Sandbox support for a custom `tls_keylog_path`.
+- More accurate multi-label domain grouping (e.g. `*.co.uk`, `*.com.au`).
+
+### Documentation
+- Expanded and clarified the protocol-decoding, eBPF attribution, sandbox, and TLS decryption
+  references — including TLS 1.2 decryption support.
+
 ## [0.25.8] - 2026-06-20
 
 ### Added

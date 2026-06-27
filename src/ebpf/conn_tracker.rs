@@ -55,6 +55,10 @@ pub struct EbpfAttribution {
 /// `daddr:dport` concurrently still alias — rare in practice.
 type AttrKey = (Protocol, IpAddr, u16);
 
+/// Hard cap on cached attributions, so a `connect()` storm can't grow the
+/// map without bound inside the TTL window.
+const MAX_ATTR_ENTRIES: usize = 4096;
+
 /// Shared cache of `AttrKey → EbpfAttribution`. Populated by the background
 /// drain thread, consulted by the connection collector.
 #[derive(Default)]
@@ -73,6 +77,14 @@ impl EbpfAttributor {
 
     fn record(&self, key: AttrKey, attr: EbpfAttribution) {
         if let Ok(mut cache) = self.cache.lock() {
+            // Bound the cache: a connect() storm could otherwise add entries
+            // faster than the TTL evicts them within the window. On overflow
+            // for a new key, drop the oldest entry by `seen_at`.
+            if cache.len() >= MAX_ATTR_ENTRIES && !cache.contains_key(&key) {
+                if let Some(oldest) = cache.iter().min_by_key(|(_, a)| a.seen_at).map(|(k, _)| *k) {
+                    cache.remove(&oldest);
+                }
+            }
             cache.insert(key, attr);
         }
     }

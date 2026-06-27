@@ -34,8 +34,11 @@ pub struct Connection {
     pub state: String,
     pub pid: Option<u32>,
     pub process_name: Option<String>,
-    /// Kernel-measured smoothed RTT in microseconds (from eBPF tcp_probe).
-    pub kernel_rtt_us: Option<f64>,
+    /// TCP handshake RTT (SYN→SYN-ACK) in microseconds, measured in userspace
+    /// from captured packets and joined onto this connection by its 5-tuple.
+    /// `None` until a handshake is observed for the flow (e.g. UDP, or a
+    /// connection that predates capture).
+    pub handshake_rtt_us: Option<f64>,
     /// Inbound (remote→local) payload bytes per second, derived from the
     /// ambient packet capture. `None` when capture isn't running or the
     /// connection hasn't been seen on the wire yet.
@@ -294,12 +297,13 @@ impl ConnectionCollector {
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let mut result: Vec<Connection> = Vec::new();
 
-            let (stream_bytes, app_protos, anomalies) = {
+            let (stream_bytes, app_protos, anomalies, handshake_rtts) = {
                 let tracker = stream_tracker.lock().unwrap();
                 (
                     tracker.snapshot_bytes(),
                     tracker.snapshot_app_protocols(),
                     tracker.snapshot_anomalies(),
+                    tracker.snapshot_handshake_rtts(),
                 )
             };
             let mut state = rate_state.lock().unwrap();
@@ -316,6 +320,9 @@ impl ConnectionCollector {
                     if let Some(&(retx, ooo)) = anomalies.get(&key) {
                         conn.retransmits = retx;
                         conn.out_of_order = ooo;
+                    }
+                    if let Some(&rtt_us) = handshake_rtts.get(&key) {
+                        conn.handshake_rtt_us = Some(rtt_us);
                     }
                 } else if conn.app_protocol.is_none() {
                     // `lsof` typically reports Chrome's QUIC UDP sockets
@@ -614,7 +621,7 @@ fn parse_lsof() -> Vec<Connection> {
                 state: state.to_string(),
                 pid,
                 process_name: process_name.clone(),
-                kernel_rtt_us: None,
+                handshake_rtt_us: None,
                 rx_rate: None,
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
@@ -745,7 +752,7 @@ fn parse_linux_connections() -> Vec<Connection> {
                 state,
                 pid,
                 process_name,
-                kernel_rtt_us: None,
+                handshake_rtt_us: None,
                 rx_rate: None,
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
@@ -1118,7 +1125,7 @@ fn parse_windows_connections() -> Vec<Connection> {
             state: rc.state,
             process_name: rc.pid.and_then(|p| pid_names.get(&p).cloned()),
             pid: rc.pid,
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
             attribution: AttributionSource::Lsof,
@@ -1194,7 +1201,7 @@ mod tests {
             state: state.into(),
             pid: Some(pid),
             process_name: Some("test".into()),
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
             attribution: AttributionSource::Lsof,

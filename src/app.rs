@@ -410,8 +410,6 @@ pub struct App {
     pub connection_timeline: ConnectionTimeline,
     pub network_intel: NetworkIntelCollector,
     intel_last_pkt_id: u64,
-    #[allow(dead_code)]
-    pub rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor,
     /// Linux-only kernel attribution path. Holds the SDK's `EventSource`
     /// (loaded BPF program + reader thread) and an `EbpfAttributor` cache
     /// the connection collector overlays onto lsof/ss-derived rows. None
@@ -607,7 +605,6 @@ impl App {
             connection_timeline: ConnectionTimeline::new(),
             network_intel,
             intel_last_pkt_id: 0,
-            rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor::new(),
             #[cfg(feature = "ebpf")]
             conn_tracker: conn_tracker_opt,
             #[cfg(feature = "ebpf")]
@@ -748,8 +745,12 @@ impl App {
             let packets = self.packet_collector.get_packets();
             self.incident_recorder.prime_current_packets(&packets);
         }
-        self.incident_recorder
-            .prime_alert_cursor(self.network_intel.alert_history().len());
+        self.incident_recorder.prime_alert_cursor(
+            self.network_intel
+                .alert_history()
+                .back()
+                .map(|a| a.timestamp),
+        );
 
         self.incident_capture_started = false;
         if !self.packet_collector.is_capturing() {
@@ -985,7 +986,11 @@ impl App {
     }
 
     fn feed_network_intel(&mut self) {
-        use crate::collectors::network_intel::{DnsQueryEvent, DnsResponseEvent};
+        use crate::collectors::network_intel::{
+            DnsQueryEvent, DnsResponseEvent, FlowActivityEvent,
+        };
+        use crate::collectors::packets::{TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_SYN};
+        use crate::dpi::Classifier;
 
         let packets = self.packet_collector.get_packets();
         for pkt in packets.iter() {
@@ -994,11 +999,12 @@ impl App {
             }
             self.intel_last_pkt_id = pkt.id;
 
-            // Feed connection attempts (TCP SYN)
+            // Feed connection attempts (TCP SYN) and, separately, data
+            // bursts on established flows (TCP PSH) so persistent single-
+            // connection C2 — which emits no new SYNs — still feeds the
+            // beacon detector.
             if let Some(flags) = pkt.tcp_flags {
-                if flags & crate::collectors::packets::TCP_FLAG_SYN != 0
-                    && flags & crate::collectors::packets::TCP_FLAG_ACK == 0
-                {
+                if flags & TCP_FLAG_SYN != 0 && flags & TCP_FLAG_ACK == 0 {
                     // SYN without ACK = connection attempt
                     if let (Some(dst_port), true) = (pkt.dst_port, !pkt.dst_ip.is_empty()) {
                         self.network_intel.on_conn_attempt(ConnAttemptEvent {
@@ -1007,36 +1013,64 @@ impl App {
                             dst_port,
                         });
                     }
+                } else if flags & TCP_FLAG_PSH != 0 {
+                    // Data on an established flow. Canonicalize to the
+                    // client→server direction (the endpoint with the lower
+                    // port is the service) so both directions of one flow
+                    // map to a single beacon key, and only consider
+                    // external destinations — LAN/loopback keepalives are
+                    // not the egress-C2 we're hunting and would be noise.
+                    if let (Some(sp), Some(dp)) = (pkt.src_port, pkt.dst_port) {
+                        let (client_ip, server_ip, server_port) = if dp <= sp {
+                            (&pkt.src_ip, &pkt.dst_ip, dp)
+                        } else {
+                            (&pkt.dst_ip, &pkt.src_ip, sp)
+                        };
+                        if !server_ip.is_empty()
+                            && !crate::collectors::geo::is_private_ip(server_ip)
+                        {
+                            self.network_intel.on_flow_activity(FlowActivityEvent {
+                                src_ip: client_ip.clone(),
+                                dst_ip: server_ip.clone(),
+                                dst_port: server_port,
+                            });
+                        }
+                    }
                 }
             }
 
-            // Feed DNS events
+            // Feed DNS events. Parse the real wire header off this packet's
+            // payload rather than the per-stream classification (which is
+            // cached on first message, so its txid/qname would be stale for
+            // later queries on the same socket) or the info string (which
+            // carries neither the transaction id nor a query/response flag).
+            // The 16-bit txid is echoed by the server, so query and response
+            // share it — that's what lets the latency match actually pair up.
             if pkt.protocol == "DNS" || pkt.protocol == "mDNS" {
-                if pkt.info.contains("Query") {
-                    // Extract qname from info: "DNS Query A example.com"
-                    let qname = pkt
-                        .info
-                        .split_whitespace()
-                        .skip(2)
-                        .last()
-                        .unwrap_or("")
-                        .to_string();
-                    if !qname.is_empty() {
-                        self.network_intel.on_dns_query(DnsQueryEvent {
-                            txid: (pkt.id & 0xFFFF) as u16,
-                            client_ip: pkt.src_ip.clone(),
-                            server_ip: pkt.dst_ip.clone(),
-                            qname,
-                        });
+                let payload = crate::collectors::packets::extract_udp_app_payload(&pkt.raw_bytes);
+                if payload.len() >= 12 {
+                    let txid = u16::from_be_bytes([payload[0], payload[1]]);
+                    if let Some(crate::dpi::AppProtocol::Dns { qname, rcode, .. }) =
+                        crate::dpi::dns::DnsClassifier.classify(&payload, false)
+                    {
+                        match rcode {
+                            // QR=0 → query (rcode absent).
+                            None => self.network_intel.on_dns_query(DnsQueryEvent {
+                                txid,
+                                client_ip: pkt.src_ip.clone(),
+                                server_ip: pkt.dst_ip.clone(),
+                                qname,
+                            }),
+                            // QR=1 → response; client/server are reversed
+                            // from the response packet's src/dst.
+                            Some(rc) => self.network_intel.on_dns_response(DnsResponseEvent {
+                                txid,
+                                client_ip: pkt.dst_ip.clone(),
+                                server_ip: pkt.src_ip.clone(),
+                                rcode: rc,
+                            }),
+                        }
                     }
-                } else if pkt.info.contains("Response") {
-                    let rcode = if pkt.info.contains("NXDOMAIN") { 3 } else { 0 };
-                    self.network_intel.on_dns_response(DnsResponseEvent {
-                        txid: (pkt.id & 0xFFFF) as u16,
-                        client_ip: pkt.dst_ip.clone(),
-                        server_ip: pkt.src_ip.clone(),
-                        rcode,
-                    });
                 }
             }
         }
@@ -2634,7 +2668,7 @@ mod tests {
             state: "ESTABLISHED".into(),
             pid: None,
             process_name: process.map(|s| s.to_string()),
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),
@@ -2772,7 +2806,7 @@ mod tests {
             state: "ESTABLISHED".into(),
             pid,
             process_name: process.map(|s| s.to_string()),
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: rx,
             tx_rate: tx,
             attribution: Default::default(),

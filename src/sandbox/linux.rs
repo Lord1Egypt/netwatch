@@ -171,6 +171,9 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
     if let Some(p) = &paths.geoip_asn_db_dir {
         out.push(p.clone());
     }
+    if let Some(p) = &paths.keylog_dir {
+        out.push(p.clone());
+    }
 
     out
 }

@@ -7,7 +7,7 @@ maintenance notes, see [WIKI.md](../WIKI.md).
 
 - [Deep Packet Inspection](#deep-packet-inspection)
   - [Protocol decoders](#protocol-decoders)
-  - [TLS 1.3 decryption](#tls-13-decryption)
+  - [TLS 1.3 / 1.2 decryption](#tls-13--12-decryption)
   - [Threat hunting with JA4](#threat-hunting-with-ja4)
 - [Display filters](#display-filters)
 - [Security & Forensics](#security--forensics)
@@ -36,20 +36,24 @@ tab to start capturing.
 | **TLS** | Version, SNI, ALPN, **ECH** flag, **JA4** fingerprint |
 | **QUIC** | Initial detection, SNI from reassembled CRYPTO frames, ECH, **JA4Q**, HTTP/3 |
 | **HTTP** | Method, host, path, status code |
-| **DNS / mDNS / LLMNR** | Query name, record type, response code, reverse-DNS cache |
+| **DNS / mDNS / LLMNR** | Query name, record type, response code, reverse-DNS cache (UDP only — DNS-over-TCP isn't classified; DoT/DoH surface at the TLS layer) |
 | **SSH** | Client/server banner + version |
 | **Others** | MQTT, SNMP, BitTorrent, FTP, NetBIOS, SSDP, STUN, NTP, DHCP, ICMP, ARP |
 
 Cleartext L7 classifiers (in `src/dpi/`): TLS, QUIC, HTTP, DNS, SSH, MQTT, SNMP, BitTorrent,
-FTP, NetBIOS, SSDP, STUN, NTP, DHCP, LLMNR — plus HTTP/3 over decrypted QUIC, and ICMP/ARP at
-the parse layer. Every classifier runs on reassembled TCP streams with handshake timing, a
-hex/text payload viewer, packet bookmarks, BPF capture filters, and PCAP export.
+FTP, NetBIOS, SSDP, STUN, NTP, DHCP, LLMNR — 15 in total. HTTP/3 decoding over decrypted QUIC is
+a reassembly/decode utility, not a separate classifier; ICMP/ARP are handled at the parse layer.
+Classifiers run over **per-flow stream tracking** (byte accumulation + TCP sequence-anomaly
+detection — not full out-of-order resequencing; cross-segment TLS records aren't reassembled),
+with handshake timing, a hex/text payload viewer, packet bookmarks, BPF capture filters, and
+PCAP export.
 
-### TLS 1.3 decryption
+### TLS 1.3 / 1.2 decryption
 
-NetWatch can decrypt TLS 1.3 application data when a **cooperating client** exports its
-session secrets — the same `SSLKEYLOGFILE` mechanism Wireshark uses. It is read-only and
-debugging-oriented: it decrypts traffic *you* control, never third-party or malware traffic.
+NetWatch can decrypt TLS 1.3 **and TLS 1.2** application data (plus QUIC 1-RTT) when a
+**cooperating client** exports its session secrets — the same `SSLKEYLOGFILE` mechanism
+Wireshark uses. It is read-only and debugging-oriented: it decrypts traffic *you* control,
+never third-party or malware traffic.
 
 ```bash
 # 1. Set the keylog path in Settings (,) → "TLS keylog", or in your config.
@@ -63,10 +67,12 @@ SSLKEYLOGFILE=/tmp/sslkeylog.txt google-chrome     # Chrome, Firefox, Node, etc.
 #    decrypted:true
 ```
 
-Supported cipher suites: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
-`TLS_CHACHA20_POLY1305_SHA256`. NetWatch decrypts application data after the handshake
-completes, and handles TLS 1.3 KeyUpdate / post-handshake re-keying. A keylog miss never
-breaks capture — the record just stays opaque.
+Supported cipher suites — **TLS 1.3:** `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
+`TLS_CHACHA20_POLY1305_SHA256`. **TLS 1.2** (AEAD only, via `CLIENT_RANDOM` keylog lines):
+the AES-128/256-GCM and ChaCha20-Poly1305 ECDHE suites; legacy CBC (mac-then-encrypt) suites
+are out of scope. NetWatch decrypts application data after the handshake completes, and handles
+TLS 1.3 KeyUpdate / post-handshake re-keying. A keylog miss never breaks capture — the record
+just stays opaque.
 
 > The ClientHello must be captured **live** — a connection whose handshake predates capture
 > is permanently undecryptable. Start capture first, then make the request.
@@ -153,8 +159,9 @@ netwatch_incident_20260403_103501/
 
 Once pcap, PKTAP, and the eBPF kprobe finish setup, NetWatch hands back its elevated
 capabilities and locks itself into a Landlock-enforced filesystem allow-list — so a
-memory-safety bug in DPI parsing of hostile capture traffic **can't read SSH keys,
-exfiltrate browser profiles, or open a new raw socket.**
+memory-safety bug in DPI parsing of hostile capture traffic **can't read SSH keys or
+exfiltrate browser profiles** (and, under `--sandbox-strict`, can't open a new raw socket
+either — see the capability note below).
 
 ```bash
 netwatch                     # best-effort sandbox (default)
@@ -162,9 +169,10 @@ netwatch --sandbox-strict    # refuse to start if Landlock can't enforce
 netwatch --no-sandbox        # escape hatch for debugging
 ```
 
-- **Capabilities dropped post-init:** `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`. The existing pcap fd and kprobe stay live; the process just can't acquire *new* ones.
+- **Capabilities dropped post-init:** `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN` in every mode. `CAP_NET_RAW` is **kept in the default (best-effort) mode** — pcap needs it to re-open capture handles when you toggle capture (`c`), cycle interface (`i`), or arm the Flight Recorder — and is dropped **only under `--sandbox-strict`**. The existing pcap fd and kprobe stay live regardless; in strict mode the process additionally can't acquire a *new* raw socket.
 - **Filesystem read allow-list** (kernel-enforced): system dirs plus a deliberately *enumerated* set of `/etc/*` files for NSS/TLS/time — so even a sudo'd NetWatch can't read `/etc/shadow` or `/etc/sudoers`. Everything else returns `EACCES`, including other users' homes and SSH keys.
 - **Write allow-list:** `~/.cache/netwatch/`, the startup working dir (PCAP exports), `/tmp`, `/run/user/<uid>`, `/dev/null`.
+- **Applied post-init, not from process start:** the sandbox engages *after* pcap, PKTAP, and the eBPF kprobe finish opening their privileged fds (a brief startup window). It bounds what a later DPI-parsing bug can reach; it is not a from-`main()` confinement of the setup phase itself.
 - **Verify at runtime:** the Settings overlay (`,`) shows the live enforcement state, e.g. `best-effort: Landlock ABI Vx, 3 caps dropped`.
 
 Network restriction is intentionally not enabled (it would break GeoIP fallback, `--remote`
@@ -357,7 +365,7 @@ Enable via Settings (`,`) → AI Insights. Supports local [Ollama](https://ollam
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders
                                             ↓
-                          Stream reassembly · Handshake timing
+                          Per-flow stream tracking · Handshake timing
                           TLS 1.3 decryption · JA4 · Expert info
 ```
 

@@ -2,10 +2,11 @@
 //!
 //! Recognizes either side of a connection:
 //!   - **Request**: `METHOD SP request-target SP HTTP/1.x CRLF`, followed by
-//!     header lines. We pull the method and, if present, the `Host:` header.
-//!   - **Response**: `HTTP/1.x SP status CRLF`. No method/host to extract, so
-//!     we report `method = "RESPONSE"` — enough to label the flow as HTTP when
-//!     we only ever observe the server side.
+//!     header lines. We pull the method, the request-target (`path`), and, if
+//!     present, the `Host:` header.
+//!   - **Response**: `HTTP/1.x SP status CRLF`. No method/host/path to extract,
+//!     so we report `method = "RESPONSE"` and the parsed `status` code — enough
+//!     to label the flow when we only ever observe the server side.
 //!
 //! The request line is validated to contain ` HTTP/1.` before we accept it, so
 //! arbitrary text payloads that happen to start with an uppercase word aren't
@@ -32,11 +33,14 @@ impl Classifier for HttpClassifier {
         }
         let slice = &payload[..payload.len().min(MAX_SCAN)];
 
-        // Server response: `HTTP/1.x ...`.
+        // Server response: `HTTP/1.x NNN ...`.
         if slice.starts_with(b"HTTP/1.") {
+            let status = first_line(slice).and_then(parse_status);
             return Some(AppProtocol::Http {
                 method: "RESPONSE".into(),
                 host: None,
+                path: None,
+                status,
             });
         }
 
@@ -45,15 +49,23 @@ impl Classifier for HttpClassifier {
         if !request_line.contains(" HTTP/1.") {
             return None;
         }
-        let method = request_line.split(' ').next()?;
+        let mut parts = request_line.split(' ');
+        let method = parts.next()?;
         if !METHODS.contains(&method) {
             return None;
         }
+        // The request-target sits between the method and the ` HTTP/1.x` token.
+        let path = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
 
         let host = find_host_header(slice);
         Some(AppProtocol::Http {
             method: method.to_string(),
             host,
+            path,
+            status: None,
         })
     }
 }
@@ -65,6 +77,14 @@ fn first_line(slice: &[u8]) -> Option<&str> {
         .position(|&b| b == b'\r' || b == b'\n')
         .unwrap_or(slice.len());
     std::str::from_utf8(&slice[..end]).ok()
+}
+
+/// Parse the 3-digit status code from a response line `HTTP/1.x NNN ...`.
+fn parse_status(line: &str) -> Option<u16> {
+    line.split(' ')
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|c| (100..=599).contains(c))
 }
 
 /// Scan header lines for `Host:` (case-insensitive). Returns the trimmed
@@ -112,6 +132,8 @@ mod tests {
             AppProtocol::Http {
                 method: "GET".into(),
                 host: Some("example.com".into()),
+                path: Some("/index.html".into()),
+                status: None,
             }
         );
     }
@@ -125,6 +147,8 @@ mod tests {
             AppProtocol::Http {
                 method: "POST".into(),
                 host: Some("api.example.com:8080".into()),
+                path: Some("/api".into()),
+                status: None,
             }
         );
     }
@@ -138,6 +162,8 @@ mod tests {
             AppProtocol::Http {
                 method: "GET".into(),
                 host: Some("lower.example".into()),
+                path: Some("/".into()),
+                status: None,
             }
         );
     }
@@ -151,12 +177,14 @@ mod tests {
             AppProtocol::Http {
                 method: "GET".into(),
                 host: None,
+                path: Some("/".into()),
+                status: None,
             }
         );
     }
 
     #[test]
-    fn server_response() {
+    fn server_response_parses_status() {
         let p = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         let r = HttpClassifier.classify(p, true).unwrap();
         assert_eq!(
@@ -164,6 +192,23 @@ mod tests {
             AppProtocol::Http {
                 method: "RESPONSE".into(),
                 host: None,
+                path: None,
+                status: Some(404),
+            }
+        );
+    }
+
+    #[test]
+    fn server_response_200() {
+        let p = b"HTTP/1.1 200 OK\r\n\r\n";
+        let r = HttpClassifier.classify(p, true).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Http {
+                method: "RESPONSE".into(),
+                host: None,
+                path: None,
+                status: Some(200),
             }
         );
     }
@@ -177,6 +222,8 @@ mod tests {
             AppProtocol::Http {
                 method: "CONNECT".into(),
                 host: Some("example.com:443".into()),
+                path: Some("example.com:443".into()),
+                status: None,
             }
         );
     }

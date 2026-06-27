@@ -112,7 +112,12 @@ pub struct IncidentRecorder {
     frozen_at: Option<DateTime<Utc>>,
     freeze_reason: Option<String>,
     last_packet_id: u64,
-    last_alert_history_len: usize,
+    /// Monotonic timestamp of the most recently recorded alert. Cursoring
+    /// on the alert's own `Instant` (rather than the history length) is
+    /// robust to `alert_history` being a bounded ring buffer: once it hits
+    /// its cap the length stops growing, so a length cursor would `skip`
+    /// the whole slice and silently drop every new alert from the bundle.
+    last_recorded_alert_at: Option<std::time::Instant>,
     packets: VecDeque<TimedPacket>,
     connection_snapshots: VecDeque<TimedSnapshot<ConnectionSnapshot>>,
     health_snapshots: VecDeque<TimedSnapshot<HealthSnapshot>>,
@@ -136,7 +141,7 @@ impl IncidentRecorder {
             frozen_at: None,
             freeze_reason: None,
             last_packet_id: 0,
-            last_alert_history_len: 0,
+            last_recorded_alert_at: None,
             packets: VecDeque::new(),
             connection_snapshots: VecDeque::new(),
             health_snapshots: VecDeque::new(),
@@ -201,8 +206,10 @@ impl IncidentRecorder {
         self.last_packet_id = packets.last().map(|pkt| pkt.id).unwrap_or(0);
     }
 
-    pub fn prime_alert_cursor(&mut self, alert_history_len: usize) {
-        self.last_alert_history_len = alert_history_len;
+    /// Skip alerts that already existed when the recorder armed, so a
+    /// bundle only captures alerts raised during the incident window.
+    pub fn prime_alert_cursor(&mut self, last_alert_at: Option<std::time::Instant>) {
+        self.last_recorded_alert_at = last_alert_at;
     }
 
     pub fn record(
@@ -370,13 +377,15 @@ impl IncidentRecorder {
     }
 
     fn record_alerts(&mut self, now: DateTime<Utc>, alert_history: &[Alert]) {
-        let skip = if alert_history.len() >= self.last_alert_history_len {
-            self.last_alert_history_len
-        } else {
-            0
-        };
-
-        for alert in alert_history.iter().skip(skip) {
+        // Record every alert newer than the cursor. Comparing the alert's
+        // own monotonic timestamp survives `alert_history` sliding once it
+        // reaches its ring-buffer cap, where a length-based cursor breaks.
+        let cursor = self.last_recorded_alert_at;
+        let mut newest = cursor;
+        for alert in alert_history
+            .iter()
+            .filter(|a| cursor.is_none_or(|c| a.timestamp > c))
+        {
             self.alert_events.push_back(TimedSnapshot {
                 observed_at: now,
                 value: AlertEventSnapshot {
@@ -387,8 +396,12 @@ impl IncidentRecorder {
                     detail: alert.detail.clone(),
                 },
             });
+            newest = Some(match newest {
+                Some(n) if n >= alert.timestamp => n,
+                _ => alert.timestamp,
+            });
         }
-        self.last_alert_history_len = alert_history.len();
+        self.last_recorded_alert_at = newest;
 
         while self.alert_events.len() > MAX_ALERT_EVENTS {
             self.alert_events.pop_front();
@@ -578,7 +591,7 @@ impl IncidentRecorder {
         self.freeze_reason = None;
         self.frozen_at = None;
         self.last_packet_id = 0;
-        self.last_alert_history_len = 0;
+        self.last_recorded_alert_at = None;
         self.packets.clear();
         self.connection_snapshots.clear();
         self.health_snapshots.clear();
@@ -694,7 +707,7 @@ mod tests {
             state: "ESTABLISHED".into(),
             pid: Some(4242),
             process_name: Some("curl".into()),
-            kernel_rtt_us: Some(12_000.0),
+            handshake_rtt_us: Some(12_000.0),
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),
@@ -745,6 +758,51 @@ mod tests {
             rtt_ms: None,
             cpu_percent: None,
         }
+    }
+
+    fn make_alert(base: std::time::Instant, secs: u64, msg: &str) -> Alert {
+        use crate::collectors::network_intel::{AlertCategory, AlertSeverity};
+        Alert {
+            severity: AlertSeverity::Warning,
+            category: AlertCategory::Beaconing,
+            message: msg.to_string(),
+            detail: String::new(),
+            timestamp: base + std::time::Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn new_alerts_recorded_after_history_ring_slides() {
+        // Regression: the alert cursor was length-based, so once
+        // `alert_history` reached its ring-buffer cap (length stops
+        // growing) every new alert was skipped from the bundle. With a
+        // timestamp cursor, alerts recorded after the window slides still
+        // land. Model the slide with constant-length windows.
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let base = std::time::Instant::now();
+        let now = Utc::now();
+
+        let window1 = [
+            make_alert(base, 1, "a1"),
+            make_alert(base, 2, "a2"),
+            make_alert(base, 3, "a3"),
+        ];
+        recorder.record_alerts(now, &window1);
+        assert_eq!(recorder.alert_events.len(), 3);
+
+        // Ring slid: dropped the oldest, appended a4. Same length.
+        let window2 = [
+            make_alert(base, 2, "a2"),
+            make_alert(base, 3, "a3"),
+            make_alert(base, 4, "a4"),
+        ];
+        recorder.record_alerts(now, &window2);
+        assert_eq!(
+            recorder.alert_events.len(),
+            4,
+            "the new alert after the slide must still be recorded"
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ fn build_remote_nodes(app: &App) -> (Vec<RemoteNode>, Vec<RemoteNode>) {
         if entry.0.process.is_none() {
             entry.0.process = conn.process_name.clone();
         }
-        if let Some(rtt_us) = conn.kernel_rtt_us {
+        if let Some(rtt_us) = conn.handshake_rtt_us {
             let rtt_ms = rtt_us / 1000.0;
             entry.0.rtt_ms = Some(match entry.0.rtt_ms {
                 Some(prev) => prev.min(rtt_ms),

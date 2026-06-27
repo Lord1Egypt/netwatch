@@ -354,7 +354,18 @@ fn render_app_protocol_base(p: &Option<crate::dpi::AppProtocol>) -> String {
         Some(Http {
             method,
             host: Some(h),
-        }) => format!("HTTP {} {}", method, h),
+            path,
+            ..
+        }) => format!("HTTP {} {}{}", method, h, path.as_deref().unwrap_or("")),
+        Some(Http {
+            status: Some(code), ..
+        }) => format!("HTTP {}", code),
+        Some(Http {
+            method,
+            host: None,
+            path: Some(p),
+            ..
+        }) => format!("HTTP {} {}", method, p),
         Some(Http { method, .. }) => format!("HTTP {}", method),
         Some(Dns { qname, .. }) => format!("DNS {}", qname),
         Some(Ssh { version }) => format!("SSH {}", version),
@@ -693,7 +704,7 @@ fn render_conn_row(
         .unwrap_or_else(|| "—".into());
 
     let rtt_str = conn
-        .kernel_rtt_us
+        .handshake_rtt_us
         .map(|us| {
             let ms = us / 1000.0;
             if ms < 1.0 {
@@ -975,7 +986,7 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
         .map(crate::ui::widgets::format_bytes_rate)
         .unwrap_or_else(|| "—".into());
     let rtt = conn
-        .kernel_rtt_us
+        .handshake_rtt_us
         .map(|us| format!("{:.1}ms", us / 1000.0))
         .unwrap_or_else(|| "—".into());
 
@@ -1410,7 +1421,7 @@ mod tests {
             state: state.into(),
             pid: Some(1),
             process_name: Some(proc.into()),
-            kernel_rtt_us: None,
+            handshake_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),

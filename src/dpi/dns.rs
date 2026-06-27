@@ -41,6 +41,16 @@ impl Classifier for DnsClassifier {
             return None;
         }
 
+        // Header flags: QR is the high bit of byte 2; RCODE is the low
+        // nibble of byte 3 (RFC 1035 §4.1.1). We surface the response code
+        // only on responses (QR=1); queries report `None`.
+        let is_response = payload[2] & 0x80 != 0;
+        let rcode = if is_response {
+            Some(payload[3] & 0x0F)
+        } else {
+            None
+        };
+
         // Parse the first question's qname starting right after the
         // 12-byte header. Refuse compression pointers — see module
         // doc. Reject malformed lengths (would walk past the buffer).
@@ -86,7 +96,24 @@ impl Classifier for DnsClassifier {
         if name.is_empty() {
             return None;
         }
-        Some(AppProtocol::Dns { qname: name, qtype })
+        Some(AppProtocol::Dns {
+            qname: name,
+            qtype,
+            rcode,
+        })
+    }
+}
+
+/// Short label for a DNS RCODE (RFC 1035 §4.1.1 + common extensions).
+pub fn rcode_label(rcode: u8) -> String {
+    match rcode {
+        0 => "NOERROR".into(),
+        1 => "FORMERR".into(),
+        2 => "SERVFAIL".into(),
+        3 => "NXDOMAIN".into(),
+        4 => "NOTIMP".into(),
+        5 => "REFUSED".into(),
+        other => format!("RCODE{other}"),
     }
 }
 
@@ -113,11 +140,43 @@ mod tests {
     fn extracts_qname_and_qtype() {
         let result = DnsClassifier.classify(QUERY_EXAMPLE_COM_A, false);
         match result {
-            Some(AppProtocol::Dns { qname, qtype }) => {
+            Some(AppProtocol::Dns {
+                qname,
+                qtype,
+                rcode,
+            }) => {
                 assert_eq!(qname, "example.com");
                 assert_eq!(qtype, 1); // A
+                assert_eq!(rcode, None, "queries carry no rcode");
             }
             other => panic!("expected Dns{{..}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extracts_rcode_from_response() {
+        // Same question, but flags = response (QR=1) with RCODE=3 (NXDOMAIN):
+        // byte 2 = 0x81 (QR + RD), byte 3 = 0x83 (RA + NXDOMAIN).
+        #[rustfmt::skip]
+        let response: &[u8] = &[
+            0xAB, 0xCD, 0x81, 0x83,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+            0x03, b'c', b'o', b'm',
+            0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        match DnsClassifier.classify(response, false) {
+            Some(AppProtocol::Dns {
+                qname,
+                rcode: Some(rc),
+                ..
+            }) => {
+                assert_eq!(qname, "example.com");
+                assert_eq!(rc, 3); // NXDOMAIN
+                assert_eq!(rcode_label(rc), "NXDOMAIN");
+            }
+            other => panic!("expected Dns response with rcode, got {:?}", other),
         }
     }
 

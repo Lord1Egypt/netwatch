@@ -17,8 +17,8 @@
 //! JA4 supersedes JA3: it's more granular (separates a/b/c so users can
 //! tell *what* changed between two fingerprints) and covers QUIC via
 //! the protocol-prefix slot. This module computes JA4 for TLS-over-TCP
-//! today; JA4Q for QUIC is a planned follow-on that reuses the same
-//! `compute_ja4` against the reassembled QUIC ClientHello.
+//! and JA4Q for QUIC — both run `compute_ja4`, the QUIC path against the
+//! reassembled QUIC ClientHello (which sets the `q` protocol prefix).
 
 use std::fmt::Write;
 

@@ -58,6 +58,11 @@ use std::thread;
 use std::time::Duration;
 
 use ring::aead;
+
+/// Cap on bytes ingested from the keylog file per poll. Bounds the
+/// allocation when the file is large or grows fast; the remainder is
+/// drained on the next poll.
+const MAX_KEYLOG_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 use ring::hkdf;
 use ring::hmac;
 
@@ -273,8 +278,14 @@ fn keylog_loop(path: PathBuf, store: Arc<KeylogStore>, stop: Arc<AtomicBool>) {
                 }
                 if cur > last_offset {
                     let _ = f.seek(SeekFrom::Start(last_offset));
+                    // Cap the per-poll read so a huge (or maliciously large)
+                    // keylog can't force one unbounded allocation — drain it
+                    // over successive polls instead. Keylog lines are ASCII,
+                    // so a cut at the byte cap is still valid UTF-8.
+                    let to_read = (cur - last_offset).min(MAX_KEYLOG_CHUNK_BYTES);
                     let mut chunk = String::new();
-                    if f.read_to_string(&mut chunk).is_ok() {
+                    if f.by_ref().take(to_read).read_to_string(&mut chunk).is_ok() {
+                        let read = chunk.len() as u64;
                         leftover.push_str(&chunk);
                         // Drain complete lines; keep any trailing
                         // partial line in `leftover` for the next poll.
@@ -287,7 +298,9 @@ fn keylog_loop(path: PathBuf, store: Arc<KeylogStore>, stop: Arc<AtomicBool>) {
                         }
                         let remainder = leftover[consumed..].to_string();
                         leftover = remainder;
-                        last_offset = cur;
+                        // Advance by what we actually read, not to `cur`, so
+                        // the remainder of an oversized file is picked up next.
+                        last_offset += read;
                     }
                 }
             }
@@ -360,6 +373,23 @@ fn hkdf_expand_label(
 ) {
     // HkdfLabel = uint16 length || opaque label<7..255> || opaque context<0..255>
     //   label    = "tls13 " + label
+    // The length casts below are lossless for every caller in this module
+    // (output is a hash/key length ≤ 48, labels are short literals, context
+    // is a transcript hash ≤ 48). The debug_asserts pin that invariant so a
+    // future caller that violates it trips in tests rather than silently
+    // truncating a length field.
+    debug_assert!(
+        output.len() <= u16::MAX as usize,
+        "HKDF output len exceeds u16"
+    );
+    debug_assert!(
+        label.len() <= u8::MAX as usize - 6,
+        "tls13 label too long for u8 len"
+    );
+    debug_assert!(
+        context.len() <= u8::MAX as usize,
+        "HKDF context too long for u8 len"
+    );
     let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
     info.extend_from_slice(&(output.len() as u16).to_be_bytes());
     let full_label_len = (6 + label.len()) as u8;
@@ -763,6 +793,12 @@ impl Tls12DirectionKeys {
         aad[8] = content_type;
         aad[9] = version[0];
         aad[10] = version[1];
+        // A TLS plaintext record is ≤ 2^14 + 256 bytes, so this is lossless;
+        // assert it so an oversized record trips in tests, not silently.
+        debug_assert!(
+            plaintext_len <= u16::MAX as usize,
+            "TLS record len exceeds u16"
+        );
         aad[11..].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
         aad
     }

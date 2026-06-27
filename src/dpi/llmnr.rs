@@ -16,7 +16,7 @@ impl Classifier for LlmnrClassifier {
             return None;
         }
         match DnsClassifier.classify(payload, is_tcp)? {
-            AppProtocol::Dns { qname, qtype } => Some(AppProtocol::Llmnr { qname, qtype }),
+            AppProtocol::Dns { qname, qtype, .. } => Some(AppProtocol::Llmnr { qname, qtype }),
             _ => None,
         }
     }

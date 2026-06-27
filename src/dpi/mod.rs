@@ -53,13 +53,30 @@ pub enum AppProtocol {
         #[serde(default)]
         ja4: Option<String>,
     },
-    /// HTTP/1.x request line + `Host:` header.
+    /// HTTP/1.x request line + `Host:` header. Requests also carry the
+    /// request-target (`path`); responses carry the `status` code.
     Http {
         method: String,
         host: Option<String>,
+        /// Request-target from the request line (e.g. `/index.html`). `None`
+        /// on responses or when only the server side was observed.
+        #[serde(default)]
+        path: Option<String>,
+        /// Response status code (e.g. `404`). `None` on requests.
+        #[serde(default)]
+        status: Option<u16>,
     },
-    /// DNS query — first question's qname + qtype.
-    Dns { qname: String, qtype: u16 },
+    /// DNS query or response — first question's qname + qtype, plus the
+    /// header RCODE on responses.
+    Dns {
+        qname: String,
+        qtype: u16,
+        /// Response code from the DNS header (`0`=NOERROR, `3`=NXDOMAIN,
+        /// …). `Some` only when the QR bit marks this a response; `None`
+        /// for queries.
+        #[serde(default)]
+        rcode: Option<u8>,
+    },
     /// SSH server / client banner line, e.g. `SSH-2.0-OpenSSH_9.0`.
     Ssh { version: String },
     /// QUIC Initial packet detected; SNI extracted across reassembled
@@ -226,4 +243,70 @@ pub fn classify_once(
     }
 
     None
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    /// Tiny deterministic xorshift PRNG — keeps the fuzz corpus
+    /// reproducible and pulls in no `rand`/`proptest` dependency.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xFF) as u8
+        }
+    }
+
+    /// Backs the "safely parses hostile traffic" claim: throw a large
+    /// corpus of random and adversarially-shaped byte buffers at every DPI
+    /// classifier and assert the parsers never panic (overflow, slice OOB,
+    /// utf8, etc.). The test passing *is* the assertion — any panic in a
+    /// classifier surfaces here instead of in production capture.
+    #[test]
+    fn classifiers_never_panic_on_hostile_input() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        // A few real protocol prefixes to seed structured mutation — a
+        // valid-looking header followed by garbage is the nastiest case
+        // for a length-trusting parser.
+        let seeds: &[&[u8]] = &[
+            &[0x16, 0x03, 0x01],                   // TLS handshake record
+            &[0x47, 0x45, 0x54, 0x20],             // "GET "
+            b"HTTP/1.1 200 OK\r\n",                // HTTP response line
+            &[0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01], // DNS-ish header
+            &[0x13, b'B', b'i', b't'],             // BitTorrent length prefix
+            b"SSH-2.0-",                           // SSH banner
+        ];
+
+        for iter in 0..20_000u32 {
+            let len = (rng.next() % 2048) as usize;
+            let mut buf = Vec::with_capacity(len);
+            // Optionally prepend a structured seed so we exercise the
+            // "valid prefix, hostile tail" path, not just pure noise.
+            if iter % 3 == 0 {
+                let seed = seeds[(iter as usize / 3) % seeds.len()];
+                buf.extend_from_slice(seed);
+            }
+            while buf.len() < len {
+                buf.push(rng.byte());
+            }
+
+            let sp = (rng.next() & 0xFFFF) as u16;
+            let dp = (rng.next() & 0xFFFF) as u16;
+            // Both transports, and a couple of canonical ports to unlock
+            // the port-gated classifiers (FTP/SNMP/NetBIOS/DNS/…).
+            let _ = classify_once(&buf, true, sp, dp);
+            let _ = classify_once(&buf, false, sp, dp);
+            let _ = classify_once(&buf, false, 53, dp);
+            let _ = classify_once(&buf, true, 21, dp);
+        }
+    }
 }

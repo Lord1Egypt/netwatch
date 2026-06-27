@@ -32,7 +32,7 @@ Think of it as **one zero-config binary that does the job of a bandwidth meter, 
 
 **Made for** blue-teamers, incident responders, SREs, and homelabbers who need to see what's happening *right now* — not parse a capture file an hour later.
 
-<samp>500+ tests · Landlock-sandboxed · safely parses hostile traffic</samp>
+<samp>500+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
 
 <p align="center">
   <img src="demo-tour.gif" alt="A tour of the live NetWatch TUI: dashboard, live packet capture and decode, network topology with traceroute, and automatic alerting" width="820">
@@ -47,8 +47,8 @@ Think of it as **one zero-config binary that does the job of a bandwidth meter, 
 - 🔓 **Read encrypted traffic you control** — point a browser or app's `SSLKEYLOGFILE` at NetWatch and watch the plaintext of its TLS 1.3 sessions decode live, the same way Wireshark does it. No proxy, no certificates, nothing in the middle.
 - 🧬 **Fingerprint the software behind a connection** — JA4 turns each TLS/QUIC handshake into a stable fingerprint, so you can recognize a specific client — or a specific piece of malware — *even though the traffic is encrypted*, the way you'd recognize a browser by its user-agent. Pivot on a fingerprint to find every other flow from the same software.
 - 🚨 **Catch malware calling home** — built-in detection for C2 beaconing (regular, low-jitter check-ins), port scans, and DNS tunneling runs in the background with zero setup. A critical alert auto-freezes the recorder so the evidence is already saved when you look.
-- ⚙️ **Name the process behind every connection** — a kernel-level eBPF probe attributes each socket to the program that opened it, not a best-guess from polling. Falls back gracefully where eBPF isn't available.
-- 📡 **Decode the protocols, not just the ports** — real L7 parsing of TLS, QUIC, HTTP, DNS, SSH, and a dozen more, with TCP stream reassembly and handshake timing — so you see `api.github.com` and the JA4 fingerprint, not just "port 443."
+- ⚙️ **Name the process behind every connection** — maps each socket to the program that opened it from `ss`/`lsof`, with an optional kernel-level eBPF kprobe (Linux, the `ebpf` feature) that also catches short-lived flows polling can miss. Works everywhere; the kprobe is an enhancement, not a requirement.
+- 📡 **Decode the protocols, not just the ports** — real L7 parsing of TLS, QUIC, HTTP, and DNS (plus an SSH banner/version sniff) and a dozen more, with per-flow stream tracking and handshake timing — so you see `api.github.com` and the JA4 fingerprint, not just "port 443."
 - 🎥 **Freeze the evidence** — arm a rolling recorder and freeze any incident into a portable bundle: the packets *plus* the connections, DNS, health, and alerts that explain them. Built for bug reports and post-mortems.
 - 🛡️ **Safe by design** — after setup, NetWatch drops its privileges and locks itself into a Landlock filesystem allow-list (Linux). A tool that parses hostile traffic *cannot* read your SSH keys, browser profiles, or `/etc/shadow`.
 
@@ -124,7 +124,7 @@ Nine tabs, switched with `1`–`9`:
 | 1 | **Dashboard** | Interfaces, bandwidth graph, top connections, gateway/DNS health, latency heatmap. Useful in 5 seconds. |
 | 2 | **Connections** | Every socket with its process + PID, protocol, state, GeoIP, and latency sparklines. |
 | 3 | **Interfaces** | Per-interface IPv4/IPv6, MAC, MTU, RX/TX, errors, drops. |
-| 4 | **Packets** | Live capture with real L7 decode, TLS 1.3 decryption, JA4, stream reassembly, filters, PCAP export. |
+| 4 | **Packets** | Live capture with real L7 decode, TLS 1.3 decryption, JA4, per-flow stream tracking, filters, PCAP export. |
 | 5 | **Stats** | Protocol breakdown by bytes + TCP handshake-timing histogram. |
 | 6 | **Topology** | ASCII map of machine → gateway → DNS → top hosts, with traceroute. |
 | 7 | **Timeline** | Connection timeline color-coded by TCP state; security alerts land here. |
@@ -149,7 +149,7 @@ The Packets tab is where the forensics live — deep protocol decoding, live TLS
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders
                                             ↓
-                          Stream reassembly · Handshake timing
+                          Per-flow stream tracking · Handshake timing
                           TLS 1.3 decryption · JA4 · Threat detection
 ```
 
@@ -157,7 +157,7 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders
 |-----------|-------|-------|
 | Connections | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
 | Packets | libpcap (BPF) | libpcap |
-| Process attribution | PKTAP | eBPF kprobe, with `lsof`/`ss` fallback |
+| Process attribution | PKTAP | `lsof`/`ss` polling, with optional eBPF kprobe overlay |
 
 Everything degrades gracefully: features that need elevated privileges show a clear message and fall back, never crash. Full architecture notes live in [WIKI.md](WIKI.md).
 

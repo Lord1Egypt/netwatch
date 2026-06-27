@@ -1120,6 +1120,22 @@ impl StreamTracker {
             .collect()
     }
 
+    /// Per-stream TCP handshake RTT (SYN→SYN-ACK) in microseconds, for streams
+    /// with a completed handshake. Keyed by `StreamKey` so the connection
+    /// collector attaches a precise per-connection RTT via the same 5-tuple
+    /// join it uses for app-protocol and anomaly enrichment.
+    pub fn snapshot_handshake_rtts(&self) -> HashMap<StreamKey, f64> {
+        self.all_streams
+            .values()
+            .filter_map(|s| {
+                s.handshake
+                    .as_ref()
+                    .and_then(|hs| hs.syn_to_syn_ack_ms())
+                    .map(|ms| (s.key.clone(), ms * 1000.0))
+            })
+            .collect()
+    }
+
     /// Visit each stream that has a completed SYN→SYN-ACK handshake but has
     /// not yet been recorded in `sampled`, invoking `f(remote_ip, rtt_ms)`.
     /// Replaces the previous deep-clone-and-iterate pattern that allocated
@@ -1197,7 +1213,7 @@ impl PacketCollector {
         // Share the StreamTracker's KeylogStore with the watcher so the
         // capture loop sees ingested secrets immediately.
         let store = {
-            let t = self.stream_tracker.lock().unwrap();
+            let t = crate::app::safe_lock(&self.stream_tracker, "packets::snapshot");
             std::sync::Arc::clone(&t.keylog)
         };
         tracing::info!(
@@ -1216,7 +1232,7 @@ impl PacketCollector {
         {
             return;
         }
-        *self.error.lock().unwrap() = None;
+        *crate::app::safe_lock(&self.error, "packets::clear_error") = None;
 
         let packets = Arc::clone(&self.packets);
         let capturing = Arc::clone(&self.capturing);
@@ -1255,7 +1271,7 @@ impl PacketCollector {
                         format!("Capture failed: {e}")
                     };
                     tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap open failed");
-                    *error.lock().unwrap() = Some(msg);
+                    *crate::app::safe_lock(&error, "packets::capture_init_error") = Some(msg);
                     capturing.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1274,7 +1290,8 @@ impl PacketCollector {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap setnonblock failed");
-                    *error.lock().unwrap() = Some(format!("Capture failed: {e}"));
+                    *crate::app::safe_lock(&error, "packets::capture_failed") =
+                        Some(format!("Capture failed: {e}"));
                     capturing.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1284,7 +1301,8 @@ impl PacketCollector {
             if let Some(filter) = bpf.as_deref() {
                 if let Err(e) = cap.filter(filter, true) {
                     tracing::error!(target: "netwatch::capture", filter = %filter, error = %e, "BPF filter compile/install failed");
-                    *error.lock().unwrap() = Some(format!("BPF filter error: {e}"));
+                    *crate::app::safe_lock(&error, "packets::bpf_error") =
+                        Some(format!("BPF filter error: {e}"));
                     capturing.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1304,7 +1322,8 @@ impl PacketCollector {
                                 };
                                 let payload = extract_app_payload(packet.data, proto);
                                 let (idx, app_proto, decrypted) = {
-                                    let mut t = tracker.lock().unwrap();
+                                    let mut t =
+                                        crate::app::safe_lock(&tracker, "packets::capture_loop");
                                     let i = t.track_packet(
                                         &parsed.src_ip,
                                         sp,
@@ -1420,7 +1439,7 @@ impl PacketCollector {
 
     pub fn clear(&self) {
         self.packets.write().unwrap().clear();
-        self.stream_tracker.lock().unwrap().clear();
+        crate::app::safe_lock(&self.stream_tracker, "packets::reset").clear();
     }
 
     pub fn is_capturing(&self) -> bool {
@@ -1428,7 +1447,7 @@ impl PacketCollector {
     }
 
     pub fn get_error(&self) -> Option<String> {
-        self.error.lock().unwrap().clone()
+        crate::app::safe_lock(&self.error, "packets::get_error").clone()
     }
 
     /// Cheap read of the packet ring's current length — for the `M`
@@ -1713,14 +1732,38 @@ fn describe_app_protocol(p: &crate::dpi::AppProtocol) -> (&'static str, String) 
             }
             ("QUIC", s)
         }
-        Http { method, host } => (
+        Http {
+            method,
+            host,
+            path,
+            status,
+        } => (
             "HTTP",
-            match host {
-                Some(h) => format!("{method} {h}"),
-                None => method.clone(),
+            match (status, host) {
+                (Some(code), _) => format!("{code}"),
+                (None, Some(h)) => format!("{method} {h}{}", path.as_deref().unwrap_or("")),
+                (None, None) => match path {
+                    Some(p) => format!("{method} {p}"),
+                    None => method.clone(),
+                },
             },
         ),
-        Dns { qname, qtype } => ("DNS", format!("{qname} (type={qtype})")),
+        Dns {
+            qname,
+            qtype,
+            rcode,
+        } => (
+            "DNS",
+            match rcode {
+                Some(rc) => {
+                    format!(
+                        "{qname} (type={qtype}, {})",
+                        crate::dpi::dns::rcode_label(*rc)
+                    )
+                }
+                None => format!("{qname} (type={qtype})"),
+            },
+        ),
         Llmnr { qname, qtype } => ("LLMNR", format!("{qname} (type={qtype})")),
         Ssh { version } => ("SSH", version.clone()),
         Mqtt { client_id } => ("MQTT", client_id.clone().unwrap_or_default()),
@@ -2098,7 +2141,7 @@ fn build_packet(
     tcp_flags: Option<u8>,
     tcp_seq: Option<u32>,
 ) -> CapturedPacket {
-    let mut cnt = counter.lock().unwrap();
+    let mut cnt = crate::app::safe_lock(&counter, "packets::counter");
     *cnt += 1;
     let id = *cnt;
     let now = chrono::Local::now();
@@ -3073,6 +3116,58 @@ mod tests {
             !tracker.streams.contains_key(&first_flow_key),
             "oldest flow was not evicted"
         );
+    }
+
+    #[test]
+    fn snapshot_handshake_rtts_returns_us_for_completed_handshakes() {
+        let mut tracker = StreamTracker::new();
+        // Completed SYN→SYN-ACK 1ms apart → 1000µs.
+        tracker.track_packet(
+            "1.1.1.1",
+            1234,
+            "2.2.2.2",
+            80,
+            StreamProtocol::Tcp,
+            b"",
+            0,
+            "t",
+            Some(TCP_FLAG_SYN),
+            None,
+            1_000_000,
+        );
+        tracker.track_packet(
+            "2.2.2.2",
+            80,
+            "1.1.1.1",
+            1234,
+            StreamProtocol::Tcp,
+            b"",
+            1,
+            "t",
+            Some(TCP_FLAG_SYN | TCP_FLAG_ACK),
+            None,
+            2_000_000,
+        );
+        // A second flow with only a SYN — no completed handshake, no entry.
+        tracker.track_packet(
+            "3.3.3.3",
+            5555,
+            "4.4.4.4",
+            80,
+            StreamProtocol::Tcp,
+            b"",
+            2,
+            "t",
+            Some(TCP_FLAG_SYN),
+            None,
+            3_000_000,
+        );
+
+        let rtts = tracker.snapshot_handshake_rtts();
+        assert_eq!(rtts.len(), 1, "only the completed handshake should appear");
+        let key = StreamKey::new(StreamProtocol::Tcp, "1.1.1.1", 1234, "2.2.2.2", 80);
+        let rtt = rtts.get(&key).copied().expect("handshake rtt present");
+        assert!((rtt - 1000.0).abs() < 1.0, "expected ~1000µs, got {rtt}");
     }
 
     #[test]

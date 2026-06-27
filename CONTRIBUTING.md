@@ -42,6 +42,15 @@ cargo clippy --all-targets
 
 ## Architecture overview
 
+> **New here?** Take the interactive [Architecture Tour](docs/architecture-tour.html) — an 18-slide,
+> kernel-up walkthrough of the runtime, the DPI/decryption pipeline, eBPF attribution, and the
+> sandbox. Open it in a browser, or read on for the text map.
+>
+> **Working on the eBPF subsystem?** The [eBPF Deep Dive](docs/ebpf-deep-dive.html) is a 23-slide
+> interactive deck that builds eBPF from first principles up to NetWatch's real aya kprobe — with
+> drive-able simulations of the verifier, the issue-#38 timing bug, and the full
+> `connect()` → process-name trace.
+
 ```
 src/
 ├── main.rs                  — Entry point, CLI arg parsing, root error handling
