@@ -3704,6 +3704,30 @@ mod tests {
     }
 
     #[test]
+    fn the_ceiling_fires_on_a_resolver_whose_baseline_would_not() {
+        // 80ms, give or take 5: the baseline opens at twice the mean, 160ms,
+        // so from a mean of 50ms up the 100ms ceiling is the only way this
+        // rule opens. It must not wait for the baseline to agree.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 80.0, 5.0, 2_000);
+        let t = Thresholds::default();
+        let b = base.get("169.254.1.1", "dns.rtt_p50").unwrap();
+        assert_eq!(dns_open_line(b, &t), Some(160.0));
+        let slow = |p50: f64| {
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            detect(&obs_with_dns(dns), &base, &t)
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+        };
+        assert!(slow(100.0).is_none(), "the ceiling is exclusive");
+        let d = slow(120.0).expect("120ms is over the 100ms ceiling");
+        assert_eq!(d.evidence[0].value, 120.0);
+        assert_eq!(d.evidence[0].baseline, Some(80.0));
+        assert_eq!(d.severity, Severity::Medium, "1.5 times the mean");
+    }
+
+    #[test]
     fn the_dns_open_line_is_the_highest_of_its_three_tests() {
         let t = Thresholds::default();
         let line = |mean: f64, sigma: f64| {
