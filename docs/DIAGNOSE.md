@@ -128,6 +128,8 @@ and a key left out keeps its default:
 ```toml
 [diagnose_thresholds]
 sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
+sigma_floor_ms = 0.5       # smallest σ a baseline is judged against
+sigma_floor_pct = 5.0      # or this percentage of the baseline's mean, if larger
 consecutive_n = 3          # samples a condition must show before an issue opens
 verdict_hold_secs = 30     # how long a socket verdict must persist
 dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or not
@@ -142,15 +144,24 @@ wifi_rssi_dbm = -70.0
 wifi_retry_pct = 20.0
 ```
 
-A value that cannot mean anything (a σ multiple of 0 or less, `consecutive_n =
-0`, a percentage outside 0–100, `nan` or `inf`) is replaced by its default and
-logged; `diagnose run` and `diagnose coverage` also print it to stderr. The
+A value that cannot mean anything (a σ multiple of 0 or less, a negative σ
+floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or `inf`) is
+replaced by its default and logged; `diagnose run` and `diagnose coverage` also
+print it to stderr. The
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
-same numbers.
+same numbers. An episode recorded before a threshold existed replays with that
+threshold's default: one from before 0.34 is judged against the σ floor it ran
+without.
 `--generate-config` and the Settings editor's save write the table only once it
 differs from the defaults. Then they write every key, and a key in the file
 keeps its value when a later release retunes that default.
+
+Every σ is floored before it is used. A resolver that answers from cache in
+1.2 ms, give or take 0.05 ms, is judged as if σ were 0.5 ms, so 3σ is 2.7 ms
+rather than 1.35 ms, and a 40 ms resolver is judged against at least 2 ms. The
+Dashboard's latency tiles show the floored σ too. Setting both floors to 0
+judges the raw σ.
 
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
 above normal is left out, so an incident does not become the new normal. A low

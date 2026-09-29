@@ -106,7 +106,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 /// that has a baseline carries `base · σ · nominal | N.Nσ`, and the one that
 /// is deviating says since when.
 struct Reading {
-    /// `base 1.2 · σ 0.4 · 3.2σ`, or a plain qualifier for metrics with no
+    /// `base 1.2 · σ 0.5 · 3.2σ`, or a plain qualifier for metrics with no
     /// learned distribution.
     detail: String,
     /// Set when the metric is currently the subject of an open issue.
@@ -148,8 +148,11 @@ impl Reading {
             );
         };
 
-        let sigma = base.sigma();
-        let above = base.sigma_above(v).unwrap_or(0.0);
+        // The floored σ Diagnose judges with, so a move the tab calls
+        // nominal does not turn this tile red.
+        let floor = app.diagnose.engine.settings().thresholds.sigma_floor();
+        let sigma = base.sigma_floored(floor);
+        let above = base.sigma_above(v, floor).unwrap_or(0.0);
         // Only deviation upward is interesting for a latency metric: a
         // resolver answering faster than baseline is not a finding.
         let (qualifier, severity) = if above >= 3.0 {
@@ -396,7 +399,7 @@ fn session_retrans(app: &App) -> (f64, Option<(String, f64)>) {
 /// ```text
 /// ╭ dns rtt ─────────────────────╮   <- title in the border, severity-coloured
 /// │ 41 ms              ▁▂▃▂▁     │   <- value, unit, inline history
-/// │ base 1.2 · σ 0.4 · 3.2σ      │
+/// │ base 1.2 · σ 0.5 · 3.2σ      │
 /// │ since 06:48                  │   <- only while it is deviating
 /// ╰──────────────────────────────╯
 /// ```
@@ -2305,5 +2308,45 @@ mod tests {
             app.diagnose.engine.observe(&rerouted(40.0), &base);
         }
         assert!(issue_behind(&app, &["path."]));
+    }
+
+    /// A tile scores against the σ Diagnose judges with. A resolver that
+    /// answers in 1.2 ms give or take 0.05 is 16σ out at 2.0 ms against its
+    /// raw σ, and 1.6σ against the 0.5 ms floor: the tile went red on a move
+    /// the Diagnose tab called nominal.
+    #[test]
+    fn a_tile_judges_a_flat_baseline_against_the_floor() {
+        use crate::diagnose::fixture::RESOLVER;
+        let tile = |config: crate::config::NetwatchConfig| {
+            let mut app = App::prepare_with_config(config);
+            app.diagnose.baselines = crate::diagnose::fixture::baselines();
+            app.diagnose
+                .baselines
+                .seed(RESOLVER, "dns.rtt_p50", 1.2, 0.05, 2_400);
+            let r = Reading::baselined(&app, RESOLVER, "dns.rtt_p50", Some(2.0));
+            let t = &app.theme;
+            let status = [
+                (t.status_good, "good"),
+                (t.status_warn, "warn"),
+                (t.status_error, "error"),
+            ]
+            .into_iter()
+            .find(|(c, _)| *c == r.severity)
+            .map(|(_, name)| name);
+            (r.detail, status)
+        };
+        assert_eq!(
+            tile(crate::config::NetwatchConfig::default()),
+            ("base 1.2 · σ 0.5 · nominal".to_string(), Some("good"))
+        );
+
+        // Both floors at 0 is the raw σ, on the tile as in Diagnose.
+        let mut unfloored = crate::config::NetwatchConfig::default();
+        unfloored.diagnose_thresholds.sigma_floor_ms = 0.0;
+        unfloored.diagnose_thresholds.sigma_floor_pct = 0.0;
+        assert_eq!(
+            tile(unfloored),
+            ("base 1.2 · σ 0.1 · 16.0σ".to_string(), Some("error"))
+        );
     }
 }

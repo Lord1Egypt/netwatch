@@ -1095,7 +1095,8 @@ pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
             baselines: store,
         });
 
-        store.set_gate_sigma(engine.settings().thresholds.sigma_k);
+        let t = engine.settings().thresholds;
+        store.set_gate(t.sigma_k, t.sigma_floor());
         for r in &frame.readings {
             store.observe(&r.subject, &r.metric, r.value, r.at);
         }
@@ -1520,8 +1521,8 @@ mod tests {
             }) {
                 self.finished.push(ep);
             }
-            self.store
-                .set_gate_sigma(self.engine.settings().thresholds.sigma_k);
+            let t = self.engine.settings().thresholds;
+            self.store.set_gate(t.sigma_k, t.sigma_floor());
             for r in &readings {
                 self.store.observe(&r.subject, r.metric, r.value, r.at);
             }
@@ -1803,6 +1804,15 @@ mod tests {
         let thresholds = json["settings"]["thresholds"].as_object_mut().unwrap();
         assert!(thresholds.remove("wifi_retry_pct").is_some());
         assert!(thresholds.remove("dns_tc_pct").is_some());
+        // The σ floor arrived in 0.34, in the thresholds and in the
+        // baseline snapshot on each frame.
+        assert!(thresholds.remove("sigma_floor_ms").is_some());
+        assert!(thresholds.remove("sigma_floor_pct").is_some());
+        for frame in json["frames"].as_array_mut().unwrap() {
+            if let Some(snap) = frame["baselines"].as_object_mut() {
+                assert!(snap.remove("sigma_floor").is_some());
+            }
+        }
         let back: Episode = serde_json::from_value(json).unwrap();
         assert_eq!(back.settings, ep.settings);
         assert!(replay(&back).matches());

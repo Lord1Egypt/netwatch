@@ -263,7 +263,7 @@ fn build(input: &Input<'_>) -> Builder {
         let base = input.baselines?.get(subject?, metric)?;
         let value = value?;
         Some((
-            base.sigma_above(value),
+            base.sigma_above(value, input.thresholds.sigma_floor()),
             (base.mean > 0.0).then(|| value / base.mean),
         ))
     };
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn names_do_not_depend_on_the_data() {
         let (issues, obs, base) = rich();
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let open: Vec<&Issue> = issues.iter().collect();
         let t = Thresholds::default();
         for issue in &issues {
@@ -830,7 +830,7 @@ mod tests {
             .iter()
             .find(|i| i.rule == "dns.slow_resolver")
             .unwrap();
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let t = Thresholds::default();
         let v = extract(&Input {
             issue: Some(dns),
@@ -857,7 +857,9 @@ mod tests {
             at("check.gateway.rtt_spike.local_network_congested.gateway_rtt_above_baseline")
                 .is_nan()
         );
-        assert!(at("dns.rtt_p50.sigma") > 3.0);
+        // 40ms against 1.2ms, scored against the 0.5ms floor rather than the
+        // fixture's σ 0.4, as the detector scored it.
+        assert!((at("dns.rtt_p50.sigma") - 77.6).abs() < 1e-3);
         assert!(at("dns.rtt_p50_ms") > 30.0);
         assert!(at("context.secs_since_onset") > 0.0);
         assert!(at("nat.symmetric").is_nan(), "missing stays NaN, not 0");
