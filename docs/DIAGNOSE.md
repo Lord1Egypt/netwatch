@@ -48,6 +48,21 @@ clock-skew evidence. See the [chrony tracking documentation](https://chrony-proj
 4. When the issue closes, the optional cause prompt records what actually
    happened. You can skip it or change the answer from the issue/history.
 
+An issue closes on its own in one of two ways. It auto-closes when its verify
+condition holds for its window, which means netwatch watched it recover. It
+expires when what it is about has been gone for 60 seconds: the socket closed,
+the target was removed from the config or its entry changed, the resolver left
+the system config, the periodic trace moved to another target, or the platform
+no longer lists the interface. The report then says "expired, evidence gone",
+and an expiry never counts as a recovery.
+
+An issue whose evidence has only stopped arriving stays open and shows
+"stale since" and the time it stopped. A gateway that cannot be probed because
+ICMP is blocked is the usual case. From this host it looks the same as a
+gateway that is down. The socket collector refreshes only in the Dense view
+and under `netwatch diagnose run`, so in the Full and Lite views a socket issue
+goes stale instead of expiring.
+
 ## History and sharing
 
 **Incident history** lists the latest 100 saved incidents, including their
