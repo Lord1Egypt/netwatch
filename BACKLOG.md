@@ -20,7 +20,7 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [ ] P13 diagnose/034-exit-code (B06, B07)
 - [ ] P14 diagnose/034-verify-and-config (B03, B04)
 - [ ] P15 diagnose/034-sigma-floor (B09)
-- [ ] P16 diagnose/034-expired (B24)
+- [x] P16 diagnose/034-expired (B24)
 - [ ] P17 diagnose/034-delta-floor-deadband (B10, B11)
 - [ ] P18 diagnose/034-expiry-guard (B25)
 - [ ] P19 diagnose/034-dns-verify (B13)
