@@ -251,6 +251,7 @@ fn state_name(state: &IssueState) -> &'static str {
         IssueState::Muted { .. } => "muted",
         IssueState::Resolved { .. } => "resolved",
         IssueState::AutoClosed { .. } => "auto_closed",
+        IssueState::Expired { .. } => "expired",
     }
 }
 

@@ -850,8 +850,19 @@ pub enum IssueState {
     Resolved {
         at: String,
     },
+    /// The verify condition held for its window: netwatch watched it clear.
     AutoClosed {
         at: String,
+    },
+    /// Closed because what the issue is about went away, such as a socket
+    /// that closed, not because anything measured it recover. An expiry is
+    /// never a recovery and never credits a step.
+    ///
+    /// `reason` is an authored phrase ("socket closed"), never a host,
+    /// address or target name: redacted exports keep a state verbatim.
+    Expired {
+        at: String,
+        reason: String,
     },
 }
 
@@ -867,6 +878,7 @@ impl IssueState {
             IssueState::Muted { .. } => "muted",
             IssueState::Resolved { .. } => "resolved",
             IssueState::AutoClosed { .. } => "auto-closed",
+            IssueState::Expired { .. } => "expired",
         }
     }
 }
@@ -992,6 +1004,9 @@ pub enum VerifyOutcome {
     /// An operator closed the issue by hand. Nothing was measured, so this is
     /// not evidence that the step worked — or that the fault is gone.
     ClosedByOperator,
+    /// The issue expired: what it was about went away before its verify
+    /// condition held, so nothing measured whether the step worked.
+    NotMeasured,
 }
 
 impl VerifyOutcome {
@@ -1002,6 +1017,7 @@ impl VerifyOutcome {
             VerifyOutcome::NotRecovered => "not recovered",
             VerifyOutcome::RecoveredBeforeAction => "was already recovering",
             VerifyOutcome::ClosedByOperator => "closed by hand, not measured",
+            VerifyOutcome::NotMeasured => "closed without a measurement",
         }
     }
 }

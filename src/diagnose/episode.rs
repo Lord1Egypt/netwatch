@@ -943,8 +943,8 @@ pub struct IssueSpan {
     pub top_cause: Option<String>,
     /// Why the issue left the primary list: `"suppressed"` when it is still
     /// open under another issue, otherwise its state label (`"auto-closed"`,
-    /// `"resolved"`, `"muted"`), or `"pruned"` when the engine's history
-    /// limit dropped it on the same tick. Without it an expiry, a
+    /// `"expired"`, `"resolved"`, `"muted"`), or `"pruned"` when the engine's
+    /// history limit dropped it on the same tick. Without it an expiry, a
     /// suppression and a verified fix pin the same way. `None` while open,
     /// and in decisions pinned before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
