@@ -148,8 +148,10 @@ impl Reading {
             );
         };
 
-        // The floored σ Diagnose judges with, so a move the tab calls
-        // nominal does not turn this tile red.
+        // The floored σ Diagnose judges with, so a move under the σ floor
+        // does not turn this tile red. The tile colours on σ alone: a move
+        // under a rule's delta floor (a wired gateway from 2 to 9 ms) still
+        // does, and `issue_behind` then has it say no issue was raised.
         let floor = app.diagnose.engine.settings().thresholds.sigma_floor();
         let sigma = base.sigma_floored(floor);
         let above = base.sigma_above(v, floor).unwrap_or(0.0);
