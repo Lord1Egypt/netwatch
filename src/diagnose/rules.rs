@@ -750,9 +750,9 @@ pub fn apply_suppression(issues: &mut [Issue]) {
     }
 }
 
-/// The issues a user should be shown as findings: open, and not a consequence
-/// of another open issue.
-pub fn primary_issues(issues: &[Issue]) -> Vec<&Issue> {
+/// The findings a user should be shown: open, and not a consequence of
+/// another open finding.
+pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
     issues
         .iter()
         .filter(|i| i.state.is_open() && i.suppressed_by.is_none())
@@ -1201,7 +1201,7 @@ mod tests {
 
         assert_eq!(issues[0].suppressed_by.as_deref(), Some("B"));
         assert_eq!(issues[1].consequences, vec!["A".to_string()]);
-        let primary = primary_issues(&issues);
+        let primary = primary_findings(&issues);
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].id, "B");
     }
@@ -1237,7 +1237,7 @@ mod tests {
             issues[2].consequences,
             vec!["A".to_string(), "B".to_string()]
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1287,7 +1287,7 @@ mod tests {
             issues[0].suppressed_by.is_none(),
             "dns must resurface as a finding once the gateway recovers"
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1317,6 +1317,6 @@ mod tests {
             ),
         ];
         apply_suppression(&mut issues);
-        assert_eq!(primary_issues(&issues).len(), 3);
+        assert_eq!(primary_findings(&issues).len(), 3);
     }
 }

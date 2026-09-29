@@ -307,7 +307,7 @@ impl Engine {
 
     /// Findings to show: open, and not a consequence of another open issue.
     pub fn primary(&self) -> Vec<&Issue> {
-        rules::primary_issues(&self.issues)
+        rules::primary_findings(&self.issues)
     }
 
     pub fn open_count(&self) -> usize {

@@ -57,7 +57,7 @@ pub struct Report {
 impl Report {
     /// Issues that are findings in their own right, worst first.
     pub fn primary(&self) -> Vec<&Issue> {
-        rules::primary_issues(&self.issues)
+        rules::primary_findings(&self.issues)
     }
 
     fn find(&self, id: &str) -> Option<&Issue> {
