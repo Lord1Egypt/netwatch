@@ -5718,6 +5718,17 @@ mod target_tests {
             })
             .unwrap();
         assert_eq!(top.id, "server_stage_slow");
+
+        // The evidence carries the σ the stage was judged against. It used to
+        // carry 0, and the report printed "σ0".
+        let ev = &d.evidence[0];
+        assert_eq!(ev.metric, "target.first_byte_ms");
+        assert_eq!((ev.baseline, ev.sigma), (Some(40.0), Some(4.0)));
+        // A first byte that never varied is judged, and reported, against the
+        // floor.
+        base.seed("api", "target.ttfb_ms", 5.0, 0.1, 2_400);
+        let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+        assert_eq!(d.evidence[0].sigma, Some(0.5));
     }
 
     #[test]
