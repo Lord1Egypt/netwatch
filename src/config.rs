@@ -146,6 +146,28 @@ pub struct NetwatchConfig {
     #[serde(default)]
     pub diagnose_probes: crate::diagnose::active::Config,
     pub diagnose_targets: Vec<crate::diagnose::targets::TargetConfig>,
+
+    /// The Diagnose engine's thresholds, e.g.
+    ///
+    /// ```toml
+    /// [diagnose_thresholds]
+    /// dns_ceiling_ms = 30
+    /// ```
+    ///
+    /// A missing key keeps its default. A value that cannot mean anything
+    /// (σ multiple ≤ 0, `consecutive_n` = 0, a share outside 0–100, NaN) is
+    /// logged and replaced by its default. Read at startup: an episode
+    /// records the thresholds it ran with, so they do not change mid-run.
+    ///
+    /// Saved only once it differs from the defaults. `--generate-config` and
+    /// the Settings editor write the whole config, and a table of today's
+    /// defaults in the file would hold them there when a release retunes one.
+    #[serde(default, skip_serializing_if = "is_default_thresholds")]
+    pub diagnose_thresholds: crate::diagnose::detectors::Thresholds,
+}
+
+fn is_default_thresholds(t: &crate::diagnose::detectors::Thresholds) -> bool {
+    *t == crate::diagnose::detectors::Thresholds::default()
 }
 
 fn default_record_episodes() -> bool {
@@ -214,6 +236,7 @@ impl Default for NetwatchConfig {
             diagnose_record_episodes: default_record_episodes(),
             diagnose_probes: Default::default(),
             diagnose_targets: Vec::new(),
+            diagnose_thresholds: Default::default(),
             sandbox: default_sandbox(),
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
@@ -397,6 +420,7 @@ show_geo = false
             diagnose_record_episodes: false,
             diagnose_probes: Default::default(),
             diagnose_targets: vec![],
+            diagnose_thresholds: Default::default(),
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();
@@ -473,6 +497,66 @@ bandwidth_threshold = 50000000
         assert_eq!(cfg.alerts.bandwidth_threshold, 50_000_000);
         assert_eq!(cfg.alerts.port_scan_threshold, 20); // default
         assert_eq!(cfg.alerts.port_scan_window_secs, 30); // default
+    }
+
+    #[test]
+    fn diagnose_thresholds_parse_from_toml_and_default_when_absent() {
+        use crate::diagnose::detectors::Thresholds;
+        let cfg: NetwatchConfig = toml::from_str(
+            r#"
+[diagnose_thresholds]
+dns_ceiling_ms = 30
+consecutive_n = 5
+"#,
+        )
+        .unwrap();
+        // A whole number is read as a float, and the keys left out keep
+        // their defaults.
+        assert_eq!(
+            cfg.diagnose_thresholds,
+            Thresholds {
+                dns_ceiling_ms: 30.0,
+                consecutive_n: 5,
+                ..Thresholds::default()
+            }
+        );
+
+        let cfg: NetwatchConfig = toml::from_str("default_tab = \"diagnose\"").unwrap();
+        assert_eq!(cfg.diagnose_thresholds, Thresholds::default());
+
+        // A save leaves the table out while it holds the defaults, so a
+        // later retune still reaches this file, and keeps it once changed.
+        let saved = toml::to_string_pretty(&NetwatchConfig::default()).unwrap();
+        assert!(!saved.contains("diagnose_thresholds"), "{saved}");
+        let saved = toml::to_string_pretty(&NetwatchConfig {
+            diagnose_thresholds: Thresholds {
+                sigma_k: 4.0,
+                ..Thresholds::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let back: NetwatchConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(back.diagnose_thresholds.sigma_k, 4.0);
+    }
+
+    /// DIAGNOSE.md lists the table with every default, so a threshold added
+    /// or retuned without the doc fails here.
+    #[test]
+    fn the_documented_thresholds_are_the_defaults() {
+        // A Windows checkout rewrites the doc to CRLF, and the search below
+        // spans a line break.
+        let doc = include_str!("../docs/DIAGNOSE.md").replace("\r\n", "\n");
+        let start = doc
+            .find("```toml\n[diagnose_thresholds]\n")
+            .expect("DIAGNOSE.md shows the thresholds table")
+            + "```toml\n".len();
+        let block = &doc[start..][..doc[start..].find("```").unwrap()];
+        let documented: toml::Table = toml::from_str(block).unwrap();
+        assert_eq!(
+            documented["diagnose_thresholds"],
+            toml::Value::try_from(crate::diagnose::detectors::Thresholds::default()).unwrap()
+        );
     }
 
     #[test]

@@ -527,6 +527,9 @@ the free-text ones, `S` saves. Most changes apply the moment you make them — `
 exception, because Landlock and dropped capabilities can't be undone inside a running
 process, so it takes effect on the next launch.
 
+Both leave out the `[diagnose_thresholds]` table while it holds its defaults, so a later
+release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
+
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.

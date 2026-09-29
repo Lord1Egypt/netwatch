@@ -120,6 +120,43 @@ JSON output carries the ruleset size, the sampling window, the coverage object
 and the issues, so a support engineer can see what was evaluated rather than
 inferring it from an empty list.
 
+## Thresholds
+
+The engine's thresholds live in a `config.toml` table. These are the defaults,
+and a key left out keeps its default:
+
+```toml
+[diagnose_thresholds]
+sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
+consecutive_n = 3          # samples a condition must show before an issue opens
+verdict_hold_secs = 30     # how long a socket verdict must persist
+dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or not
+socket_rtt_ms = 100.0
+loaded_rtt_delta_ms = 100.0
+saturation_pct = 90.0
+iface_error_floor = 1.0    # interface errors per minute
+iface_drop_floor = 60.0    # interface drops per minute
+dns_tc_pct = 10.0
+dns_mismatch_pct = 50.0
+wifi_rssi_dbm = -70.0
+wifi_retry_pct = 20.0
+```
+
+A value that cannot mean anything (a σ multiple of 0 or less, `consecutive_n =
+0`, a percentage outside 0–100, `nan` or `inf`) is replaced by its default and
+logged; `diagnose run` and `diagnose coverage` also print it to stderr. The
+table is read at startup, and coverage's **r** reload leaves it alone: each
+recorded episode keeps the thresholds it ran with, so a replay judges it by the
+same numbers.
+`--generate-config` and the Settings editor's save write the table only once it
+differs from the defaults. Then they write every key, and a key in the file
+keeps its value when a later release retunes that default.
+
+`sigma_k` also sets what the baselines learn: a reading that many σ or more
+above normal is left out, so an incident does not become the new normal. A low
+value leaves out ordinary peaks too, so the saved baselines settle lower and
+flag more, and they take time to relearn after the value is raised again.
+
 ## Diagnose coverage in terminal Netwatch
 
 Press **9**, then **c** to inspect every check. Use **↑/↓** to select a row.

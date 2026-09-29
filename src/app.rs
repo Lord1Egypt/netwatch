@@ -627,6 +627,7 @@ impl App {
         };
 
         let ui = AppUiState::from_config(&user_config);
+        let diagnose = DiagnoseController::new(&user_config.diagnose_thresholds);
 
         Self {
             traffic: TrafficCollector::new(),
@@ -674,7 +675,7 @@ impl App {
             pktap_handle: None,
             sandbox_report: crate::sandbox::Report::default(),
             workers_started: false,
-            diagnose: DiagnoseController::new(),
+            diagnose,
         }
     }
 

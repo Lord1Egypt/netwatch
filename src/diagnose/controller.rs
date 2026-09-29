@@ -56,11 +56,22 @@ pub struct DiagnoseController {
 }
 
 impl DiagnoseController {
-    pub(crate) fn new() -> Self {
+    /// A live controller whose engine judges with `thresholds`, the
+    /// configured `[diagnose_thresholds]`. A value that cannot mean anything
+    /// is logged and replaced by its default rather than refused.
+    pub(crate) fn new(thresholds: &crate::diagnose::detectors::Thresholds) -> Self {
+        let (thresholds, warnings) = thresholds.validated();
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
         let fingerprint =
             crate::diagnose::baseline::NetworkFingerprint::new(String::new(), None, vec![], None);
         Self {
-            engine: crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock)),
+            engine: crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock))
+                .with_settings(crate::diagnose::engine::Settings {
+                    thresholds,
+                    ..Default::default()
+                }),
             baselines: crate::diagnose::baseline::BaselineStore::load(
                 &crate::diagnose::baseline::BaselineStore::default_path(),
                 fingerprint,
@@ -858,5 +869,82 @@ pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
             .and_then(|i| i.mac.clone())
             .map(|_| vec!["report.json".to_string()])
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::App;
+    use crate::config::NetwatchConfig;
+    use crate::diagnose::baseline::{BaselineStore, NetworkFingerprint};
+    use crate::diagnose::detectors::{DnsObs, Observations, Thresholds};
+
+    /// Whether three samples of a 40ms resolver, on a network with no
+    /// baseline yet, open `dns.slow_resolver` in the app's engine.
+    fn a_40ms_resolver_opens_an_issue(app: &mut App) -> bool {
+        let obs = Observations {
+            dns: Some(DnsObs {
+                resolver: "192.0.2.53".into(),
+                rtt_p50_ms: Some(40.0),
+                rtt_p95_ms: Some(48.0),
+                failure_rate_pct: 0.0,
+                truncation_rate_pct: 0.0,
+                queries: 38,
+                failed: 0,
+                truncated: 0,
+                alt_resolver: None,
+                alt_rtt_ms: None,
+                icmp_rtt_ms: None,
+                cached_rtt_ms: None,
+                window_secs: 180,
+                cross: None,
+            }),
+            ..Default::default()
+        };
+        let base = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
+        for _ in 0..3 {
+            app.diagnose.engine.observe(&obs, &base);
+        }
+        app.diagnose
+            .engine
+            .primary()
+            .iter()
+            .any(|i| i.rule == "dns.slow_resolver")
+    }
+
+    /// The engine used to start with `Thresholds::default()` whatever the
+    /// config said, so no threshold a user could set reached a detector.
+    #[test]
+    fn the_engine_starts_with_configured_thresholds() {
+        let config: NetwatchConfig = toml::from_str(
+            "[diagnose_thresholds]\ndns_ceiling_ms = 30\nsigma_k = 0\nsocket_rtt_ms = inf\n",
+        )
+        .unwrap();
+        let mut app = App::prepare_with_config(config);
+        let settings = *app.diagnose.engine.settings();
+        let t = settings.thresholds;
+        assert_eq!(t.dns_ceiling_ms, 30.0);
+        assert_eq!(
+            t.sigma_k,
+            Thresholds::default().sigma_k,
+            "an invalid σ multiple falls back to the default"
+        );
+        assert_eq!(t.socket_rtt_ms, Thresholds::default().socket_rtt_ms);
+        // Every episode embeds these settings, and JSON writes infinity as
+        // null, which would not load again.
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::diagnose::engine::Settings>(&json).unwrap(),
+            settings
+        );
+        assert!(a_40ms_resolver_opens_an_issue(&mut app));
+
+        // Without the section nothing changes: 40ms is under the default.
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        assert_eq!(
+            app.diagnose.engine.settings().thresholds,
+            Thresholds::default()
+        );
+        assert!(!a_40ms_resolver_opens_an_issue(&mut app));
     }
 }

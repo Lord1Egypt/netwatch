@@ -300,6 +300,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()
     };
+    super::run::print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(rule) = &test {
         config
             .diagnose_probes

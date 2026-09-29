@@ -20,7 +20,13 @@ use super::issue::{
 use super::rules;
 
 /// Tunables. Defaults are the spec's: k=3σ, N=3 consecutive samples.
+///
+/// Read from `[diagnose_thresholds]` in config.toml, and embedded in every
+/// recorded episode. A field missing from either takes its default, so a
+/// field added later neither breaks a config written before it nor stops
+/// an older episode from loading.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Thresholds {
     /// σ multiple that counts as a deviation.
     pub sigma_k: f64,
@@ -78,6 +84,64 @@ impl Default for Thresholds {
             wifi_rssi_dbm: -70.0,
             wifi_retry_pct: 20.0,
         }
+    }
+}
+
+impl Thresholds {
+    /// These thresholds with every value that cannot mean anything put back
+    /// to its default, and one warning per value put back.
+    ///
+    /// They come from a hand-edited file, and a typo there should cost one
+    /// setting, not the tab: a σ multiple of 0 calls every sample a
+    /// deviation, and a share above 100% can never be reached. NaN and
+    /// infinity are refused everywhere: every comparison with NaN is false,
+    /// so the rule it feeds would never fire, and every episode embeds these
+    /// values, where JSON writes either as `null` and the episode no longer
+    /// loads.
+    pub fn validated(self) -> (Self, Vec<String>) {
+        type Rule = (fn(f64) -> bool, &'static str);
+        let above_zero: Rule = (
+            |v| v > 0.0 && v.is_finite(),
+            "must be a finite number above 0",
+        );
+        let share: Rule = (|v| (0.0..=100.0).contains(&v), "must be within 0..=100");
+        let number: Rule = (|v| v.is_finite(), "must be a finite number");
+
+        let mut t = self;
+        let mut warnings = Vec::new();
+        let mut check = |name: &str, field: fn(&mut Self) -> &mut f64, (ok, needs): Rule| {
+            let value = field(&mut t);
+            if !ok(*value) {
+                let default = *field(&mut Self::default());
+                warnings.push(format!(
+                    "diagnose_thresholds.{name} = {value} {needs}, so the default {default} is used"
+                ));
+                *value = default;
+            }
+        };
+        check("sigma_k", |t| &mut t.sigma_k, above_zero);
+        check("dns_ceiling_ms", |t| &mut t.dns_ceiling_ms, number);
+        check("socket_rtt_ms", |t| &mut t.socket_rtt_ms, number);
+        check(
+            "loaded_rtt_delta_ms",
+            |t| &mut t.loaded_rtt_delta_ms,
+            number,
+        );
+        check("saturation_pct", |t| &mut t.saturation_pct, share);
+        check("iface_error_floor", |t| &mut t.iface_error_floor, number);
+        check("iface_drop_floor", |t| &mut t.iface_drop_floor, number);
+        check("dns_tc_pct", |t| &mut t.dns_tc_pct, share);
+        check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
+        check("wifi_rssi_dbm", |t| &mut t.wifi_rssi_dbm, number);
+        check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
+        if t.consecutive_n == 0 {
+            t.consecutive_n = Self::default().consecutive_n;
+            warnings.push(format!(
+                "diagnose_thresholds.consecutive_n = 0 must be at least 1, so the default {} is used",
+                t.consecutive_n
+            ));
+        }
+        (t, warnings)
     }
 }
 
@@ -3417,6 +3481,86 @@ mod tests {
         );
         assert!(d.evidence[0].baseline.is_none());
         assert!(d.evidence[0].multiple_label().is_none());
+    }
+
+    #[test]
+    fn a_lowered_dns_ceiling_fires_where_the_default_does_not() {
+        // A 40ms resolver on a first run, with no baseline: under the 100ms
+        // default it is ordinary, under a configured 30ms ceiling it is slow.
+        let obs = obs_with_dns(slow_dns());
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"dns.slow_resolver"));
+
+        let t = Thresholds {
+            dns_ceiling_ms: 30.0,
+            ..Thresholds::default()
+        };
+        let found = detect(&obs, &store(), &t);
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("40ms is over a 30ms ceiling");
+        assert_eq!(d.evidence[0].value, 40.0);
+        assert!(d.evidence[0].baseline.is_none());
+    }
+
+    #[test]
+    fn an_invalid_threshold_falls_back_to_its_default() {
+        let default = Thresholds::default();
+        assert_eq!(default.validated(), (default, vec![]));
+
+        let (t, warnings) = Thresholds {
+            sigma_k: 0.0,
+            consecutive_n: 0,
+            saturation_pct: 150.0,
+            dns_tc_pct: -1.0,
+            dns_ceiling_ms: f64::NAN,
+            // TOML reads `inf`, a natural way to switch a rule off, but an
+            // episode that embeds it would not load again.
+            loaded_rtt_delta_ms: f64::INFINITY,
+            iface_drop_floor: f64::NEG_INFINITY,
+            // Valid values that are not the defaults are kept, the edges
+            // of a share included.
+            dns_mismatch_pct: 100.0,
+            wifi_retry_pct: 0.0,
+            wifi_rssi_dbm: -80.0,
+            socket_rtt_ms: 0.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(
+            t,
+            Thresholds {
+                dns_mismatch_pct: 100.0,
+                wifi_retry_pct: 0.0,
+                wifi_rssi_dbm: -80.0,
+                socket_rtt_ms: 0.0,
+                ..default
+            }
+        );
+        assert_eq!(
+            warnings,
+            [
+                "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
+                "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
+                "diagnose_thresholds.loaded_rtt_delta_ms = inf must be a finite number, so the default 100 is used",
+                "diagnose_thresholds.saturation_pct = 150 must be within 0..=100, so the default 90 is used",
+                "diagnose_thresholds.iface_drop_floor = -inf must be a finite number, so the default 60 is used",
+                "diagnose_thresholds.dns_tc_pct = -1 must be within 0..=100, so the default 10 is used",
+                "diagnose_thresholds.consecutive_n = 0 must be at least 1, so the default 3 is used",
+            ]
+        );
+
+        let (t, warnings) = Thresholds {
+            sigma_k: f64::INFINITY,
+            ..default
+        }
+        .validated();
+        assert_eq!(t, default);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_k = inf must be a finite number above 0, so the default 3 is used"]
+        );
     }
 
     #[test]
