@@ -8,7 +8,8 @@
 
 use crate::diagnose::coverage::Coverage;
 use crate::diagnose::detectors::Observations;
-use crate::diagnose::issue::{Availability, CheckResult, Issue, Kind};
+use crate::diagnose::issue::{Availability, CheckResult, Issue, Kind, Subject};
+use crate::diagnose::rules;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -44,14 +45,14 @@ impl Outcome {
     }
 }
 
-/// Decide the outcome of a finished run.
+/// Decide the outcome of a finished run, from the findings [`select`] chose.
 ///
 /// Only an Issue is a finding. An Observation says something worth knowing,
 /// not something wrong, so a host whose only finding is a symmetric NAT
 /// exits 0. `evidence` is whether the run ever saw a usable observation for
 /// what it was asked about. Without one there is nothing to conclude,
 /// however quiet the issue list looks.
-pub fn outcome(findings: &[&Issue], evidence: bool) -> Outcome {
+pub fn outcome(findings: &[Issue], evidence: bool) -> Outcome {
     if findings.iter().any(|f| f.kind() == Kind::Issue) {
         Outcome::Finding
     } else if evidence {
@@ -189,12 +190,18 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
 
     let config = run_config(NetwatchConfig::load());
     print_threshold_warnings(&config.diagnose_thresholds);
-    if let Some(name) = &opts.target {
-        anyhow::ensure!(
-            config.diagnose_targets.iter().any(|t| &t.name == name),
-            "no configured target named {name}"
-        );
-    }
+    let mut asked = opts
+        .target
+        .as_deref()
+        .map(|name| {
+            config
+                .diagnose_targets
+                .iter()
+                .find(|t| t.name == name)
+                .map(Asked::new)
+                .ok_or_else(|| anyhow::anyhow!("no configured target named {name}"))
+        })
+        .transpose()?;
     let mode = crate::sandbox::Mode::from_config(&config.sandbox);
     let mut app = App::prepare_with_config(config);
     crate::runtime::bootstrap::start(
@@ -237,6 +244,9 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         app.diagnose.baselines.set_network(fingerprint);
         let observations = sampler.sample(&app, &app.diagnose.engine.settings().thresholds);
         saw_evidence |= evidence(&observations, opts.target.as_deref());
+        if let Some(asked) = &mut asked {
+            asked.saw(&observations);
+        }
         app.diagnose.engine.observe_live_at(
             &observations,
             &app.diagnose.baselines,
@@ -251,14 +261,7 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
     }
     app.packet_collector.stop_capture();
 
-    let all = app.diagnose.engine.primary();
-    let findings: Vec<&Issue> = match &opts.target {
-        Some(name) => all
-            .into_iter()
-            .filter(|i| i.subject.label() == *name)
-            .collect(),
-        None => all,
-    };
+    let findings = select(app.diagnose.engine.issues(), asked.as_ref());
     let outcome = outcome(&findings, saw_evidence);
     let sampling = Sampling {
         target: opts.target,
@@ -280,6 +283,130 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         print!("{}", text_report(outcome, &sampling, &findings));
     }
     Ok(outcome)
+}
+
+/// The target a run was asked about, and the interface and resolver its
+/// latest probe's lookup went through, as a finding about it would record
+/// them in its scope. Either is `None` when not known.
+#[derive(Debug, Clone)]
+struct Asked {
+    name: String,
+    via_iface: Option<String>,
+    via_resolver: Option<String>,
+    /// The target is a name. One given as an address has no resolver on its
+    /// route.
+    resolves: bool,
+    /// The target is this host: it is a loopback address, or every address
+    /// its latest probe resolved is. Nothing host-wide lies on its route.
+    local: bool,
+}
+
+impl Asked {
+    fn new(target: &super::targets::TargetConfig) -> Self {
+        let address = target.host.parse::<std::net::IpAddr>().ok();
+        Self {
+            name: target.name.clone(),
+            via_iface: None,
+            via_resolver: None,
+            resolves: address.is_none(),
+            local: address.is_some_and(|a| a.is_loopback()),
+        }
+    }
+
+    /// Take the route from this sample's probe of the target, if it has one.
+    fn saw(&mut self, observations: &Observations) {
+        let Some(probe) = observations.targets.iter().find(|t| t.name == self.name) else {
+            return;
+        };
+        let lookup = probe.route_lookup();
+        self.via_resolver = lookup.map(|l| l.resolver.clone());
+        self.via_iface = lookup.and_then(|l| l.link.clone());
+        if !probe.addresses.is_empty() {
+            self.local = probe
+                .addresses
+                .iter()
+                .all(|a| a.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback()));
+        }
+    }
+
+    fn is_about(&self, finding: &Issue) -> bool {
+        matches!(&finding.subject, Subject::Target { name } if *name == self.name)
+    }
+
+    /// Whether a host, interface or resolver finding can lie on this
+    /// target's route. It can unless it names an interface or resolver the
+    /// target is known not to use, the edge suppression draws, or it is
+    /// about a resolver and the target is an address, or the target is this
+    /// host.
+    fn routes_through(&self, finding: &Issue) -> bool {
+        if self.local {
+            return false;
+        }
+        let (iface, resolver) = match &finding.subject {
+            Subject::Host => (
+                finding.scope.via_iface.as_deref(),
+                finding.scope.via_resolver.as_deref(),
+            ),
+            Subject::Iface { name } => (Some(name.as_str()), None),
+            Subject::Resolver { addr } => (finding.scope.via_iface.as_deref(), Some(addr.as_str())),
+            _ => return false,
+        };
+        let differs = |theirs: Option<&str>, ours: Option<&str>| {
+            theirs
+                .zip(ours)
+                .is_some_and(|(theirs, ours)| theirs != ours)
+        };
+        !differs(iface, self.via_iface.as_deref())
+            && (resolver.is_none() || self.resolves)
+            && !differs(resolver, self.via_resolver.as_deref())
+    }
+
+    /// A finding about this target, as the run counts it. The detector makes
+    /// a failure of the service itself an Observation, "service, not
+    /// network", because the Diagnose tab asks whether the network is at
+    /// fault. A run asked about one target asks whether it works, and a 503
+    /// says it does not, so the finding keeps its rule's severity.
+    fn counted(&self, finding: &Issue) -> Issue {
+        let mut finding = finding.clone();
+        if let Some(rule) = rules::lookup(&finding.rule) {
+            finding.severity = finding.severity.max(rule.severity);
+        }
+        finding
+    }
+}
+
+/// The findings a run reports, as it counts them.
+///
+/// Without a target, every primary finding. With one: the findings about
+/// that target, which count as Issues; the findings whose consequences
+/// include one, so a gateway failure that hides the target's own finding
+/// still decides the run; and the host, interface and resolver Issues on the
+/// target's route. Matching on the subject's label alone used to drop the
+/// gateway failure, and the run exited 0 with the target down.
+fn select(all: &[Issue], asked: Option<&Asked>) -> Vec<Issue> {
+    let primary = rules::primary_findings(all);
+    let Some(asked) = asked else {
+        return primary.into_iter().cloned().collect();
+    };
+    let about: Vec<&str> = all
+        .iter()
+        .filter(|i| asked.is_about(i))
+        .map(|i| i.id.as_str())
+        .collect();
+    primary
+        .into_iter()
+        .filter_map(|f| {
+            if asked.is_about(f) {
+                Some(asked.counted(f))
+            } else if f.consequences.iter().any(|id| about.contains(&id.as_str()))
+                || (f.kind() == Kind::Issue && asked.routes_through(f))
+            {
+                Some(f.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// What a run sampled, apart from what it found.
@@ -306,13 +433,13 @@ fn json_report(
     outcome: Outcome,
     sampling: &Sampling,
     coverage: &Coverage,
-    findings: &[&Issue],
+    findings: &[Issue],
 ) -> serde_json::Value {
     let of = |kind: Kind| -> Vec<Finding> {
         findings
             .iter()
             .filter(|f| f.kind() == kind)
-            .map(|&issue| Finding { kind, issue })
+            .map(|issue| Finding { kind, issue })
             .collect()
     };
     serde_json::json!({
@@ -339,7 +466,7 @@ fn json_report(
 
 /// The text report: the outcome, the Issues under it, then the Observations
 /// under their own heading, since they do not set the exit status.
-fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[&Issue]) -> String {
+fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[Issue]) -> String {
     let mut out = format!(
         "{} · {} samples in {:.0}s\n",
         outcome.label(),
@@ -363,10 +490,14 @@ fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[&Issue]) -> St
     out
 }
 
-/// A finding's summary line, then its top cause and the check that cause is
+/// A finding's summary line and the note that qualifies it, such as
+/// "service, not network", then its top cause and the check that cause is
 /// still missing.
 fn finding_lines(finding: &Issue) -> String {
     let mut out = format!("  {}\n", finding.summary_line());
+    if let Some(note) = &finding.scope.note {
+        out.push_str(&format!("    {note}\n"));
+    }
     if let Some(cause) = finding.top_cause() {
         out.push_str(&format!(
             "    {} ({}, {})\n",
@@ -395,6 +526,8 @@ fn missing_line(missing: &CheckResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnose::issue::Severity;
+    use crate::diagnose::targets::TargetObs;
 
     #[test]
     fn budgets_parse_and_are_bounded() {
@@ -590,8 +723,9 @@ mod tests {
     #[test]
     fn a_finding_outranks_the_evidence_question() {
         let issue = crate::diagnose::fixture::report().issues.remove(0);
-        assert_eq!(outcome(&[&issue], true), Outcome::Finding);
-        assert_eq!(outcome(&[&issue], false), Outcome::Finding);
+        let issue = std::slice::from_ref(&issue);
+        assert_eq!(outcome(issue, true), Outcome::Finding);
+        assert_eq!(outcome(issue, false), Outcome::Finding);
         assert_eq!(Outcome::Finding as i32, 1);
     }
 
@@ -641,19 +775,20 @@ mod tests {
     /// finding, Info included.
     #[test]
     fn observations_alone_exit_zero() {
-        let nat = symmetric_nat();
-        let outcome = outcome(&[&nat], true);
+        let findings = [symmetric_nat()];
+        let nat = &findings[0];
+        let outcome = outcome(&findings, true);
         assert_eq!(outcome, Outcome::NoFinding);
         assert_eq!(outcome as i32, 0);
         // An Observation is no evidence either way: with nothing measured
         // the run is still incomplete, not healthy.
-        assert_eq!(super::outcome(&[&nat], false), Outcome::Incomplete);
+        assert_eq!(super::outcome(&findings, false), Outcome::Incomplete);
 
-        let json = json_report(outcome, &sampling(true), &Coverage::default(), &[&nat]);
+        let json = json_report(outcome, &sampling(true), &Coverage::default(), &findings);
         assert_eq!(json["exit"], 0);
         assert_eq!(json["issues"], serde_json::json!([]));
         assert_eq!(json["observations"][0]["rule"], "nat.symmetric");
-        let text = text_report(outcome, &sampling(true), &[&nat]);
+        let text = text_report(outcome, &sampling(true), &findings);
         let (above, below) = text
             .split_once("observations · not counted in the exit status\n")
             .expect("observations have their own heading");
@@ -665,11 +800,12 @@ mod tests {
     fn one_issue_exits_one() {
         let nat = symmetric_nat();
         let (engine, _) = crate::diagnose::fixture::run();
-        let issue = engine.primary_issues()[0];
-        assert_eq!(outcome(&[&nat, issue], true), Outcome::Finding);
-        assert_eq!(outcome(&[issue, &nat], false), Outcome::Finding);
+        let issue = engine.primary_issues()[0].clone();
+        let findings = [nat.clone(), issue.clone()];
+        assert_eq!(outcome(&findings, true), Outcome::Finding);
+        assert_eq!(outcome(&findings, false), Outcome::Finding);
 
-        let text = text_report(Outcome::Finding, &sampling(true), &[&nat, issue]);
+        let text = text_report(Outcome::Finding, &sampling(true), &findings);
         let (above, below) = text
             .split_once("observations · not counted in the exit status\n")
             .expect("observations have their own heading");
@@ -680,11 +816,10 @@ mod tests {
 
     #[test]
     fn json_separates_issues_from_observations() {
-        let nat = symmetric_nat();
         let (engine, _) = crate::diagnose::fixture::run();
-        let mut findings = engine.primary();
+        let mut findings = select(engine.issues(), None);
         let issues = findings.len();
-        findings.push(&nat);
+        findings.push(symmetric_nat());
         let json = json_report(
             outcome(&findings, true),
             &sampling(true),
@@ -711,7 +846,7 @@ mod tests {
     #[test]
     fn schema_2_checks_have_state_not_passed() {
         let (engine, _) = crate::diagnose::fixture::run();
-        let findings = engine.primary();
+        let findings = select(engine.issues(), None);
         let json = json_report(
             outcome(&findings, true),
             &sampling(true),
@@ -738,6 +873,271 @@ mod tests {
             states.into_iter().collect::<Vec<_>>(),
             ["failed", "not_run", "passed"]
         );
+    }
+
+    fn asked(toml: &str) -> Asked {
+        Asked::new(&toml::from_str(toml).expect("a target entry"))
+    }
+
+    /// A probe of `name` that resolved through 192.168.8.1 and connected,
+    /// with `http` as its first-byte stage.
+    fn probe(name: &str, http: crate::diagnose::targets::Stage) -> TargetObs {
+        use crate::diagnose::targets::{Lookup, LookupOutcome, Stage, TargetContext};
+        let ok = |ms| {
+            Some(Stage {
+                ms: Some(ms),
+                error: None,
+            })
+        };
+        TargetObs {
+            baseline_key: None,
+            name: name.into(),
+            host: format!("{name}.corp.internal"),
+            port: 443,
+            tls: true,
+            http: true,
+            expect_status: None,
+            probed_at: "2026-09-15 10:00:00".into(),
+            resolve: Stage {
+                ms: Some(2.0),
+                error: None,
+            },
+            addresses: vec!["10.1.2.3".into()],
+            lookups: vec![Lookup {
+                resolver: "192.168.8.1".into(),
+                link: None,
+                outcome: LookupOutcome::Answered,
+            }],
+            connect: ok(12.0),
+            connect_v4: ok(12.0),
+            connect_v6: None,
+            tls_stage: ok(30.0),
+            status: None,
+            http_stage: Some(http),
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
+            stale_after_secs: None,
+            context: TargetContext::default(),
+        }
+    }
+
+    /// D33-B07: `--target api` exited 0 on a 503, because the detector
+    /// demotes a failing service to an Observation. Asked about the target,
+    /// the run counts it as an Issue; asked about the network, it does not.
+    #[test]
+    fn a_named_target_answering_503_exits_one() {
+        use crate::diagnose::targets::{Stage, StageError};
+        let mut target = probe(
+            "api",
+            Stage {
+                ms: Some(40.0),
+                error: Some(StageError::HttpStatus { status: 503 }),
+            },
+        );
+        target.status = Some(503);
+        let observations = Observations {
+            targets: vec![target],
+            ..Default::default()
+        };
+        let engine = engine_after(&observations);
+        let tab = engine.primary();
+        assert_eq!(tab.len(), 1, "{tab:?}");
+        assert_eq!(tab[0].rule, "target.http_error");
+        assert_eq!(tab[0].kind(), Kind::Observation, "the Diagnose tab's kind");
+        assert!(evidence(&observations, Some("api")));
+
+        let mut api = asked("name = \"api\"\nhost = \"api.corp.internal\"");
+        api.saw(&observations);
+        let findings = select(engine.issues(), Some(&api));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind(), Kind::Issue);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        let outcome = outcome(&findings, true);
+        assert_eq!(outcome as i32, 1);
+        let json = json_report(outcome, &sampling(true), engine.coverage(), &findings);
+        assert_eq!(json["issues"][0]["kind"], "issue");
+        assert_eq!(json["issues"][0]["scope"]["note"], "service, not network");
+        let text = text_report(outcome, &sampling(true), &findings);
+        assert!(
+            text.contains(&format!(
+                "  {}\n    service, not network\n",
+                findings[0].summary_line()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("observations"), "{text}");
+        assert_eq!(
+            engine.primary()[0].severity,
+            Severity::Info,
+            "the engine's finding is left alone"
+        );
+
+        // The same run without --target asks whether the network is at
+        // fault, and a failing service is not.
+        let findings = select(engine.issues(), None);
+        assert_eq!(findings[0].kind(), Kind::Observation);
+        assert_eq!(super::outcome(&findings, true) as i32, 0);
+    }
+
+    /// REVIEW §2.1: the filter matched on the subject's label, so a gateway
+    /// failure that suppressed the target's own finding was dropped and the
+    /// run exited 0 with the target down.
+    #[test]
+    fn a_gateway_root_cause_survives_the_target_filter() {
+        use crate::diagnose::detectors::GatewayObs;
+        use crate::diagnose::targets::{Stage, StageError};
+        let mut target = probe(
+            "api",
+            Stage {
+                ms: None,
+                error: None,
+            },
+        );
+        target.connect = Some(Stage {
+            ms: Some(3000.0),
+            error: Some(StageError::Timeout),
+        });
+        target.connect_v4 = target.connect.clone();
+        target.tls_stage = None;
+        target.http_stage = None;
+        let observations = Observations {
+            iface: crate::diagnose::fixture::observations_at(0).iface,
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: None,
+                loss_pct: 100.0,
+                arp_ok: None,
+                icmp_ok: false,
+                internet_reachable: Some(false),
+            }),
+            targets: vec![target],
+            ..Default::default()
+        };
+        let engine = engine_after(&observations);
+        let tab = engine.primary();
+        assert_eq!(tab.len(), 1, "{tab:?}");
+        let gateway = tab[0];
+        assert_eq!(gateway.rule, "gateway.unreachable");
+        let hidden = engine
+            .issues()
+            .iter()
+            .find(|i| i.subject.label() == "api")
+            .expect("the target's own finding");
+        assert_eq!(hidden.suppressed_by.as_ref(), Some(&gateway.id));
+        assert!(
+            tab.iter().all(|f| f.subject.label() != "api"),
+            "the old label filter kept nothing"
+        );
+
+        let mut api = asked("name = \"api\"\nhost = \"api.corp.internal\"");
+        api.saw(&observations);
+        let findings = select(engine.issues(), Some(&api));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule, "gateway.unreachable");
+        assert_eq!(findings[0].consequences, vec![hidden.id.clone()]);
+        assert_eq!(outcome(&findings, true), Outcome::Finding);
+    }
+
+    fn finding(id: &str, rule: &str, subject: Subject) -> Issue {
+        let r = rules::lookup(rule).expect("a catalogued rule");
+        Issue {
+            id: id.into(),
+            rule: rule.into(),
+            severity: r.severity,
+            title: r.title.into(),
+            subject,
+            since: "2026-09-15 10:00:00".into(),
+            last_seen: "2026-09-15 10:00:00".into(),
+            state: crate::diagnose::issue::IssueState::Open,
+            evidence: vec![],
+            scope: Default::default(),
+            causes: vec![],
+            remediation: vec![],
+            verify: rules::default_verify(rule).unwrap(),
+            artifacts: vec![],
+            consequences: vec![],
+            suppressed_by: None,
+            recurrence: 0,
+            tests: vec![],
+            verification: None,
+        }
+    }
+
+    /// A host-wide Issue stays with the named target unless it names an
+    /// interface or resolver the target is known not to use. Findings about
+    /// paths, sockets or other targets, and Observations, leave.
+    #[test]
+    fn the_target_keeps_host_wide_issues_on_its_route() {
+        let resolver = |addr: &str| Subject::Resolver { addr: addr.into() };
+        let iface = |name: &str| Subject::Iface { name: name.into() };
+        let mut gateway = finding("1", "gateway.unreachable", Subject::Host);
+        gateway.scope.via_iface = Some("eth0".into());
+        let issues = vec![
+            gateway,
+            finding("2", "dns.failing", resolver("192.168.8.1")),
+            finding("3", "link.down", iface("wlan0")),
+            finding("4", "gateway.rtt_spike", Subject::Host),
+            finding("5", "nat.symmetric", Subject::Host),
+            finding(
+                "6",
+                "path.high_loss",
+                Subject::Path {
+                    target: "1.1.1.1".into(),
+                },
+            ),
+            finding(
+                "7",
+                "target.connect_failed",
+                Subject::Target {
+                    name: "other".into(),
+                },
+            ),
+        ];
+        let kept = |asked: &Asked| -> Vec<String> {
+            select(&issues, Some(asked))
+                .into_iter()
+                .map(|f| f.id)
+                .collect()
+        };
+        let named = "name = \"api\"\nhost = \"api.corp.internal\"";
+
+        // Nothing known about its route: every host-wide Issue could lie on it.
+        assert_eq!(kept(&asked(named)), ["1", "2", "3", "4"]);
+
+        let mut known = asked(named);
+        known.via_iface = Some("eth0".into());
+        known.via_resolver = Some("192.168.8.1".into());
+        assert_eq!(kept(&known), ["1", "2", "4"], "wlan0 is not its link");
+
+        let mut tunnelled = asked(named);
+        tunnelled.via_iface = Some("wg0".into());
+        tunnelled.via_resolver = Some("10.8.0.1".into());
+        assert_eq!(kept(&tunnelled), ["4"]);
+
+        // An address needs no resolver.
+        let literal = asked("name = \"api\"\nhost = \"10.1.2.3\"");
+        assert_eq!(kept(&literal), ["1", "3", "4"]);
+
+        // A service on this host goes through no gateway, link or resolver.
+        let loopback = asked("name = \"api\"\nhost = \"127.0.0.1\"");
+        assert!(kept(&loopback).is_empty());
+        let mut localhost = asked("name = \"api\"\nhost = \"localhost\"");
+        assert_eq!(kept(&localhost), ["1", "2", "3", "4"], "not yet resolved");
+        let mut resolved = probe(
+            "api",
+            crate::diagnose::targets::Stage {
+                ms: Some(40.0),
+                error: None,
+            },
+        );
+        resolved.addresses = vec!["::1".into(), "127.0.0.1".into()];
+        localhost.saw(&Observations {
+            targets: vec![resolved],
+            ..Default::default()
+        });
+        assert!(kept(&localhost).is_empty());
     }
 
     #[test]
