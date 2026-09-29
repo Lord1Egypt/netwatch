@@ -150,8 +150,14 @@ const RECURRENCE_WINDOW_MINS: i64 = 30;
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub thresholds: Thresholds,
-    /// How long a resolved condition must stay resolved before auto-closing.
-    pub auto_close_secs: u64,
+    /// How long an issue's subject must stay gone before the issue closes as
+    /// [`IssueState::Expired`]. Recovery is the verify condition's business
+    /// (`Verify::hold_secs`); this is only about absence.
+    ///
+    /// Episodes recorded before 0.34 call it `auto_close_secs`; nothing read
+    /// it then.
+    #[serde(alias = "auto_close_secs")]
+    pub expire_after_secs: u64,
     /// Closed issues kept for the report and the timeline.
     pub history_limit: usize,
 }
@@ -160,7 +166,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             thresholds: Thresholds::default(),
-            auto_close_secs: 300,
+            expire_after_secs: 60,
             history_limit: 50,
         }
     }
@@ -1976,6 +1982,26 @@ mod tests {
         assert_eq!(e.issues().len(), 2);
         assert_eq!(e.primary()[0].recurrence, 0);
         assert_ne!(e.primary()[0].id, id);
+    }
+
+    #[test]
+    fn settings_with_auto_close_secs_still_load() {
+        // The settings block of an episode recorded before the rename, as
+        // the pinned corpus held it.
+        let old = r#"{"thresholds":{"sigma_k":3.0,"consecutive_n":3,"verdict_hold_secs":30,
+            "dns_ceiling_ms":100.0,"socket_rtt_ms":100.0,"loaded_rtt_delta_ms":100.0,
+            "saturation_pct":90.0,"iface_error_floor":1.0,"iface_drop_floor":60.0,
+            "dns_tc_pct":10.0,"dns_mismatch_pct":50.0,"wifi_rssi_dbm":-70.0,
+            "wifi_retry_pct":20.0},"auto_close_secs":300,"history_limit":50}"#;
+        let loaded: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.expire_after_secs, 300);
+        assert_eq!(loaded.history_limit, 50);
+
+        // It writes back under the new name only.
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(json.contains(r#""expire_after_secs":300"#), "{json}");
+        assert!(!json.contains("auto_close_secs"), "{json}");
+        assert_eq!(Settings::default().expire_after_secs, 60);
     }
 
     #[test]
