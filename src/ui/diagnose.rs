@@ -752,7 +752,7 @@ fn verdict_spans(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> Vec<S
 
 /// The verdict row's words, without its glyph: what `y` copies, so a pasted
 /// summary says what the screen says. It used to copy `Verdict::line()`,
-/// which words the same state differently ("no visible findings").
+/// which words the same state differently ("no visible issues").
 pub fn verdict_words(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> String {
     verdict_spans(engine, baselines, t)
         .iter()

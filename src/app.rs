@@ -4923,7 +4923,7 @@ mod diagnose_action_tests {
     }
 
     /// `y` copied `Verdict::line()`, which words the same state differently
-    /// from the verdict row ("no visible findings" against "no issues
+    /// from the verdict row ("no visible issues" against "no issues
     /// found"). It now copies the row's words, with issues open and without.
     #[test]
     fn y_copies_the_words_on_screen() {

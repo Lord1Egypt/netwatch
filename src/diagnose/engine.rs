@@ -1177,7 +1177,7 @@ impl Verdict {
         match self {
             Verdict::Clear => "no issues · baselines ready".to_string(),
             Verdict::Learning { detail } | Verdict::Incomplete { detail } => {
-                format!("no visible findings · {detail}")
+                format!("no visible issues · {detail}")
             }
             Verdict::Issues {
                 count, headline, ..
@@ -2155,6 +2155,8 @@ mod tests {
         let v = e.verdict(&b);
         assert!(!matches!(v, Verdict::Issues { .. }), "{v:?}");
         assert_eq!(v.count(), 0);
+        // The line must not deny the finding the tab lists beside it.
+        assert!(v.line().starts_with("no visible issues"), "{}", v.line());
 
         // An Issue beside it is what the verdict counts and leads with.
         let mut both = rerouted(2.0);
@@ -2506,7 +2508,7 @@ mod tests {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
         assert_eq!(
             e.verdict(&base()).line(),
-            "no visible findings · coverage not recorded"
+            "no visible issues · coverage not recorded"
         );
     }
 
