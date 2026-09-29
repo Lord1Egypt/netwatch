@@ -991,4 +991,17 @@ mod tests {
         assert_eq!(s.overall_readiness(), Readiness::Unknown);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_snapshot_round_trips_bit_for_bit() {
+        // serde_json's fast float parser reads this mean back one unit in
+        // the last place low, so a replay started from a baseline the live
+        // engine never had.
+        let mut s = BaselineStore::new(office());
+        s.seed("r", "m", 9.576_865_747_399_413, 0.27, 2_400);
+        let json = serde_json::to_string(&s.snapshot()).unwrap();
+        let back = BaselineStore::from_snapshot(&serde_json::from_str(&json).unwrap());
+        assert!(s.get("r", "m").is_some());
+        assert_eq!(back.get("r", "m"), s.get("r", "m"));
+    }
 }
