@@ -12,7 +12,7 @@
 //! stable, human-sized list of findings happens here.
 
 use chrono::{DateTime, Duration, Local, TimeZone};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::baseline::{BaselineStore, SigmaFloor};
 use super::detectors::{self, Detection, Observations, Thresholds};
@@ -125,6 +125,101 @@ fn sample_time(
     } else {
         None
     }
+}
+
+/// Why an open issue's subject has gone away, or `None` while it may still be
+/// there. Gone is a positive finding about the subject, never an absence of
+/// readings about it: an unmeasured gateway, a stale probe or a collector
+/// that did not run leaves the issue open, however long it lasts.
+///
+/// | Subject | Gone when |
+/// |---|---|
+/// | Socket | the sockets collector is fresh (≤ 30 s), the rule's coverage is available or has no subjects, and no socket matches |
+/// | Target | its name has left the config, or no entry under its name has the revision the issue was found under |
+/// | Resolver | it has left the system resolvers, and so has any resolver an applied step switched to |
+/// | Path (`path.*`) | it was the periodic trace target while open, periodic tracing is still on, and the trace target is now another |
+/// | Iface | the interface collector is fresh (≤ 15 s) and the platform no longer lists it |
+/// | Host, anything else, or no recorded config | never |
+///
+/// The returned reason is authored text, never the subject's name, because
+/// redacted exports keep a state verbatim.
+fn subject_gone(
+    issue: &Issue,
+    obs: &Observations,
+    coverage: &super::coverage::Coverage,
+    live: Option<(&ObservationTimes, std::time::Instant)>,
+    periodic_path: bool,
+) -> Option<&'static str> {
+    use super::coverage::Availability;
+    use super::issue::Subject;
+    // A recording from before the configuration was recorded, or a frame
+    // built without one: unknown, which never expires anything.
+    let config = obs.config.as_ref()?;
+    let fresh = |at: fn(&ObservationTimes) -> Option<std::time::Instant>, max_secs| {
+        live.is_some_and(|(times, now)| {
+            crate::collectors::health::ProbeTimes::fresh_at(at(times), max_secs, now)
+        })
+    };
+    match &issue.subject {
+        Subject::Socket { local, remote } => {
+            // The collector listed every socket it could see, just now.
+            let listed = coverage.rules.iter().any(|r| {
+                r.rule == issue.rule
+                    && matches!(r.status, Availability::Available | Availability::NoSubjects)
+            });
+            let open = obs
+                .sockets
+                .iter()
+                .any(|s| &s.local == local && &s.remote == remote);
+            (fresh(|t| t.sockets, 30) && listed && !open).then_some("socket closed")
+        }
+        Subject::Target { name } => {
+            let mut revisions = config
+                .targets
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, r)| r)
+                .peekable();
+            if revisions.peek().is_none() {
+                Some("target removed from the config")
+            } else if let Some(found) = &issue.scope.configuration {
+                // A duplicated name is a config error netwatch reports, and
+                // one entry still carrying this revision keeps the subject.
+                (!revisions.any(|r| r == found)).then_some("target configuration changed")
+            } else {
+                None
+            }
+        }
+        Subject::Resolver { addr } => {
+            let resolvers = config.resolvers.as_ref()?;
+            let listed = |a: &str| resolvers.iter().any(|r| r == a);
+            (!listed(addr) && !replacement_resolvers(issue).any(listed))
+                .then_some("resolver left the config")
+        }
+        Subject::Path { target } if issue.rule.starts_with("path.") => {
+            (periodic_path && config.trace_refresh_secs.is_some() && &config.trace_target != target)
+                .then_some("trace target changed")
+        }
+        Subject::Iface { name } => {
+            let listed = config.interfaces.as_ref()?.contains(name);
+            (!listed && fresh(|t| t.interface, 15)).then_some("interface removed")
+        }
+        _ => None,
+    }
+}
+
+/// Resolvers an applied step switched this issue's lookups to. Their results
+/// stand in for the original resolver's, so they can verify its issue and
+/// keep its subject from counting as gone.
+fn replacement_resolvers(issue: &Issue) -> impl Iterator<Item = &str> {
+    use super::issue::{Action, Applied};
+    issue
+        .remediation
+        .iter()
+        .filter_map(|step| match (&step.action, &step.applied) {
+            (Some(Action::SetResolver { addr }), Some(Applied::Yes { .. })) => Some(addr.as_str()),
+            _ => None,
+        })
 }
 
 pub fn format_ts(dt: DateTime<Local>) -> String {
@@ -266,6 +361,13 @@ pub struct Engine {
     seq: u32,
     coverage: super::coverage::Coverage,
     verification_samples: HashMap<IssueId, (std::time::Instant, std::time::Instant)>,
+    /// When an open issue's subject was first seen gone; see
+    /// [`subject_gone`]. Cleared the moment it is not.
+    gone_since: HashMap<IssueId, DateTime<Local>>,
+    /// Path issues whose target was the periodic trace target on some tick
+    /// while they were open. Only these can expire when the trace target
+    /// changes: a path traced by hand was never going to be traced again.
+    periodic_paths: HashSet<IssueId>,
     /// Conditions detected but not yet open, by `Detection::key()`.
     pending: HashMap<String, Pending>,
     /// Events since the last [`Engine::take_events`].
@@ -283,6 +385,8 @@ impl Engine {
             seq: 0,
             coverage: Default::default(),
             verification_samples: HashMap::new(),
+            gone_since: HashMap::new(),
+            periodic_paths: HashSet::new(),
             pending: HashMap::new(),
             events: Vec::new(),
         }
@@ -433,7 +537,7 @@ impl Engine {
         if !fresh(times.egress, 30) {
             observed.egress = None;
         }
-        self.observe_inner(&observed, base, Some(times));
+        self.observe_inner(&observed, base, Some((times, now)));
         self.coverage.mark_stale_probes(&times.health, now);
         for row in &mut self.coverage.rules {
             if matches!(
@@ -484,11 +588,13 @@ impl Engine {
         }
     }
 
+    /// `live` is the collectors' completion times and the instant they are
+    /// judged at, when the caller has them.
     fn observe_inner(
         &mut self,
         obs: &Observations,
         base: &BaselineStore,
-        times: Option<&ObservationTimes>,
+        live: Option<(&ObservationTimes, std::time::Instant)>,
     ) {
         self.coverage = super::coverage::Coverage::from_observations(
             obs,
@@ -510,13 +616,13 @@ impl Engine {
         for d in detections {
             if self.is_open_key(&d.key()) {
                 self.merge(d, now, now);
-            } else if let Some(since) = self.confirmed(&d, times, now) {
+            } else if let Some(since) = self.confirmed(&d, live.map(|(t, _)| t), now) {
                 self.pending.remove(&d.key());
                 self.merge(d, now, since);
             }
         }
 
-        self.age_unseen(&seen, obs, base, now, times);
+        self.age_unseen(&seen, obs, base, now, live);
         self.decide_verifications(now);
 
         rules::apply_suppression(&mut self.issues);
@@ -611,6 +717,7 @@ impl Engine {
                 // A muted issue keeps accruing evidence silently; it just
                 // doesn't reach the verdict line.
                 issue.last_seen = ts.clone();
+                issue.stale_since = None;
                 issue.severity = d.severity;
                 issue.title = d.title;
                 issue.evidence = d.evidence;
@@ -627,6 +734,7 @@ impl Engine {
                 super::next_test::apply(issue, &ts);
                 self.verifying_since.remove(&id);
                 self.verification_samples.remove(&id);
+                self.gone_since.remove(&id);
                 return;
             }
             self.by_key.remove(&key);
@@ -648,6 +756,7 @@ impl Engine {
             subject: d.subject,
             since: format_ts(since),
             last_seen: ts,
+            stale_since: None,
             state: IssueState::Open,
             evidence: d.evidence,
             scope: d.scope,
@@ -670,37 +779,69 @@ impl Engine {
     /// checked against live metrics; once it has held for `hold_secs` the
     /// issue auto-closes. Until then it stays open — a metric dipping under
     /// the threshold for one sample is not a fix.
+    ///
+    /// An issue whose subject has gone, per [`subject_gone`], for
+    /// `expire_after_secs` closes as Expired instead. One whose evidence has
+    /// only stopped arriving stays open and records `stale_since`: a probe
+    /// that cannot run looks just like a fault that has not cleared.
     fn age_unseen(
         &mut self,
         seen: &[String],
         obs: &Observations,
         base: &BaselineStore,
         now: DateTime<Local>,
-        times: Option<&ObservationTimes>,
+        live: Option<(&ObservationTimes, std::time::Instant)>,
     ) {
         let mut closed: Vec<IssueId> = Vec::new();
         let floor = self.settings.thresholds.sigma_floor();
+        let expire_after = Duration::seconds(self.settings.expire_after_secs as i64);
         for issue in self.issues.iter_mut() {
             if !issue.state.is_open() {
                 continue;
+            }
+            if let (super::issue::Subject::Path { target }, Some(config)) =
+                (&issue.subject, &obs.config)
+            {
+                if config.trace_refresh_secs.is_some() && &config.trace_target == target {
+                    self.periodic_paths.insert(issue.id.clone());
+                }
             }
             let key = format!("{}|{}", issue.rule, issue.subject.label());
             if seen.contains(&key) {
                 continue;
             }
 
+            let periodic = self.periodic_paths.contains(&issue.id);
+            match subject_gone(issue, obs, &self.coverage, live, periodic) {
+                Some(reason) => {
+                    let since = *self.gone_since.entry(issue.id.clone()).or_insert(now);
+                    if now - since >= expire_after {
+                        issue.state = IssueState::Expired {
+                            at: format_ts(now),
+                            reason: reason.into(),
+                        };
+                        closed.push(issue.id.clone());
+                        continue;
+                    }
+                }
+                None => {
+                    self.gone_since.remove(&issue.id);
+                }
+            }
+
             let mut scoped = obs.clone();
             match &issue.subject {
                 super::issue::Subject::Resolver { addr } => {
-                    scoped.dns = scoped.dns.filter(|d| &d.resolver == addr || issue.remediation.iter().any(|step| {
-                        matches!((&step.action, &step.applied),
-                            (Some(super::issue::Action::SetResolver { addr: replacement }), Some(super::issue::Applied::Yes { .. }))
-                            if replacement == &d.resolver)
-                    }))
+                    scoped.dns = scoped.dns.filter(|d| {
+                        &d.resolver == addr || replacement_resolvers(issue).any(|r| r == d.resolver)
+                    })
                 }
                 super::issue::Subject::Path { target } => {
                     scoped.paths.retain(|p| &p.target == target);
-                    scoped.active.pmtu = scoped.active.pmtu.filter(|p| p.target.as_ref() == Some(target))
+                    scoped.active.pmtu = scoped
+                        .active
+                        .pmtu
+                        .filter(|p| p.target.as_ref() == Some(target))
                 }
                 super::issue::Subject::Socket { local, remote } => scoped
                     .sockets
@@ -708,27 +849,36 @@ impl Engine {
                 super::issue::Subject::Iface { name } => {
                     scoped.iface = scoped.iface.filter(|i| &i.name == name)
                 }
-                super::issue::Subject::Target { name } => {
-                    scoped.targets.retain(|t| &t.name == name && (issue.scope.configuration.is_none() || issue.scope.configuration == t.baseline_key))
-                }
+                super::issue::Subject::Target { name } => scoped.targets.retain(|t| {
+                    &t.name == name
+                        && (issue.scope.configuration.is_none()
+                            || issue.scope.configuration == t.baseline_key)
+                }),
                 _ => {}
             }
             let mut values = metric_values(&scoped);
             add_sigma_metrics(&mut values, &scoped, base, floor);
-            let holding = if issue.rule.starts_with("egress.") {
-                obs.egress
+            let available = self.coverage.rules.iter().any(|r| {
+                r.rule == issue.rule && r.status == super::coverage::Availability::Available
+            });
+            let (measured, holding) = if issue.rule.starts_with("egress.") {
+                let recovered = obs
+                    .egress
                     .as_ref()
-                    .and_then(|o| o.recovered(&issue.subject, &issue.rule))
-                    == Some(true)
+                    .and_then(|o| o.recovered(&issue.subject, &issue.rule));
+                (recovered.is_some(), recovered == Some(true))
             } else {
-                self.coverage.rules.iter().any(|r| {
-                    r.rule == issue.rule && r.status == super::coverage::Availability::Available
-                }) && match values.get(&issue.verify.metric) {
-                    Some(v) => issue.verify.holds(*v),
+                match values.get(&issue.verify.metric) {
+                    Some(v) => (true, available && issue.verify.holds(*v)),
                     // Missing evidence is not recovery; reset the hold timer.
-                    None => false,
+                    None => (false, false),
                 }
             };
+            if available && measured {
+                issue.stale_since = None;
+            } else if issue.stale_since.is_none() {
+                issue.stale_since = Some(format_ts(now));
+            }
 
             if !holding {
                 self.verifying_since.remove(&issue.id);
@@ -737,7 +887,7 @@ impl Engine {
             }
 
             let mut live_held = None;
-            if let Some(times) = times {
+            if let Some((times, _)) = live {
                 if let Some(sample) = sample_time(&issue.rule, &issue.subject, times) {
                     let Some(sample) = sample else {
                         self.verifying_since.remove(&issue.id);
@@ -788,6 +938,8 @@ impl Engine {
         for id in closed {
             self.verifying_since.remove(&id);
             self.verification_samples.remove(&id);
+            self.gone_since.remove(&id);
+            self.periodic_paths.remove(&id);
         }
     }
 
@@ -826,6 +978,8 @@ impl Engine {
         self.verifying_since.retain(|id, _| !doomed.contains(id));
         self.verification_samples
             .retain(|id, _| !doomed.contains(id));
+        self.gone_since.retain(|id, _| !doomed.contains(id));
+        self.periodic_paths.retain(|id| !doomed.contains(id));
     }
 
     // ------------------------------------------------------ user actions
@@ -1473,7 +1627,7 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
 mod tests {
     use super::*;
     use crate::diagnose::baseline::NetworkFingerprint;
-    use crate::diagnose::detectors::{DnsObs, GatewayObs, IfaceObs, SocketObs};
+    use crate::diagnose::detectors::{DnsObs, GatewayObs, IfaceObs, ObservedConfig, SocketObs};
 
     fn base() -> BaselineStore {
         let mut b = BaselineStore::new(NetworkFingerprint::new(
@@ -1939,9 +2093,9 @@ mod tests {
         );
     }
 
-    /// Close `id` as Expired at the clock's time. The engine only reads this
-    /// state so far; deciding that a subject is gone is the expiry guard's
-    /// job (D33-B25), so these tests close the issue the way it will.
+    /// Close `id` as Expired at the clock's time, as the expiry guard does,
+    /// so these tests are about what follows an expiry rather than what
+    /// causes one. The guard's own tests drive [`subject_gone`].
     fn expire(e: &mut Engine, id: &str, reason: &str) {
         let at = format_ts(e.clock.now());
         let issue = e.issues.iter_mut().find(|i| i.id == id).unwrap();
@@ -1951,6 +2105,7 @@ mod tests {
         };
         e.verifying_since.remove(id);
         e.verification_samples.remove(id);
+        e.gone_since.remove(id);
     }
 
     #[test]
@@ -2057,6 +2212,597 @@ mod tests {
         assert!(json.contains(r#""expire_after_secs":300"#), "{json}");
         assert!(!json.contains("auto_close_secs"), "{json}");
         assert_eq!(Settings::default().expire_after_secs, 60);
+    }
+
+    // ------------------------------------------------------ the expiry guard
+
+    fn find(e: &Engine, rule: &str) -> Issue {
+        e.issues()
+            .iter()
+            .find(|i| i.rule == rule)
+            .unwrap_or_else(|| panic!("no {rule} issue: {:#?}", e.issues()))
+            .clone()
+    }
+
+    fn expired(reason: &str, at: &str) -> IssueState {
+        IssueState::Expired {
+            at: at.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// A socket retransmitting 12 segments a minute at 20 ms: tcp.retrans_burst.
+    fn retransmitting() -> SocketObs {
+        SocketObs {
+            local: "10.88.0.2:52344".into(),
+            remote: "10.88.0.3:9000".into(),
+            process: Some("ncat".into()),
+            rtt_ms: Some(20.0),
+            rttvar_ms: Some(2.0),
+            retrans: Some(12),
+            cwnd: Some(10),
+            ssthresh: Some(u32::MAX),
+            rwnd: Some(64_000),
+            mss: Some(1448),
+            tx_bps: 2.4e6,
+            rx_bps: 0.0,
+            verdict_age_secs: 90,
+        }
+    }
+
+    /// What the sampler reports once a successful dump lists no sockets.
+    fn no_sockets(config: Option<ObservedConfig>) -> Observations {
+        let mut o = Observations {
+            config,
+            ..Default::default()
+        };
+        for rule in [
+            "tcp.bufferbloat_remote",
+            "tcp.retrans_burst",
+            "tcp.zero_window",
+        ] {
+            o.coverage_hints.insert(
+                rule.into(),
+                (
+                    super::super::coverage::Availability::NoSubjects,
+                    "successful TCP dump contained no established sockets".into(),
+                ),
+            );
+        }
+        o
+    }
+
+    /// Collector completion times `t` seconds after `start`, as a live tick
+    /// sees them when every listed collector has just run.
+    fn ran_at(start: std::time::Instant, t: u64) -> ObservationTimes {
+        let at = start + std::time::Duration::from_secs(t);
+        let mut times = ObservationTimes {
+            interface: Some(at),
+            sockets: Some(at),
+            ..Default::default()
+        };
+        times.health.gateway = Some(at);
+        times.health.internet = Some(at);
+        times.health.gateway_target = Some("192.168.8.1".into());
+        times
+    }
+
+    #[test]
+    fn a_closed_socket_expires_its_retrans_issue() {
+        let mut other = retransmitting();
+        other.local = "10.88.0.2:52390".into();
+        other.retrans = Some(0);
+        // The socket closes, and the collector's next dumps say so: either
+        // they list nothing at all, or they list the sockets still open.
+        let empty = no_sockets(Some(ObservedConfig::default()));
+        let others = Observations {
+            sockets: vec![other],
+            config: Some(ObservedConfig::default()),
+            ..Default::default()
+        };
+        for closed in [empty, others] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            let open = Observations {
+                sockets: vec![retransmitting()],
+                config: Some(ObservedConfig::default()),
+                ..Default::default()
+            };
+            e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "tcp.retrans_burst").id;
+
+            for t in 1..=60 {
+                clock.advance_secs(1);
+                e.observe_live_at(&closed, &b, &ran_at(start, t), at(t));
+            }
+            let issue = e.get(&id).unwrap();
+            assert_eq!(issue.state, IssueState::Open, "gone for 59 s");
+            assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:11"));
+
+            clock.advance_secs(1);
+            e.observe_live_at(&closed, &b, &ran_at(start, 61), at(61));
+            assert_eq!(
+                e.get(&id).unwrap().state,
+                expired("socket closed", "2026-09-03 06:49:11")
+            );
+        }
+    }
+
+    /// Outside the Dense view nothing refreshes the socket collector, so its
+    /// last dump ages out. An empty list from a collector that has stopped,
+    /// or one whose input the rule cannot use, is not a socket closing.
+    #[test]
+    fn a_socket_issue_goes_stale_when_its_collector_stops() {
+        let mut unusable = no_sockets(Some(ObservedConfig::default()));
+        unusable.coverage_hints.insert(
+            "tcp.retrans_burst".into(),
+            (
+                super::super::coverage::Availability::CollectorFailed,
+                "netlink dump failed".into(),
+            ),
+        );
+        let cases = [
+            (no_sockets(Some(ObservedConfig::default())), false),
+            (unusable, true),
+        ];
+        for (closed, collector_runs) in cases {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            let open = Observations {
+                sockets: vec![retransmitting()],
+                config: Some(ObservedConfig::default()),
+                ..Default::default()
+            };
+            e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "tcp.retrans_burst").id;
+
+            for t in 1..=600 {
+                clock.advance_secs(1);
+                let ran = if collector_runs { t } else { 0 };
+                e.observe_live_at(&closed, &b, &ran_at(start, ran), at(t));
+            }
+            let issue = e.get(&id).unwrap();
+            assert_eq!(issue.state, IssueState::Open);
+            assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:11"));
+        }
+    }
+
+    /// The gateway probe measures nothing when ICMP cannot be sent and no
+    /// TCP port answers, and the sampler then reports no gateway at all. That
+    /// is what a gateway outage looks like from a host that cannot ping, so
+    /// it must never close the outage.
+    #[test]
+    fn an_unmeasured_gateway_never_expires_the_outage() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let config = Some(ObservedConfig {
+            resolvers: Some(vec!["169.254.1.1".into()]),
+            interfaces: Some(vec!["lo".into(), "eth0".into()]),
+            ..Default::default()
+        });
+        let down = Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: None,
+                loss_pct: 100.0,
+                arp_ok: None,
+                icmp_ok: false,
+                internet_reachable: Some(false),
+            }),
+            config: config.clone(),
+            ..Default::default()
+        };
+        e.observe_live_at(&down, &b, &ran_at(start, 0), at(0));
+        let id = find(&e, "gateway.unreachable").id;
+
+        let unmeasured = Observations {
+            config,
+            ..Default::default()
+        };
+        for t in (5..=1800).step_by(5) {
+            clock.advance_secs(5);
+            e.observe_live_at(&unmeasured, &b, &ran_at(start, t), at(t));
+        }
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open, "half an hour unmeasured");
+        assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:15"));
+    }
+
+    fn target_obs(revision: &str, refused: bool) -> crate::diagnose::targets::TargetObs {
+        use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
+        TargetObs {
+            baseline_key: Some(revision.into()),
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
+            name: "api".into(),
+            host: "127.0.0.1".into(),
+            port: 8443,
+            tls: false,
+            http: false,
+            expect_status: None,
+            probed_at: String::new(),
+            resolve: Stage {
+                ms: Some(0.0),
+                error: None,
+            },
+            addresses: vec!["127.0.0.1".into()],
+            lookups: vec![],
+            connect: Some(Stage {
+                ms: Some(1.0),
+                error: refused.then_some(StageError::Refused),
+            }),
+            connect_v4: None,
+            connect_v6: None,
+            tls_stage: None,
+            http_stage: None,
+            status: None,
+            stale_after_secs: None,
+            context: TargetContext::default(),
+        }
+    }
+
+    fn targets_config(revisions: &[&str]) -> Option<ObservedConfig> {
+        Some(ObservedConfig {
+            targets: revisions
+                .iter()
+                .map(|r| ("api".to_string(), r.to_string()))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_removed_target_expires() {
+        // Taken out of the config, the target is no longer probed. Edited,
+        // it is probed afresh under its new revision, and that result,
+        // healthy or not, says nothing about the endpoint the issue is about.
+        let removed = Observations {
+            config: targets_config(&[]),
+            ..Default::default()
+        };
+        let edited = Observations {
+            targets: vec![target_obs("target-config:bbbb", false)],
+            config: targets_config(&["target-config:bbbb"]),
+            ..Default::default()
+        };
+        for (after, reason) in [
+            (removed, "target removed from the config"),
+            (edited, "target configuration changed"),
+        ] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![target_obs("target-config:aaaa", true)],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            for _ in 0..60 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{reason}");
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+            assert_eq!(
+                e.get(&id).unwrap().state,
+                expired(reason, "2026-09-03 06:49:11")
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_target_probe_is_stale_not_expired() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let refused = Observations {
+            targets: vec![target_obs("target-config:aaaa", true)],
+            config: targets_config(&["target-config:aaaa"]),
+            ..Default::default()
+        };
+        // The target stays configured, but its prober publishes once and
+        // then stops, so its one result ages past the stale limit.
+        let times = ObservationTimes {
+            targets: [("api".to_string(), at(0))].into_iter().collect(),
+            ..Default::default()
+        };
+        e.observe_live_at(&refused, &b, &times, at(0));
+        let id = find(&e, "target.connect_failed").id;
+        for t in (60..=3600).step_by(60) {
+            clock.advance_secs(60);
+            e.observe_live_at(&refused, &b, &times, at(t));
+        }
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        // Fresh up to 900 s, so first missing on the tick at 960 s.
+        assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 07:04:10"));
+    }
+
+    #[test]
+    fn stale_since_is_set_once_and_cleared_on_fresh_evidence() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let stale = |e: &Engine| e.issues()[0].stale_since.clone();
+        e.observe(&obs(40.0), &b);
+        assert_eq!(stale(&e), None);
+
+        let unmeasured = Observations::default();
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        assert_eq!(stale(&e).as_deref(), Some("2026-09-03 06:48:15"));
+
+        // The metric returns, under the verify line: measured again, so no
+        // longer stale, though not yet closed.
+        clock.advance_secs(5);
+        e.observe(&obs(1.3), &b);
+        assert_eq!(stale(&e), None);
+        assert!(e.issues()[0].state.is_open());
+
+        // Missing again, then the condition itself comes back.
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        assert_eq!(stale(&e).as_deref(), Some("2026-09-03 06:48:30"));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(stale(&e), None);
+        assert_eq!(e.open_count(), 1);
+    }
+
+    /// An episode recorded before the configuration was recorded replays
+    /// with `config: None`. Its socket closing is the same evidence as in
+    /// the tests above, but the guard reads unknown as "never expire", so
+    /// the replay keeps the issue open as the recording did. The same frames
+    /// with a configuration expire it.
+    #[test]
+    fn an_episode_without_config_never_expires() {
+        use crate::diagnose::{episode, fixture};
+        // The socket retransmits for 30 s, then a fresh dump lists nothing.
+        fn frame(t: u64) -> Observations {
+            if t < 30 {
+                Observations {
+                    sockets: vec![retransmitting()],
+                    ..Default::default()
+                }
+            } else {
+                no_sockets(None)
+            }
+        }
+        let old = fixture::record(&fixture::Scenario {
+            id: "socket-closes-before-0.34",
+            start: "2026-09-03 06:48:10",
+            secs: 240,
+            baselines: base,
+            obs: frame,
+            cadence: fixture::Cadence::live(),
+            thresholds: Thresholds::default(),
+        });
+        assert!(old.frames.iter().all(|f| f.obs.config.is_none()));
+        let span = |replay: &episode::ReplayReport| {
+            let spans: Vec<_> = replay
+                .issues
+                .iter()
+                .filter(|s| s.key.starts_with("tcp.retrans_burst|"))
+                .cloned()
+                .collect();
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            spans[0].clone()
+        };
+
+        let replayed = episode::replay(&old);
+        assert!(replayed.matches(), "{:?}", replayed.divergences);
+        assert_eq!(span(&replayed).closed, None);
+
+        let mut new = old.clone();
+        for f in &mut new.frames {
+            f.obs.config = Some(ObservedConfig::default());
+        }
+        let span = span(&episode::replay(&new));
+        // Gone from the frame at 30 s, expired 60 s later.
+        assert_eq!(span.closed.as_deref(), Some("2026-09-03 06:49:40"));
+        assert_eq!(span.close_reason.as_deref(), Some("expired"));
+    }
+
+    fn on_resolver(p50: f64, resolver: &str, listed: Option<&[&str]>) -> Observations {
+        let mut o = obs(p50);
+        o.dns.as_mut().unwrap().resolver = resolver.into();
+        o.config = Some(ObservedConfig {
+            resolvers: listed.map(|l| l.iter().map(|r| r.to_string()).collect()),
+            ..Default::default()
+        });
+        o
+    }
+
+    #[test]
+    fn a_resolver_that_left_the_config_expires() {
+        let b = base();
+        let old = "169.254.1.1";
+        let new = "192.168.8.1";
+        // The network now hands out another resolver, which answers fast.
+        // Its results cannot verify the old resolver's issue.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, Some(&[new])), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            expired("resolver left the config", "2026-09-03 06:49:11")
+        );
+
+        // A resolver list that could not be read says nothing about it.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        for _ in 0..600 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, None), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+    }
+
+    /// A resolver switched to by an applied step stands in for the old one:
+    /// its answers verify the issue, so the old one leaving is the fix
+    /// working, not the subject going away.
+    #[test]
+    fn a_resolver_switched_to_by_an_applied_step_is_a_recovery_not_an_expiry() {
+        use crate::diagnose::issue::Applied;
+        let b = base();
+        let old = "169.254.1.1";
+        let new = "192.168.8.1";
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        assert!(e.record_applied(
+            &id,
+            '1',
+            Applied::Yes {
+                at: "2026-09-03 06:48:10".into(),
+                before: old.into(),
+                after: new.into(),
+            }
+        ));
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, Some(&[new])), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:49:11".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_path_expires_only_when_its_periodic_trace_target_changes() {
+        use crate::diagnose::detectors::{HopObs, PathObs};
+        let b = base();
+        let hop = |number, loss_pct| HopObs {
+            number,
+            ip: Some(format!("10.0.0.{number}")),
+            asn: None,
+            rtt_p50_ms: Some(5.0),
+            rtt_p95_ms: None,
+            loss_pct,
+            silent: false,
+        };
+        let lossy = |trace: &str, every| Observations {
+            paths: vec![PathObs {
+                target: "1.1.1.1".into(),
+                hops: vec![hop(1, 0.0), hop(2, 20.0)],
+                previous: None,
+                traced_at: "2026-09-03 06:48:05".into(),
+                destination_reached: Some(false),
+            }],
+            config: Some(ObservedConfig {
+                trace_target: trace.into(),
+                trace_refresh_secs: every,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let untraced = |trace: &str, every| Observations {
+            paths: vec![],
+            ..lossy(trace, every)
+        };
+        let cases = [
+            // Traced every 5 minutes, then the trace target is changed.
+            (
+                lossy("1.1.1.1", Some(300)),
+                untraced("9.9.9.9", Some(300)),
+                true,
+            ),
+            // Traced by hand while the periodic trace follows another
+            // target: nothing will trace it again, but it has not gone.
+            (
+                lossy("9.9.9.9", Some(300)),
+                untraced("9.9.9.9", Some(300)),
+                false,
+            ),
+            // The target changed, but tracing is by hand from now on.
+            (
+                lossy("1.1.1.1", Some(300)),
+                untraced("9.9.9.9", None),
+                false,
+            ),
+        ];
+        for (before, after, expires) in cases {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            e.observe(&before, &b);
+            let id = find(&e, "path.high_loss").id;
+            for _ in 0..61 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            let state = e.get(&id).unwrap().state.clone();
+            if expires {
+                assert_eq!(
+                    state,
+                    expired("trace target changed", "2026-09-03 06:49:11")
+                );
+            } else {
+                assert_eq!(state, IssueState::Open, "{after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_removed_interface_expires_only_on_a_fresh_collector() {
+        let b = base();
+        let listing = |names: &[&str]| {
+            Some(ObservedConfig {
+                interfaces: Some(names.iter().map(|n| n.to_string()).collect()),
+                ..Default::default()
+            })
+        };
+        let down = Observations {
+            iface: Some(IfaceObs {
+                carrier: Some(false),
+                ..crate::diagnose::fixture::observations_at(0).iface.unwrap()
+            }),
+            config: listing(&["lo", "eth0"]),
+            ..Default::default()
+        };
+        // The USB adapter is pulled: the platform stops listing it.
+        let pulled = Observations {
+            config: listing(&["lo"]),
+            ..Default::default()
+        };
+        for collector_runs in [true, false] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            e.observe_live_at(&down, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "link.down").id;
+            for t in 1..=61 {
+                clock.advance_secs(1);
+                let ran = if collector_runs { t } else { 0 };
+                e.observe_live_at(&pulled, &b, &ran_at(start, ran), at(t));
+            }
+            let state = e.get(&id).unwrap().state.clone();
+            if collector_runs {
+                assert_eq!(state, expired("interface removed", "2026-09-03 06:49:11"));
+            } else {
+                assert_eq!(state, IssueState::Open);
+            }
+        }
     }
 
     #[test]

@@ -831,6 +831,7 @@ mod tests {
             subject,
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
+            stale_since: None,
             state: IssueState::Open,
             evidence: vec![],
             scope: Scope::default(),
