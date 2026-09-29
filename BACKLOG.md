@@ -15,7 +15,7 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [x] P08 diagnose/034-controller (X01)
 - [ ] P09 diagnose/034-thresholds-config (B01)
 - [ ] P10 diagnose/034-observation-kind (B05)
-- [ ] P11 diagnose/034-corpus-manifest (C02, C08)
+- [x] P11 diagnose/034-corpus-manifest (C02, C08)
 - [ ] P12 diagnose/034-catalogue-texts (B33a)
 - [ ] P13 diagnose/034-exit-code (B06, B07)
 - [ ] P14 diagnose/034-verify-and-config (B03, B04)
