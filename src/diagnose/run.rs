@@ -291,6 +291,9 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
 #[derive(Debug, Clone)]
 struct Asked {
     name: String,
+    /// A sample has held a probe of the target. Until one has, the run knows
+    /// no route for it, not an empty one.
+    observed: bool,
     via_iface: Option<String>,
     via_resolver: Option<String>,
     /// The target is a name. One given as an address has no resolver on its
@@ -306,6 +309,7 @@ impl Asked {
         let address = target.host.parse::<std::net::IpAddr>().ok();
         Self {
             name: target.name.clone(),
+            observed: false,
             via_iface: None,
             via_resolver: None,
             resolves: address.is_none(),
@@ -318,6 +322,7 @@ impl Asked {
         let Some(probe) = observations.targets.iter().find(|t| t.name == self.name) else {
             return;
         };
+        self.observed = true;
         let lookup = probe.route_lookup();
         self.via_resolver = lookup.map(|l| l.resolver.clone());
         self.via_iface = lookup.and_then(|l| l.link.clone());
@@ -337,9 +342,11 @@ impl Asked {
     /// target's route. It can unless it names an interface or resolver the
     /// target is known not to use, the edge suppression draws, or it is
     /// about a resolver and the target is an address, or the target is this
-    /// host.
+    /// host. Nothing can before the target was probed: a target that is
+    /// disabled, invalid or slower than the budget would otherwise take on
+    /// every host-wide Issue and exit 1 with no evidence about it.
     fn routes_through(&self, finding: &Issue) -> bool {
-        if self.local {
+        if !self.observed || self.local {
             return false;
         }
         let (iface, resolver) = match &finding.subject {
@@ -1103,41 +1110,85 @@ mod tests {
         };
         let named = "name = \"api\"\nhost = \"api.corp.internal\"";
 
-        // Nothing known about its route: every host-wide Issue could lie on it.
-        assert_eq!(kept(&asked(named)), ["1", "2", "3", "4"]);
+        // Probed, but its lookup recorded no route: every host-wide Issue
+        // could lie on it.
+        assert_eq!(kept(&probed(named, &["10.1.2.3"])), ["1", "2", "3", "4"]);
 
-        let mut known = asked(named);
+        let mut known = probed(named, &["10.1.2.3"]);
         known.via_iface = Some("eth0".into());
         known.via_resolver = Some("192.168.8.1".into());
         assert_eq!(kept(&known), ["1", "2", "4"], "wlan0 is not its link");
 
-        let mut tunnelled = asked(named);
+        let mut tunnelled = probed(named, &["10.1.2.3"]);
         tunnelled.via_iface = Some("wg0".into());
         tunnelled.via_resolver = Some("10.8.0.1".into());
         assert_eq!(kept(&tunnelled), ["4"]);
 
         // An address needs no resolver.
-        let literal = asked("name = \"api\"\nhost = \"10.1.2.3\"");
+        let literal = probed("name = \"api\"\nhost = \"10.1.2.3\"", &["10.1.2.3"]);
         assert_eq!(kept(&literal), ["1", "3", "4"]);
 
         // A service on this host goes through no gateway, link or resolver.
-        let loopback = asked("name = \"api\"\nhost = \"127.0.0.1\"");
+        let loopback = probed("name = \"api\"\nhost = \"127.0.0.1\"", &["127.0.0.1"]);
         assert!(kept(&loopback).is_empty());
-        let mut localhost = asked("name = \"api\"\nhost = \"localhost\"");
+        let mut localhost = probed("name = \"api\"\nhost = \"localhost\"", &[]);
         assert_eq!(kept(&localhost), ["1", "2", "3", "4"], "not yet resolved");
-        let mut resolved = probe(
+        localhost.saw(&Observations {
+            targets: vec![unrouted(&["::1", "127.0.0.1"])],
+            ..Default::default()
+        });
+        assert!(kept(&localhost).is_empty());
+    }
+
+    /// A probe of `api` whose lookup recorded no route, and which resolved
+    /// `addresses`.
+    fn unrouted(addresses: &[&str]) -> TargetObs {
+        let mut target = probe(
             "api",
             crate::diagnose::targets::Stage {
                 ms: Some(40.0),
                 error: None,
             },
         );
-        resolved.addresses = vec!["::1".into(), "127.0.0.1".into()];
-        localhost.saw(&Observations {
-            targets: vec![resolved],
+        target.lookups.clear();
+        target.addresses = addresses.iter().map(|a| a.to_string()).collect();
+        target
+    }
+
+    /// The target in `toml`, after one sample held [`unrouted`]`(addresses)`.
+    fn probed(toml: &str, addresses: &[&str]) -> Asked {
+        let mut target = asked(toml);
+        target.saw(&Observations {
+            targets: vec![unrouted(addresses)],
             ..Default::default()
         });
-        assert!(kept(&localhost).is_empty());
+        target
+    }
+
+    /// P13 review: a target no sample held a probe of, because it is
+    /// disabled, failed validation or did not finish inside the budget, has
+    /// no route to put a host-wide Issue on. Reading its unknown route as
+    /// any route kept every one, and the run exited 1 with `"evidence":
+    /// false`, where the label filter before it exited 2.
+    #[test]
+    fn a_target_never_probed_is_incomplete_whatever_the_host_shows() {
+        let (engine, _) = crate::diagnose::fixture::run();
+        let observations = crate::diagnose::fixture::observations_at(0);
+        let named = "name = \"api\"\nhost = \"api.corp.internal\"";
+        let mut api = asked(named);
+        api.saw(&observations);
+        assert!(!evidence(&observations, Some("api")));
+        let findings = select(engine.issues(), Some(&api));
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(outcome(&findings, false), Outcome::Incomplete);
+
+        // Not vacuous: the host has Issues a probed target would keep.
+        let findings = select(engine.issues(), Some(&probed(named, &["10.1.2.3"])));
+        assert!(
+            findings.iter().any(|f| f.kind() == Kind::Issue),
+            "{findings:?}"
+        );
+        assert_eq!(outcome(&findings, true), Outcome::Finding);
     }
 
     #[test]
