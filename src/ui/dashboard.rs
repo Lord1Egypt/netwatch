@@ -405,17 +405,19 @@ fn session_retrans(app: &App) -> (f64, Option<(String, f64)>) {
 /// dot in front of the number: a coloured bullet is a fifth thing on the row
 /// competing with four that carry meaning, and the spec reserves status colour
 /// for the value's relationship to its threshold.
-/// Whether Diagnose has an open finding behind a tile's alarm colour.
+/// Whether Diagnose has an open Issue behind a tile's alarm colour.
 ///
 /// A tile alarms on a threshold; Diagnose opens an issue only once a
 /// condition has been confirmed across samples and its rule has the evidence
 /// it needs. The two disagreeing is normal and often correct — but a red
 /// border beside a status line reading "no issues" is a contradiction on
-/// screen, so the tile says which of the two it is.
+/// screen, so the tile says which of the two it is. An Observation, such as a
+/// route change that added 20 ms or less, does not count: the status line
+/// does not count it either.
 fn issue_behind(app: &App, rules: &[&str]) -> bool {
     app.diagnose
         .engine
-        .primary()
+        .primary_issues()
         .iter()
         .any(|i| rules.iter().any(|r| i.rule.starts_with(r)))
 }
@@ -2260,5 +2262,48 @@ mod tests {
         assert_eq!(fmt_ms(9.96), "10.0");
         assert_eq!(fmt_ms(41.4), "41");
         assert_eq!(fmt_ms(184.6), "185");
+    }
+
+    /// An Info route change used to count as an issue behind an alarmed
+    /// latency tile, which then dropped "no issue raised" while the status
+    /// line beside it said "no issues".
+    #[test]
+    fn an_observation_is_not_an_issue_behind_a_tile() {
+        use crate::diagnose::baseline::{BaselineStore, NetworkFingerprint};
+        use crate::diagnose::detectors::{Observations, PathObs};
+        use crate::diagnose::fixture::path_before;
+
+        let rerouted = |added_ms: f64| {
+            let mut after = path_before();
+            after[2].ip = Some("203.0.113.44".into());
+            after[2].rtt_p50_ms = after[2].rtt_p50_ms.map(|r| r + added_ms);
+            Observations {
+                paths: vec![PathObs {
+                    target: "1.1.1.1".into(),
+                    hops: after,
+                    previous: Some(path_before()),
+                    traced_at: "2026-09-03 06:48:10".into(),
+                    destination_reached: Some(true),
+                }],
+                ..Default::default()
+            }
+        };
+        let base = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
+        let mut app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        for _ in 0..3 {
+            app.diagnose.engine.observe(&rerouted(2.0), &base);
+        }
+        assert_eq!(
+            app.diagnose.engine.primary().len(),
+            1,
+            "path.changed is open"
+        );
+        assert!(!issue_behind(&app, &["path."]));
+
+        // 40 ms added makes the same route change an Issue.
+        for _ in 0..3 {
+            app.diagnose.engine.observe(&rerouted(40.0), &base);
+        }
+        assert!(issue_behind(&app, &["path."]));
     }
 }

@@ -9,7 +9,7 @@
 //! issue. That distinction is the point: a diagnostic tool that lists 24 rules
 //! and silently evaluates nine is lying about its coverage.
 
-use super::issue::{Issue, IssueId, RuleId, Severity, Subject, Verify};
+use super::issue::{Issue, IssueId, Kind, RuleId, Severity, Subject, Verify};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,8 @@ pub struct Rule {
     /// Plain-English trigger, shown in the "how issues are found" panel.
     pub trigger: &'static str,
     /// Rules whose issues become consequences of this one when both are open
-    /// and they share a subject scope. Explicit — never inferred.
+    /// and they share a subject scope. Explicit — never inferred. An
+    /// Observation of this rule still never hides an Issue.
     pub suppresses: &'static [RuleId],
     pub status: RuleStatus,
     /// What must be measured before this rule may fire. Empty means the rule
@@ -712,6 +713,15 @@ pub fn apply_suppression(issues: &mut [Issue]) {
             if !depends_on(root, child) {
                 continue;
             }
+            // An Observation never hides an Issue. The edge stays in the
+            // catalogue because a detector can raise the same rule to an
+            // Issue: path.changed is Medium once the new hop adds more than
+            // 20 ms, and then it does explain the path's rtt spike. At Info
+            // it is a route that changed, which explains nothing a user
+            // would fix.
+            if root.kind() == Kind::Observation && child.kind() == Kind::Issue {
+                continue;
+            }
             // Most severe root wins, so a link failure beats a gateway failure.
             if best.map(|(_, s)| root.severity > s).unwrap_or(true) {
                 best = Some((ri, root.severity));
@@ -750,9 +760,10 @@ pub fn apply_suppression(issues: &mut [Issue]) {
     }
 }
 
-/// The issues a user should be shown as findings: open, and not a consequence
-/// of another open issue.
-pub fn primary_issues(issues: &[Issue]) -> Vec<&Issue> {
+/// The findings a user should be shown: open, and not a consequence of
+/// another open finding. Issues and Observations alike; [`Kind`] tells them
+/// apart.
+pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
     issues
         .iter()
         .filter(|i| i.state.is_open() && i.suppressed_by.is_none())
@@ -1201,7 +1212,7 @@ mod tests {
 
         assert_eq!(issues[0].suppressed_by.as_deref(), Some("B"));
         assert_eq!(issues[1].consequences, vec!["A".to_string()]);
-        let primary = primary_issues(&issues);
+        let primary = primary_findings(&issues);
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].id, "B");
     }
@@ -1237,7 +1248,7 @@ mod tests {
             issues[2].consequences,
             vec!["A".to_string(), "B".to_string()]
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1287,7 +1298,7 @@ mod tests {
             issues[0].suppressed_by.is_none(),
             "dns must resurface as a finding once the gateway recovers"
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1317,6 +1328,71 @@ mod tests {
             ),
         ];
         apply_suppression(&mut issues);
-        assert_eq!(primary_issues(&issues).len(), 3);
+        assert_eq!(primary_findings(&issues).len(), 3);
+    }
+
+    /// An Info `path.changed` used to hide a Medium `path.rtt_spike` on the
+    /// same path: a note that the route moved took the fault off the screen.
+    #[test]
+    fn an_observation_never_hides_an_issue() {
+        let path = || Subject::Path {
+            target: "1.1.1.1".into(),
+        };
+        let mut issues = vec![
+            issue("A", "path.changed", path()),
+            issue("B", "path.rtt_spike", path()),
+        ];
+        assert_eq!(issues[0].kind(), Kind::Observation);
+        apply_suppression(&mut issues);
+        assert!(issues[1].suppressed_by.is_none());
+        assert!(issues[0].consequences.is_empty());
+        let primary: Vec<&str> = primary_findings(&issues)
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(primary, ["A", "B"]);
+
+        // Once the new hop adds enough latency to make the route change an
+        // Issue, it explains the spike again.
+        issues[0].severity = Severity::Medium;
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by.as_deref(), Some("A"));
+
+        // An Issue still hides an Observation it explains.
+        let flow = || Subject::Egress {
+            process: "curl".into(),
+            destination: "203.0.113.7".into(),
+            port: 443,
+        };
+        let mut issues = vec![
+            issue("C", "egress.drift", flow()),
+            issue("D", "egress.policy_violation", flow()),
+        ];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[0].suppressed_by.as_deref(), Some("D"));
+    }
+
+    #[test]
+    fn the_six_info_rules_are_observations() {
+        let observations: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|r| r.severity.kind() == Kind::Observation)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            observations,
+            [
+                "dns.truncation_retry",
+                "path.changed",
+                "tcp.zero_window",
+                "tcp.timewait_exhaustion",
+                "nat.symmetric",
+                "egress.drift",
+            ]
+        );
+        for id in observations {
+            let found = issue("A", id, Subject::Host);
+            assert_eq!(found.kind(), Kind::Observation, "{id}");
+        }
     }
 }
