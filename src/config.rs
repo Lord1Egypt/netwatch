@@ -544,7 +544,9 @@ consecutive_n = 5
     /// or retuned without the doc fails here.
     #[test]
     fn the_documented_thresholds_are_the_defaults() {
-        let doc = include_str!("../docs/DIAGNOSE.md");
+        // A Windows checkout rewrites the doc to CRLF, and the search below
+        // spans a line break.
+        let doc = include_str!("../docs/DIAGNOSE.md").replace("\r\n", "\n");
         let start = doc
             .find("```toml\n[diagnose_thresholds]\n")
             .expect("DIAGNOSE.md shows the thresholds table")
