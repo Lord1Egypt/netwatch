@@ -184,9 +184,11 @@ two minutes and reopened each time it rose. A noisy link now takes longer to
 close.
 
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
-above normal is left out, so an incident does not become the new normal. A low
-value leaves out ordinary peaks too, so the saved baselines settle lower and
-flag more, and they take time to relearn after the value is raised again.
+above normal is left out, so an incident does not become the new normal. A
+reading between `sigma_close_k` and `sigma_k` is learned, so an issue that
+settles there closes once its baseline has caught up with it. A low value
+leaves out ordinary peaks too, so the saved baselines settle lower and flag
+more, and they take time to relearn after the value is raised again.
 
 ## Diagnose coverage in terminal Netwatch
 
