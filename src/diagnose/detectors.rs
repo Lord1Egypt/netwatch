@@ -196,7 +196,8 @@ impl Thresholds {
         check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
         // A close line at or above the open line is no deadband. When the
         // default is not below a lowered `sigma_k` either, the fallback keeps
-        // the defaults' proportion.
+        // the defaults' proportion. The warning rounds it: a `sigma_k` of 2
+        // leaves 1.3333333333333333.
         if t.sigma_close_k >= t.sigma_k {
             let default = Self::default();
             let (fallback, used) = if default.sigma_close_k < t.sigma_k {
@@ -204,7 +205,8 @@ impl Thresholds {
                 (v, format!("the default {v}"))
             } else {
                 let v = t.sigma_k * default.sigma_close_k / default.sigma_k;
-                (v, format!("{v}, two thirds of it,"))
+                let shown = (v * 100.0).round() / 100.0;
+                (v, format!("{shown}, two thirds of it,"))
             };
             warnings.push(format!(
                 "diagnose_thresholds.sigma_close_k = {} must be below sigma_k = {}, so {used} is used",
@@ -3899,6 +3901,18 @@ mod tests {
         assert_eq!(
             warnings,
             ["diagnose_thresholds.sigma_close_k = 2 must be below sigma_k = 1.5, so 1, two thirds of it, is used"]
+        );
+
+        // The warning rounds what it reports; the value is not rounded.
+        let (t, warnings) = Thresholds {
+            sigma_k: 2.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(t.sigma_close_k, 2.0 * 2.0 / 3.0);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 2 must be below sigma_k = 2, so 1.33, two thirds of it, is used"]
         );
 
         // Any line below the open one stands.
