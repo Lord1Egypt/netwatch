@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::issue::{Applied, Issue, IssueState, Severity, StepKind};
+use super::issue::{Applied, Issue, IssueState, Kind, Severity, StepKind};
 use super::rules;
 
 /// Host and session facts that belong in every report's environment section.
@@ -78,19 +78,29 @@ impl Report {
             }
             return line;
         }
-        let worst = primary
-            .iter()
-            .map(|i| i.severity)
-            .max()
-            .unwrap_or(Severity::Info);
+        // Observations are counted apart and never set the state: a host
+        // whose only finding is a symmetric NAT is not "impaired", and it is
+        // not "nominal" either, because nothing here measured that.
+        let (issues, observations): (Vec<&Issue>, Vec<&Issue>) =
+            primary.into_iter().partition(|i| i.kind() == Kind::Issue);
+        let notes = match observations.len() {
+            0 => String::new(),
+            n => format!(" · {}", plural(n, "observation")),
+        };
+        let Some(worst) = issues.iter().map(|i| i.severity).max() else {
+            return format!("no open issues{notes}");
+        };
         let state = match worst {
             Severity::Critical => "down",
             Severity::High => "degraded",
-            Severity::Medium => "impaired",
-            Severity::Info => "nominal with notes",
+            // Info is an Observation, so it is never the worst Issue.
+            Severity::Medium | Severity::Info => "impaired",
         };
-        let counts = severity_counts(&primary);
-        format!("{state} — {} ({counts})", plural(primary.len(), "issue"))
+        let counts = severity_counts(&issues);
+        format!(
+            "{state} — {} ({counts}){notes}",
+            plural(issues.len(), "issue")
+        )
     }
 
     pub fn to_json(&self) -> serde_json::Result<String> {
@@ -530,12 +540,7 @@ fn md_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 
 fn severity_counts(issues: &[&Issue]) -> String {
     let mut parts = Vec::new();
-    for sev in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Info,
-    ] {
+    for sev in [Severity::Critical, Severity::High, Severity::Medium] {
         let n = issues.iter().filter(|i| i.severity == sev).count();
         if n > 0 {
             parts.push(format!("{n} {}", sev.long_label()));
@@ -819,6 +824,29 @@ mod tests {
             r.summary_line().starts_with("no open findings"),
             "{}",
             r.summary_line()
+        );
+    }
+
+    /// Info findings used to count as issues and, alone, made the summary
+    /// "nominal with notes": a health claim nothing had measured.
+    #[test]
+    fn observations_are_counted_apart_from_issues() {
+        let mut r = report();
+        let ids: Vec<String> = r.primary().iter().map(|i| i.id.clone()).collect();
+        assert!(ids.len() >= 2, "the fixture opens several findings");
+        let last = r.issues.iter_mut().find(|i| i.id == ids[ids.len() - 1]);
+        last.unwrap().severity = Severity::Info;
+        let line = r.summary_line();
+        assert!(line.contains(&plural(ids.len() - 1, "issue")), "{line}");
+        assert!(line.ends_with(" · 1 observation"), "{line}");
+        assert!(!line.contains("info"), "{line}");
+
+        for i in &mut r.issues {
+            i.severity = Severity::Info;
+        }
+        assert_eq!(
+            r.summary_line(),
+            format!("no open issues · {}", plural(ids.len(), "observation"))
         );
     }
 

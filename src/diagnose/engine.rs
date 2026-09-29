@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use super::baseline::BaselineStore;
 use super::detectors::{self, Detection, Observations, Thresholds};
-use super::issue::{Issue, IssueId, IssueState, Severity};
+use super::issue::{Issue, IssueId, IssueState, Kind, Severity};
 use super::rules;
 
 /// Time source. A trait so the fixture and the tests can pin the clock and
@@ -306,8 +306,37 @@ impl Engine {
     }
 
     /// Findings to show: open, and not a consequence of another open issue.
+    /// Both kinds, in the order the Diagnose tab lists them; replay records
+    /// this list, so it is not narrowed to either kind.
     pub fn primary(&self) -> Vec<&Issue> {
         rules::primary_findings(&self.issues)
+    }
+
+    /// The primary findings that are Issues: what the verdict line counts.
+    pub fn primary_issues(&self) -> Vec<&Issue> {
+        self.primary_of(Kind::Issue)
+    }
+
+    /// The primary findings that are Observations.
+    pub fn primary_observations(&self) -> Vec<&Issue> {
+        self.primary_of(Kind::Observation)
+    }
+
+    fn primary_of(&self, kind: Kind) -> Vec<&Issue> {
+        self.primary()
+            .into_iter()
+            .filter(|i| i.kind() == kind)
+            .collect()
+    }
+
+    /// The Observations the verdict line leaves out, counted the way it counts
+    /// Issues. Nothing draws it yet; it lives here so the surface that does
+    /// cannot count differently from the verdict.
+    pub fn observation_count(&self) -> usize {
+        self.primary_observations()
+            .into_iter()
+            .filter(|i| !matches!(i.state, IssueState::Muted { .. }))
+            .count()
     }
 
     pub fn open_count(&self) -> usize {
@@ -1051,9 +1080,13 @@ impl Engine {
     /// The line under the tab bar. Collapses to one dim sentence when nothing
     /// is wrong, and never claims health it hasn't verified — a host still
     /// learning its baselines says so rather than saying "all nominal".
+    ///
+    /// Only Issues make it say so. A host whose only findings are
+    /// Observations reads as learning or incomplete, as an empty one does,
+    /// and the Diagnose tab still lists them.
     pub fn verdict(&self, base: &BaselineStore) -> Verdict {
-        let primary = self.primary();
-        let visible: Vec<&Issue> = primary
+        let visible: Vec<&Issue> = self
+            .primary_issues()
             .into_iter()
             .filter(|i| !matches!(i.state, IssueState::Muted { .. }))
             .collect();
@@ -1128,6 +1161,8 @@ pub enum Verdict {
     Incomplete {
         detail: String,
     },
+    /// At least one Issue is open. `count` leaves Observations out, so
+    /// `severity` is never Info.
     Issues {
         severity: Severity,
         count: usize,
@@ -2084,6 +2119,53 @@ mod tests {
         let v = e.verdict(&b);
         assert!(v.line().contains("gateway unreachable"), "{}", v.line());
         assert!(v.line().contains("1 issue"), "{}", v.line());
+    }
+
+    /// A trace to 1.1.1.1 whose hop 3 moved, adding `added_ms`. Up to 20 ms
+    /// that is an Info `path.changed`: an Observation.
+    fn rerouted(added_ms: f64) -> Observations {
+        let before = crate::diagnose::fixture::path_before();
+        let mut after = before.clone();
+        after[2].ip = Some("203.0.113.44".into());
+        after[2].rtt_p50_ms = after[2].rtt_p50_ms.map(|r| r + added_ms);
+        Observations {
+            now: "2026-09-03 06:48:10".into(),
+            paths: vec![crate::diagnose::detectors::PathObs {
+                target: "1.1.1.1".into(),
+                hops: after,
+                previous: Some(before),
+                traced_at: "2026-09-03 06:48:10".into(),
+                destination_reached: Some(true),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn observations_alone_do_not_make_the_verdict_say_issues() {
+        let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&rerouted(2.0), &b);
+
+        let listed: Vec<&str> = e.primary().iter().map(|i| i.rule.as_str()).collect();
+        assert_eq!(listed, ["path.changed"], "the tab still lists it");
+        assert_eq!(e.primary_observations().len(), 1);
+        assert!(e.primary_issues().is_empty());
+        assert_eq!(e.observation_count(), 1);
+        let v = e.verdict(&b);
+        assert!(!matches!(v, Verdict::Issues { .. }), "{v:?}");
+        assert_eq!(v.count(), 0);
+
+        // An Issue beside it is what the verdict counts and leads with.
+        let mut both = rerouted(2.0);
+        both.dns = Some(dns(40.0));
+        e.observe(&both, &b);
+        assert_eq!(e.primary().len(), 2);
+        let v = e.verdict(&b);
+        assert_eq!(v.count(), 1, "{}", v.line());
+        assert!(v.line().contains("slow dns resolver"), "{}", v.line());
+        assert_ne!(v.severity(), Some(Severity::Info));
+        assert_eq!(e.observation_count(), 1);
     }
 
     #[test]

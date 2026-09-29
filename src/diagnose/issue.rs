@@ -47,12 +47,35 @@ impl Severity {
             Severity::Critical => "critical",
         }
     }
+
+    /// Info is an Observation; Medium and up are Issues.
+    pub fn kind(self) -> Kind {
+        match self {
+            Severity::Info => Kind::Observation,
+            Severity::Medium | Severity::High | Severity::Critical => Kind::Issue,
+        }
+    }
 }
 
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.long_label())
     }
+}
+
+/// Whether a finding says something is wrong or only something worth knowing.
+///
+/// An Issue is a fault: the verdict line counts it, and it can hide the
+/// findings it explains. An Observation, such as a symmetric NAT or a route
+/// that changed without adding latency, is listed with the findings, but the
+/// verdict line does not count it and it never hides an Issue.
+///
+/// Derived from [`Severity`], never stored, so the two cannot disagree and a
+/// recording that says "info" loads as an Observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Observation,
+    Issue,
 }
 
 /// What the issue is about. Drives drill-through (`t` trace, `p` packets) and
@@ -1038,6 +1061,13 @@ pub struct Verification {
 }
 
 impl Issue {
+    /// Issue or Observation, from the severity the detector settled on. A
+    /// detector that demotes a finding to Info at runtime makes it an
+    /// Observation with no further code.
+    pub fn kind(&self) -> Kind {
+        self.severity.kind()
+    }
+
     /// The evidence entry a rule considers primary — by convention the first.
     /// Titles and one-line summaries quote this one.
     pub fn headline(&self) -> Option<&Evidence> {
@@ -1462,5 +1492,23 @@ mod tests {
         let json = serde_json::to_string(&issue).unwrap();
         let back: Issue = serde_json::from_str(&json).unwrap();
         assert_eq!(issue, back, "report.json must reload into the same object");
+    }
+
+    #[test]
+    fn info_is_an_observation_and_everything_else_an_issue() {
+        assert_eq!(Severity::Info.kind(), Kind::Observation);
+        for sev in [Severity::Medium, Severity::High, Severity::Critical] {
+            assert_eq!(sev.kind(), Kind::Issue, "{sev}");
+        }
+
+        // The kind is not stored: a finding recorded as "info" loads as an
+        // Observation, and one that says "high" as an Issue.
+        let issue = test_issue();
+        assert_eq!(issue.kind(), Kind::Issue);
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(!json.contains("\"kind\":\"issue\""), "{json}");
+        let info = json.replace("\"severity\":\"high\"", "\"severity\":\"info\"");
+        let back: Issue = serde_json::from_str(&info).unwrap();
+        assert_eq!(back.kind(), Kind::Observation);
     }
 }
