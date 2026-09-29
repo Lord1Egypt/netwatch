@@ -574,12 +574,7 @@ fn detect_targets(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                 // resolver belongs to. Suppression uses both: a resolver
                 // failure elsewhere, or a link failure on another interface,
                 // does not explain this finding.
-                if let Some(answered) = target
-                    .lookups
-                    .iter()
-                    .find(|l| l.outcome == super::targets::LookupOutcome::Answered)
-                    .or_else(|| target.lookups.first())
-                {
+                if let Some(answered) = target.route_lookup() {
                     d.scope.via_resolver = Some(answered.resolver.clone());
                     d.scope.via_iface = answered.link.clone();
                 }
@@ -1174,7 +1169,9 @@ fn target_detection(
         )];
     }
 
-    // What isn't a network fault shouldn't read like one.
+    // What isn't a network fault shouldn't read like one. It stays an
+    // Observation here; `diagnose run --target` asks whether this target
+    // works, and counts it as an Issue.
     let top = d
         .causes
         .iter()
@@ -1183,7 +1180,7 @@ fn target_detection(
     if let Some((id, score)) = top {
         if score >= 0.6 && ["service_down", "name_does_not_exist", "service_error"].contains(&id) {
             d.severity = Severity::Info;
-            d.scope.note = Some("not a network fault".into());
+            d.scope.note = Some("service, not network".into());
         }
     }
     Some(d)
@@ -5622,7 +5619,7 @@ mod target_tests {
         let d = detect_one(t);
         assert_eq!(d.causes[0].id, "name_does_not_exist");
         assert_eq!(d.severity, Severity::Info);
-        assert_eq!(d.scope.note.as_deref(), Some("not a network fault"));
+        assert_eq!(d.scope.note.as_deref(), Some("service, not network"));
     }
 
     #[test]
@@ -5692,6 +5689,8 @@ mod target_tests {
         assert_eq!(d.causes[0].id, "tls_intercepting_proxy");
     }
 
+    /// An Observation on the Diagnose tab. `diagnose run --target api`
+    /// counts it as an Issue (D33-B07).
     #[test]
     fn a_503_is_the_service_not_the_network() {
         let mut t = healthy();
@@ -5701,6 +5700,7 @@ mod target_tests {
         assert_eq!(d.rule, "target.http_error");
         assert_eq!(d.causes[0].id, "service_error");
         assert_eq!(d.severity, Severity::Info);
+        assert_eq!(d.scope.note.as_deref(), Some("service, not network"));
     }
 
     #[test]

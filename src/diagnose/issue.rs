@@ -72,8 +72,10 @@ impl fmt::Display for Severity {
 /// never hides an Issue.
 ///
 /// Derived from [`Severity`], never stored, so the two cannot disagree and a
-/// recording that says "info" loads as an Observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// recording that says "info" loads as an Observation. `diagnose run` writes
+/// it beside each finding it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Observation,
     Issue,
@@ -309,7 +311,7 @@ impl Availability {
 }
 
 /// What became of one check: `passed` as a word, which the JSON carries as
-/// `state`. Schema 1 still writes `passed` beside it.
+/// `state` in its place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckState {
@@ -350,15 +352,15 @@ pub struct CheckResult {
     pub weight: f64,
 }
 
-/// A check as it is written and read. Schema 1 writes `state` next to
-/// `passed`; reading takes either, so records made before `state` and
-/// `why_not` existed still load.
+/// A check as it is written and read. It is written with `state` and no
+/// `passed`, as `diagnose run`'s schema 2 has it; reading takes either, so
+/// records made before `state` and `why_not` existed still load.
 #[derive(Serialize, Deserialize)]
 struct CheckWire {
     #[serde(default)]
     id: String,
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     passed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<CheckState>,
@@ -1201,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn a_check_writes_its_state_beside_passed() {
+    fn a_check_writes_its_state_not_passed() {
         let json = |c: &CheckResult| serde_json::to_value(c).unwrap();
         let not_run = json(&CheckResult::not_run(
             "alt_resolver_is_fast",
@@ -1209,12 +1211,12 @@ mod tests {
             Availability::NotMeasured,
             "no alternate resolver probed",
         ));
-        assert_eq!(not_run["passed"], serde_json::Value::Null);
+        assert!(not_run.get("passed").is_none(), "{not_run}");
         assert_eq!(not_run["state"], "not_run");
         assert_eq!(not_run["why_not"], "not_measured");
-        // Schema 1 only gains fields: a check that ran carries no `why_not`.
+        // A check that ran carries no `why_not`.
         let passed = json(&CheckResult::pass("a", "a", "fine"));
-        assert_eq!(passed["passed"], true);
+        assert!(passed.get("passed").is_none(), "{passed}");
         assert_eq!(passed["state"], "passed");
         assert!(passed.get("why_not").is_none(), "{passed}");
         assert_eq!(json(&CheckResult::fail("a", "a", ""))["state"], "failed");
@@ -1238,7 +1240,7 @@ mod tests {
         assert_eq!(ran.state(), CheckState::Failed);
         assert_eq!(ran.why_not, None);
         assert_eq!(ran.weight, 1.0);
-        // A record that carries `state` alone, as schema 2 will, loads too.
+        // A record that carries `state` alone, as schema 2 writes it, loads too.
         let new = load(r#"{"id":"a","name":"a","state":"passed","detail":""}"#);
         assert_eq!(new.passed, Some(true));
         let new = load(

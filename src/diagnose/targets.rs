@@ -293,6 +293,15 @@ impl TargetObs {
     pub fn baseline_subject(&self) -> &str {
         self.baseline_key.as_deref().unwrap_or(&self.name)
     }
+    /// The lookup a finding about this target records as its route: the
+    /// first resolver that answered, else the first one asked. Suppression
+    /// and `diagnose run --target` read the resolver and its link from it.
+    pub fn route_lookup(&self) -> Option<&Lookup> {
+        self.lookups
+            .iter()
+            .find(|l| l.outcome == LookupOutcome::Answered)
+            .or_else(|| self.lookups.first())
+    }
     /// Stage timings for the baseline store, as `(metric, ms)`.
     pub fn stage_readings(&self) -> Vec<(&'static str, f64)> {
         let mut out = Vec::new();
