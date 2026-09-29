@@ -248,6 +248,8 @@ pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observat
         captive_portal_url: None,
         nat: None,
         targets: vec![],
+        // Unknown, as in every recording made before the snapshot existed.
+        config: None,
     }
 }
 

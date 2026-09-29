@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
 use super::detectors::{
-    classify_socket, DnsCross, DnsObs, GatewayObs, HopObs, IfaceObs, NatObs, Observations, PathObs,
-    SocketObs, SocketVerdict, Thresholds,
+    classify_socket, DnsCross, DnsObs, GatewayObs, HopObs, IfaceObs, NatObs, Observations,
+    ObservedConfig, PathObs, SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
 use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
@@ -344,6 +344,7 @@ impl LiveSampler {
             nat: nat(app),
             targets: self.targets(app),
             egress: self.egress(app),
+            config: Some(observed_config(app)),
         }
     }
 
@@ -747,6 +748,26 @@ fn nat(app: &App) -> Option<NatObs> {
     })
 }
 
+/// The configuration this tick runs with, as the collectors and probes
+/// read it: the system resolvers, the targets the prober will probe, the
+/// trace the controller will run and the interfaces the platform lists.
+fn observed_config(app: &App) -> ObservedConfig {
+    let probes = &app.user_config.diagnose_probes;
+    ObservedConfig {
+        resolvers: app.config_collector.config.dns_servers.clone(),
+        targets: app
+            .user_config
+            .diagnose_targets
+            .iter()
+            .filter(|t| t.enabled)
+            .map(|t| (t.name.clone(), t.baseline_key()))
+            .collect(),
+        trace_target: probes.trace_target.clone(),
+        trace_refresh_secs: probes.periodic_trace_secs(),
+        interfaces: app.interface_info.iter().map(|i| i.name.clone()).collect(),
+    }
+}
+
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
 /// "no measurement" and "zero milliseconds" are different claims.
 /// The DNS p50 the baseline may learn from this cycle, or `None` when the
@@ -990,6 +1011,62 @@ mod tests {
             let json = serde_json::to_value(&obs).unwrap();
             assert_eq!(json["drops_per_min"].is_null(), !counted, "{json}");
         }
+    }
+
+    /// Whether a target was removed, or a resolver left the system config,
+    /// is not in any reading. Each sample records the configuration it ran
+    /// with, so a replay can tell a subject that went away from one that
+    /// stopped being measured.
+    #[test]
+    fn the_sampler_records_the_configuration_it_ran_with() {
+        let config: crate::config::NetwatchConfig = toml::from_str(
+            r#"
+            [diagnose_probes]
+            trace_target = "9.9.9.9"
+            trace_refresh_secs = 120
+
+            [[diagnose_targets]]
+            name = "api"
+            host = "api.example.test"
+
+            [[diagnose_targets]]
+            name = "old"
+            host = "old.example.test"
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let mut app = App::prepare_with_config(config);
+        app.config_collector.config.dns_servers = vec!["192.0.2.53".into(), "fe80::1".into()];
+        app.interface_info = vec![info("nwtest0", Some(false)), info("nwtest1", Some(true))];
+        let thresholds = Thresholds::default();
+        let revision = app.user_config.diagnose_targets[0].baseline_key();
+
+        let observed = LiveSampler::new()
+            .sample(&app, &thresholds)
+            .config
+            .expect("a live sample records its configuration");
+        assert_eq!(observed.resolvers, ["192.0.2.53", "fe80::1"]);
+        assert_eq!(
+            observed.targets,
+            [("api".to_string(), revision.clone())],
+            "a disabled target is never probed"
+        );
+        assert_eq!(observed.trace_target, "9.9.9.9");
+        assert_eq!(observed.trace_refresh_secs, Some(120));
+        assert_eq!(observed.interfaces, ["nwtest0", "nwtest1"]);
+
+        // An edited target is a new revision under the same name, and an
+        // interval the controller ignores records as no periodic tracing.
+        app.user_config.diagnose_targets[0].port = 8443;
+        app.user_config.diagnose_probes.trace_refresh_secs = Some(5);
+        app.interface_info.pop();
+        let observed = LiveSampler::new().sample(&app, &thresholds).config.unwrap();
+        assert_eq!(observed.targets.len(), 1);
+        assert_eq!(observed.targets[0].0, "api");
+        assert_ne!(observed.targets[0].1, revision);
+        assert_eq!(observed.trace_refresh_secs, None);
+        assert_eq!(observed.interfaces, ["nwtest0"]);
     }
 
     #[test]

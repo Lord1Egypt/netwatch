@@ -79,12 +79,12 @@ impl Redactor {
                 }
             }
             for target in &frame.obs.targets {
-                let token = self.token("target", &target.name);
-                self.target_names.insert(target.name.clone(), token);
-                if let Some(key) = &target.baseline_key {
-                    let safe = self.token("target-config", key);
-                    self.target_names.insert(key.clone(), safe);
-                }
+                self.learn_target(&target.name, target.baseline_key.as_deref());
+            }
+            // A configured target can have no probe result in any frame,
+            // and its name is still the user's own text.
+            for (name, revision) in frame.obs.config.iter().flat_map(|c| &c.targets) {
+                self.learn_target(name, Some(revision));
             }
         }
         for label in &mut ep.labels {
@@ -138,6 +138,17 @@ impl Redactor {
                     }
                 }
             }
+            if let Some(config) = &mut frame.obs.config {
+                for (name, revision) in &mut config.targets {
+                    *name = self.target_identity(name);
+                    *revision = self.target_identity(revision);
+                }
+                // An address is redacted by the walk below. Anything else
+                // here is a name the user typed.
+                if config.trace_target.parse::<IpAddr>().is_err() {
+                    config.trace_target = self.token("host", &config.trace_target);
+                }
+            }
         }
         for snap in &mut ep.issues {
             if let super::issue::Subject::Process { name, pid } = &mut snap.issue.subject {
@@ -153,6 +164,17 @@ impl Redactor {
         let mut value = serde_json::to_value(&ep).expect("episodes serialise");
         self.walk(&mut value);
         serde_json::from_value(value).expect("redaction keeps the shape")
+    }
+
+    /// Tokens for a target's name and configuration revision, so each maps
+    /// the same way wherever it appears.
+    fn learn_target(&mut self, name: &str, revision: Option<&str>) {
+        let token = self.token("target", name);
+        self.target_names.insert(name.to_string(), token);
+        if let Some(key) = revision {
+            let safe = self.token("target-config", key);
+            self.target_names.insert(key.to_string(), safe);
+        }
     }
 
     fn learn_names(&mut self, obs: &super::detectors::Observations) {
@@ -176,6 +198,9 @@ impl Redactor {
         }
         if let Some(cross) = obs.dns.as_ref().and_then(|d| d.cross.as_ref()) {
             add(&cross.name);
+        }
+        for (name, _) in obs.config.iter().flat_map(|c| &c.targets) {
+            add(name);
         }
         for path in &obs.paths {
             add(&path.target);
@@ -798,6 +823,18 @@ mod tests {
                     "duplicate target secret-config-name".into(),
                 ),
             );
+            // The probed target, one configured target no frame has a
+            // result for, and a trace target that is not an address.
+            frame.obs.config = Some(crate::diagnose::detectors::ObservedConfig {
+                resolvers: vec!["192.168.8.53".into()],
+                targets: vec![
+                    ("dns".into(), "target-config:private-test-revision".into()),
+                    ("ledger".into(), "target-config:unprobed-revision".into()),
+                ],
+                trace_target: "tracehost".into(),
+                trace_refresh_secs: Some(120),
+                interfaces: vec!["wlan0".into()],
+            });
         }
         ep.labels.push(episode::Label {
             issue: "target.resolve_failed|dns".into(),
@@ -817,9 +854,24 @@ mod tests {
             "secret-process",
             "secret-config-name",
             "target-config:private-test-revision",
+            "ledger",
+            "target-config:unprobed-revision",
+            "tracehost",
+            "192.168.8.53",
         ] {
             assert!(!text.contains(secret), "{secret} escaped redaction");
         }
+        // A configured target maps to the tokens its probe results carry,
+        // so a replay of the export matches one to the other.
+        let probed = &safe.frames[0].obs.targets[0];
+        let config = safe.frames[0].obs.config.as_ref().unwrap();
+        assert_eq!(
+            config.targets[0],
+            (probed.name.clone(), probed.baseline_key.clone().unwrap())
+        );
+        assert!(config.targets[1].0.starts_with("target:"));
+        assert!(config.targets[1].1.starts_with("target-config:"));
+        assert_eq!(config.interfaces, ["wlan0"]);
         assert!(safe.frames[0].obs.targets[0].name.starts_with("target:"));
         assert!(safe.labels[0]
             .issue
