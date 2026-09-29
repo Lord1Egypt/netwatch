@@ -1111,7 +1111,7 @@ fn sorted(open: &[OpenIssue]) -> Vec<OpenIssue> {
 // ------------------------------------------------------------------ cli
 
 /// The decisions a pinned episode must keep producing: which issues opened,
-/// when, and what each one was blamed on.
+/// when, what each one was blamed on, and why each left the list.
 ///
 /// This is what the corpus compares, rather than the whole engine state: an
 /// issue opening a frame later, or landing on a different cause, is a change
