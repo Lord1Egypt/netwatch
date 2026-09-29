@@ -533,6 +533,13 @@ impl Engine {
 
     /// `since` is when the condition was first seen: `now` for an issue that
     /// is already open, earlier for one that just passed hysteresis.
+    ///
+    /// The verify condition is the one the detection carried when the issue
+    /// opened or reopened. A close line derived from the metric and taken
+    /// afresh every tick would move with the value it judges, and the issue
+    /// could chase it forever. A merge that changes the severity keeps it
+    /// too, so an issue that escalates from Info keeps the verify it opened
+    /// with.
     fn merge(&mut self, d: Detection, now: DateTime<Local>, since: DateTime<Local>) {
         let key = d.key();
         let ts = format_ts(now);
@@ -576,7 +583,9 @@ impl Engine {
                 issue.evidence = d.evidence;
                 issue.causes = d.causes;
                 issue.scope = d.scope;
-                issue.verify = d.verify;
+                if reopening {
+                    issue.verify = d.verify;
+                }
                 // Preserve applied outcomes across ticks: a step the user
                 // already ran must keep saying so.
                 merge_remediation(&mut issue.remediation, d.remediation);
@@ -2059,6 +2068,54 @@ mod tests {
 
         assert_eq!(e.issues().len(), 2, "an hour later is a new incident");
         assert_eq!(e.primary()[0].recurrence, 0);
+    }
+
+    /// A detector that derives its close line from the metric sends a new
+    /// line with every detection. Taken every tick, the line would follow
+    /// the metric and never judge it against where the issue opened.
+    #[test]
+    fn the_verify_condition_is_the_one_set_at_open() {
+        use crate::diagnose::issue::{Subject, Verify};
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let slow = |line: f64| {
+            let mut d = Detection::new(
+                "dns.slow_resolver",
+                Subject::Resolver {
+                    addr: "169.254.1.1".into(),
+                },
+            );
+            d.verify = Verify::below("dns.rtt_p50", line, "ms").holding_for(60);
+            d
+        };
+        let line = |e: &Engine| e.issues()[0].verify.threshold;
+        let now = clock.now();
+        e.merge(slow(10.0), now, now);
+        assert_eq!(line(&e), 10.0);
+
+        // Neither a later detection with another line nor the detector's
+        // own pass, with its constant 5 ms, moves it.
+        clock.advance_secs(5);
+        let now = clock.now();
+        e.merge(slow(30.0), now, now);
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        assert_eq!(line(&e), 10.0, "a merge keeps the line set at open");
+
+        // Closed, and back inside the recurrence window: a reopen sets the
+        // line again, as an open does.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(e.open_count(), 0);
+        clock.advance_secs(60);
+        let now = clock.now();
+        e.merge(slow(20.0), now, now);
+        assert_eq!(e.issues()[0].state, IssueState::Open);
+        assert_eq!(e.issues()[0].recurrence, 1);
+        assert_eq!(line(&e), 20.0);
     }
 
     #[test]

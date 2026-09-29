@@ -966,6 +966,8 @@ pub struct Issue {
     pub scope: Scope,
     pub causes: Vec<Cause>,
     pub remediation: Vec<Step>,
+    /// Fixed when the issue opens or reopens; later detections of the same
+    /// condition do not move it.
     pub verify: Verify,
     #[serde(default)]
     pub artifacts: Vec<String>,
