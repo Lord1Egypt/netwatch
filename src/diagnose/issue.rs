@@ -986,6 +986,14 @@ pub struct Issue {
     /// Local timestamp of the first sample that violated the rule.
     pub since: String,
     pub last_seen: String,
+    /// Local timestamp from which this open issue's evidence stopped arriving:
+    /// its rule's input went unavailable or its verify metric went missing.
+    /// Set once, and cleared when the condition is detected again or the
+    /// metric returns. An issue nothing can measure stays open rather than
+    /// expiring, and this says since when. It is also set while a subject
+    /// that has gone waits out `expire_after_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<String>,
     pub state: IssueState,
     pub evidence: Vec<Evidence>,
     #[serde(default)]
@@ -1476,6 +1484,7 @@ mod tests {
             },
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
+            stale_since: None,
             state: IssueState::Open,
             evidence: vec![dns_evidence()],
             scope: Scope::default(),

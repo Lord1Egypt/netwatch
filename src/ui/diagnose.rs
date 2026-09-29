@@ -1003,7 +1003,12 @@ fn issue_row_width(i: &&Issue) -> usize {
             value += m.len() + 3;
         }
     }
-    title.max(value)
+    let short = crate::diagnose::issue::short_time;
+    let mut when = short(&i.since).len() + 12;
+    if let Some(stale) = &i.stale_since {
+        when += short(stale).len() + 15;
+    }
+    title.max(value).max(when)
 }
 
 /// Every tracked issue in the window, oldest first.
@@ -1177,7 +1182,7 @@ fn render_issue_list(f: &mut Frame, view: &View, issues: &[&Issue], area: Rect) 
         }
         lines.push(Line::from(detail));
 
-        lines.push(Line::from(vec![
+        let mut when = vec![
             rail(sev_color),
             Span::styled(
                 format!(
@@ -1186,7 +1191,19 @@ fn render_issue_list(f: &mut Frame, view: &View, issues: &[&Issue], area: Rect) 
                 ),
                 Style::default().fg(t.text_muted),
             ),
-        ]));
+        ];
+        // Why an issue whose evidence stopped arriving is still listed: it
+        // can neither close nor expire until something measures it again.
+        if let Some(stale) = &issue.stale_since {
+            when.push(Span::styled(
+                format!(
+                    " · stale since {}",
+                    crate::diagnose::issue::short_time(stale)
+                ),
+                Style::default().fg(t.status_warn),
+            ));
+        }
+        lines.push(Line::from(when));
     }
 
     let block = widgets::Panel::new("issues")
@@ -1755,10 +1772,20 @@ mod tests {
     /// Render the fixture and return the screen as text.
     fn draw(width: u16, height: u16, mutate: impl Fn(&mut View)) -> String {
         let (engine, baselines) = fixture::run();
+        draw_engine(&engine, &baselines, width, height, mutate)
+    }
+
+    fn draw_engine(
+        engine: &crate::diagnose::engine::Engine,
+        baselines: &crate::diagnose::baseline::BaselineStore,
+        width: u16,
+        height: u16,
+        mutate: impl Fn(&mut View),
+    ) -> String {
         let theme = crate::theme::by_name("default");
         let mut view = View {
-            engine: &engine,
-            baselines: &baselines,
+            engine,
+            baselines,
             theme: &theme,
             selected: 0,
             show_report: false,
@@ -2520,6 +2547,59 @@ mod tests {
             bottom.contains('╯'),
             "the empty state closes at the bottom too: {bottom}"
         );
+    }
+
+    #[test]
+    fn an_issue_nothing_measures_says_it_is_stale() {
+        let (mut engine, baselines) = fixture::run();
+        assert!(!draw_engine(&engine, &baselines, 150, 44, |_| {}).contains("stale"));
+        // Every collector goes quiet: the open issues can neither close nor
+        // expire, and each row says since when.
+        engine.observe(
+            &crate::diagnose::detectors::Observations::default(),
+            &baselines,
+        );
+        let s = draw_engine(&engine, &baselines, 150, 44, |_| {});
+        assert!(s.contains("since 06:48:10 · stale since 06:51:20"), "{s}");
+    }
+
+    #[test]
+    fn a_lone_stale_issue_sizes_the_list_to_its_stale_since() {
+        use crate::diagnose::detectors::{GatewayObs, Observations};
+        use crate::diagnose::engine::{Engine, FixedClock};
+
+        // The gateway outage behind blocked ICMP, alone: its title and
+        // subject are short, so only the when row can size the column.
+        let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:48:10"));
+        let engine = Engine::new(Box::new(clock.clone()));
+        let mut settings = *engine.settings();
+        settings.thresholds.consecutive_n = 1;
+        let mut engine = engine.with_settings(settings);
+        let baselines = fixture::baselines();
+        engine.observe(
+            &Observations {
+                gateway: Some(GatewayObs {
+                    addr: Some("192.168.8.1".into()),
+                    rtt_ms: None,
+                    loss_pct: 100.0,
+                    arp_ok: None,
+                    icmp_ok: false,
+                    internet_reachable: Some(false),
+                }),
+                ..Default::default()
+            },
+            &baselines,
+        );
+        clock.advance_secs(5);
+        engine.observe(&Observations::default(), &baselines);
+        assert_eq!(engine.primary().len(), 1);
+        for width in [120, 150, 200] {
+            let s = draw_engine(&engine, &baselines, width, 30, |_| {});
+            assert!(
+                s.contains("since 06:48:10 · stale since 06:48:15"),
+                "{width}: {s}"
+            );
+        }
     }
 
     #[test]
