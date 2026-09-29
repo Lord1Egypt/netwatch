@@ -133,7 +133,9 @@ pub const CATALOGUE: &[Rule] = &[
         category: "link",
         severity: Severity::Critical,
         // The root cause of nearly everything else, so it suppresses widely.
-        trigger: "arp or icmp to the default gateway fails",
+        // A quiet router alone is not enough: a failed internet probe has to
+        // corroborate it, and no ARP probe exists to consult.
+        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed",
         suppresses: &[
             "dns.slow_resolver",
             "dns.failing",
@@ -165,7 +167,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "link down",
         category: "link",
         severity: Severity::Critical,
-        trigger: "interface carrier lost",
+        // Each OS reports "up" differently, and macOS reports the admin flag
+        // rather than carrier. A09 moves macOS to the `status:` line and
+        // rewrites that clause.
+        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says \"Media disconnected\"",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
         evidence: &[],

@@ -32,7 +32,7 @@ dns answers disagree · severity High
 
 gateway unreachable · severity Critical
 
-**Fires when:** arp or icmp to the default gateway fails
+**Fires when:** icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed
 
 **Evidence required:**
 
@@ -184,7 +184,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 | `dns.slow_resolver` | dns | resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline | active |
 | `dns.failing` | dns | servfail/timeout rate > 5%, or the pipeline dns stage fails | active |
 | `dns.truncation_retry` | dns | more than 10% of probe replies carry the TC bit | active |
-| `link.down` | link | interface carrier lost | active |
+| `link.down` | link | the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says "Media disconnected" | active |
 | `gateway.rtt_spike` | link | gateway rtt > 3σ above baseline for 3 samples | active |
 | `iface.errors` | link | rx/tx error, drop, overrun or fifo counters increment | active |
 | `iface.saturated` | link | throughput above 90% of link rate for 30s | active |
