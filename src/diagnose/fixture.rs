@@ -378,6 +378,12 @@ pub fn episode() -> crate::diagnose::episode::Episode {
     ep
 }
 
+/// The synthetic corpus episode `id`, rebuilt. `None` for an id no scenario
+/// here builds; `diagnose corpus` refuses a manifest row naming one.
+pub fn synthetic(id: &str) -> Option<crate::diagnose::episode::Episode> {
+    (id == "fixture-scenario").then(episode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

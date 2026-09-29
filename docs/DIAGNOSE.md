@@ -332,13 +332,20 @@ document cannot drift from the rules again.
 
 ## Pinned replay corpus
 
-`tests/diagnose/corpus/` holds a recorded episode and the decisions it must
-keep producing — which issues open, when, and what each is blamed on. The
-replay test compares against that file rather than against the recording it
-just made, so a change that moves both sides still shows up.
+`tests/diagnose/corpus/` holds recorded episodes and the decisions each must
+keep producing: which issues open, when, what each is blamed on, and why each
+left the list (`close_reason`: auto-closed, resolved, muted or suppressed).
+The replay test compares against those files rather than against a recording
+it just made, so a change that moves both sides still shows up.
+
+`manifest.toml` lists every episode, and the test checks each row by name. A
+`synthetic` row is built by a scenario in `src/diagnose/fixture.rs` and must
+also replay to its own recording; a `lab` row keeps the frames the health lab
+recorded, and only its decisions are derived again.
 
 ```sh
-netwatch diagnose corpus      # regenerate after an intended semantic change
+netwatch diagnose corpus              # regenerate after an intended semantic change
+netwatch diagnose corpus --only ID    # one manifest row
 ```
 
 A diff there is a change in what netwatch concludes, and belongs in the same

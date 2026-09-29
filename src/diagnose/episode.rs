@@ -938,6 +938,25 @@ pub struct IssueSpan {
     pub opened: String,
     pub closed: Option<String>,
     pub top_cause: Option<String>,
+    /// Why the issue left the primary list: `"suppressed"` when it is still
+    /// open under another issue, otherwise its state label (`"auto-closed"`,
+    /// `"resolved"`, `"muted"`), or `"pruned"` when the engine's history
+    /// limit dropped it on the same tick. Without it an expiry, a
+    /// suppression and a verified fix pin the same way. `None` while open,
+    /// and in decisions pinned before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+}
+
+/// Why `key`, primary on the previous frame, is not primary now.
+fn close_reason(engine: &Engine, key: &str) -> String {
+    match engine.get_by_key(key) {
+        Some(issue) if issue.state.is_open() && issue.suppressed_by.is_some() => {
+            "suppressed".into()
+        }
+        Some(issue) => issue.state.label().into(),
+        None => "pruned".into(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -994,6 +1013,7 @@ pub fn replay(episode: &Episode) -> ReplayReport {
                     opened: frame.ts.clone(),
                     closed: None,
                     top_cause: o.top_cause.clone(),
+                    close_reason: None,
                 });
             }
             if let Some(span) = spans
@@ -1011,6 +1031,7 @@ pub fn replay(episode: &Episode) -> ReplayReport {
                 .find(|s| &s.key == key && s.closed.is_none())
             {
                 span.closed = Some(frame.ts.clone());
+                span.close_reason = Some(close_reason(step.engine, key));
             }
         }
         was_open = now_open;
@@ -1113,31 +1134,135 @@ impl CanonicalDecisions {
     }
 }
 
-/// Write the pinned corpus: the deterministic fixture episode and the
-/// decisions it must keep producing.
-pub fn write_corpus(dir: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(dir)?;
-    let mut written = vec![];
-    let episode = super::fixture::episode();
-    let (decisions, report) = CanonicalDecisions::of(&episode);
-    anyhow::ensure!(
-        report.matches(),
-        "the fixture episode does not replay to its own recording; \
-         fix that before pinning it"
-    );
-    // Gzipped, like a real recording: the scenario is 440 frames and 2MB of
-    // pretty JSON, which is not something to put in a diff.
-    let ep_path = dir.join(format!("{}.json.gz", episode.id));
-    {
-        let file = std::fs::File::create(&ep_path)?;
-        let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::best());
-        serde_json::to_writer(&mut gz, &episode)?;
-        gz.finish()?.flush()?;
+/// The pinned corpus, relative to the crate root.
+pub const CORPUS_DIR: &str = "tests/diagnose/corpus";
+/// The file in the corpus directory that lists its episodes.
+pub const MANIFEST: &str = "manifest.toml";
+
+/// Where a corpus episode's frames come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorpusKind {
+    /// Built by a scenario in [`super::fixture`]. `diagnose corpus` rebuilds
+    /// its frames, so they must replay to themselves.
+    Synthetic,
+    /// Recorded by the health lab through the real `App::tick`. Its frames
+    /// are kept as recorded and only its decisions are derived again. It is
+    /// not held to replaying its recording frame for frame: an issue already
+    /// open when a live recording began shows as a divergence.
+    Lab,
+}
+
+/// One row of the corpus manifest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpusEntry {
+    /// Names `<id>.json.gz` and `<id>.decisions.json` beside the manifest.
+    pub id: String,
+    pub kind: CorpusKind,
+    /// Rule ids the episode is there to pin.
+    pub rules: Vec<String>,
+    pub note: String,
+}
+
+impl CorpusEntry {
+    pub fn episode_path(&self, dir: &Path) -> PathBuf {
+        dir.join(format!("{}.json.gz", self.id))
     }
-    written.push(ep_path);
-    let dec_path = dir.join(format!("{}.decisions.json", episode.id));
-    std::fs::write(&dec_path, serde_json::to_string_pretty(&decisions)?)?;
-    written.push(dec_path);
+
+    pub fn decisions_path(&self, dir: &Path) -> PathBuf {
+        dir.join(format!("{}.decisions.json", self.id))
+    }
+}
+
+/// `tests/diagnose/corpus/manifest.toml`: every pinned episode, one
+/// `[[episode]]` table each. The replay test iterates it, so an episode
+/// is tested because it is listed, not because a test names its file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    #[serde(default, rename = "episode")]
+    pub entries: Vec<CorpusEntry>,
+}
+
+impl Manifest {
+    pub fn load(dir: &Path) -> anyhow::Result<Self> {
+        let path = dir.join(MANIFEST);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let manifest: Self =
+            toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let mut seen = HashSet::new();
+        for entry in &manifest.entries {
+            anyhow::ensure!(
+                seen.insert(entry.id.as_str()),
+                "{}: {} is listed twice",
+                path.display(),
+                entry.id
+            );
+            for rule in &entry.rules {
+                anyhow::ensure!(
+                    super::rules::lookup(rule).is_some(),
+                    "{}: {} names {rule}, which is not in the catalogue",
+                    path.display(),
+                    entry.id
+                );
+            }
+        }
+        Ok(manifest)
+    }
+}
+
+/// Write the pinned corpus from its manifest, or only the entry `only`.
+///
+/// A synthetic entry is rebuilt from its scenario and written with its
+/// decisions. A lab entry keeps the frames it was recorded with, and only its
+/// decisions are derived again by the engine as it is now.
+pub fn write_corpus(dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
+    let manifest = Manifest::load(dir)?;
+    if let Some(id) = only {
+        anyhow::ensure!(
+            manifest.entries.iter().any(|e| e.id == id),
+            "{id} is not in {}",
+            dir.join(MANIFEST).display()
+        );
+    }
+    let mut written = vec![];
+    for entry in &manifest.entries {
+        if only.is_some_and(|id| id != entry.id) {
+            continue;
+        }
+        let episode = match entry.kind {
+            CorpusKind::Synthetic => super::fixture::synthetic(&entry.id).ok_or_else(|| {
+                anyhow::anyhow!("{}: no scenario in fixture.rs builds it", entry.id)
+            })?,
+            CorpusKind::Lab => load(&entry.episode_path(dir))
+                .map_err(|e| anyhow::anyhow!("{}: {e}", entry.episode_path(dir).display()))?,
+        };
+        let (decisions, report) = CanonicalDecisions::of(&episode);
+        if entry.kind == CorpusKind::Synthetic {
+            anyhow::ensure!(
+                report.matches(),
+                "{}: the episode does not replay to its own recording; \
+                 fix that before pinning it",
+                entry.id
+            );
+            // Gzipped, like a real recording: the fixture scenario is 440
+            // frames and 2MB of pretty JSON, which is not something to put
+            // in a diff.
+            let ep_path = entry.episode_path(dir);
+            {
+                let file = std::fs::File::create(&ep_path)?;
+                let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::best());
+                serde_json::to_writer(&mut gz, &episode)?;
+                gz.finish()?.flush()?;
+            }
+            written.push(ep_path);
+        }
+        let dec_path = entry.decisions_path(dir);
+        std::fs::write(&dec_path, serde_json::to_string_pretty(&decisions)?)?;
+        written.push(dec_path);
+    }
     Ok(written)
 }
 
@@ -1148,11 +1273,24 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         Some("coverage") => super::coverage::command(&args[1..]),
         Some("run") => super::run::command(&args[1..]),
         Some("corpus") => {
-            let dir = args
-                .get(1)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("tests/diagnose/corpus"));
-            for path in write_corpus(&dir)? {
+            let mut only = None;
+            let mut dir = None;
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--only" => {
+                        only = Some(
+                            rest.next()
+                                .ok_or_else(|| anyhow::anyhow!("--only needs an entry id"))?,
+                        )
+                    }
+                    flag if flag.starts_with("--") => anyhow::bail!("unknown option {flag}"),
+                    _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
+                    _ => anyhow::bail!("usage: netwatch diagnose corpus [--only ID] [DIR]"),
+                }
+            }
+            let dir = dir.unwrap_or_else(|| PathBuf::from(CORPUS_DIR));
+            for path in write_corpus(&dir, only.map(String::as_str))? {
                 println!("wrote {}", path.display());
             }
             Ok(())
@@ -1256,9 +1394,11 @@ fn render_report(report: &ReplayReport, path: &Path) -> String {
             "  {}  opened {}  {}  cause {}\n",
             span.key,
             span.opened,
-            span.closed
-                .as_deref()
-                .map_or("still open".to_string(), |c| format!("closed {c}")),
+            match (&span.closed, &span.close_reason) {
+                (Some(c), Some(reason)) => format!("closed {c} ({reason})"),
+                (Some(c), None) => format!("closed {c}"),
+                (None, _) => "still open".to_string(),
+            },
             span.top_cause.as_deref().unwrap_or("none")
         ));
     }
@@ -1330,23 +1470,37 @@ mod tests {
         }
 
         fn tick(&mut self, rtt: f64, step: f64) {
-            let now = self.base + Duration::from_secs_f64(self.at - T0);
-            let mut times = ObservationTimes::default();
-            times.health.gateway = now.checked_sub(Duration::from_secs(1));
-            times.health.gateway_target = Some(GW.into());
-            let obs = Observations {
-                now: super::super::engine::format_ts(self.clock.now()),
-                gateway: Some(GatewayObs {
+            self.tick_with(
+                GatewayObs {
                     addr: Some(GW.into()),
                     rtt_ms: Some(rtt),
                     loss_pct: 0.0,
                     arp_ok: Some(true),
                     icmp_ok: true,
                     internet_reachable: Some(true),
-                }),
+                },
+                step,
+            );
+        }
+
+        fn tick_with(&mut self, gateway: GatewayObs, step: f64) {
+            let now = self.base + Duration::from_secs_f64(self.at - T0);
+            let mut times = ObservationTimes::default();
+            times.health.gateway = now.checked_sub(Duration::from_secs(1));
+            // The internet probe completes with the gateway's; without it
+            // gateway.unreachable has no corroboration and cannot open.
+            times.health.internet = times.health.gateway;
+            times.health.gateway_target = Some(GW.into());
+            let readings: Vec<Reading> = gateway
+                .rtt_ms
+                .map(|rtt| Reading::new(GW, "gateway.rtt", rtt, self.at - 1.0))
+                .into_iter()
+                .collect();
+            let obs = Observations {
+                now: super::super::engine::format_ts(self.clock.now()),
+                gateway: Some(gateway),
                 ..Default::default()
             };
-            let readings = vec![Reading::new(GW, "gateway.rtt", rtt, self.at - 1.0)];
             let events = self.engine.take_events();
             self.engine.observe_live_at(&obs, &self.store, &times, now);
             let ts = super::super::engine::format_ts(self.clock.now());
@@ -1427,38 +1581,211 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_pinned_corpus_replays_to_its_recorded_decisions() {
-        // Until now the replay tests recorded in memory and replayed the
-        // result against itself, which cannot catch a change that alters both
-        // sides. This pins a committed episode and the decisions it must keep
-        // producing: which issues open, when, and what each is blamed on.
-        //
-        // A semantic fix that changes them is expected to change this file,
-        // reviewed in the same diff. Regenerate with:
-        //   cargo run -- diagnose corpus
-        let dir = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/diagnose/corpus"
-        ));
-        let episode = load(&dir.join("fixture-scenario.json.gz")).expect("corpus episode");
-        let pinned: CanonicalDecisions = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("fixture-scenario.decisions.json"))
-                .expect("corpus decisions"),
-        )
-        .expect("decisions parse");
-
+    /// One manifest entry against the engine as it is now. `Err` names the
+    /// entry, so a failure says which episode moved.
+    fn check_entry(dir: &Path, entry: &CorpusEntry) -> Result<(), String> {
+        let fail = |what: String| format!("{}: {what}", entry.id);
+        let ep_path = entry.episode_path(dir);
+        let episode = load(&ep_path).map_err(|e| fail(format!("{}: {e}", ep_path.display())))?;
+        let dec_path = entry.decisions_path(dir);
+        let pinned: CanonicalDecisions = std::fs::read_to_string(&dec_path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .map_err(|e| fail(format!("{}: {e}", dec_path.display())))?;
         let (decisions, report) = CanonicalDecisions::of(&episode);
+        if entry.kind == CorpusKind::Synthetic {
+            if let Some(d) = report.divergences.first() {
+                return Err(fail(format!(
+                    "replay diverged from the recording at frame {} ({})",
+                    d.frame, d.ts
+                )));
+            }
+        }
+        if decisions != pinned {
+            return Err(fail(format!(
+                "the engine now reaches different decisions; if that is intended, \
+                 run `cargo run -- diagnose corpus --only {}` and review the diff\n  \
+                 pinned:   {:?}\n  replayed: {:?}",
+                entry.id, pinned.issues, decisions.issues
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_corpus_entry_replays_to_its_pinned_decisions() {
+        // A replay compared against a recording made in the same test cannot
+        // catch a change that alters both sides. These are committed
+        // episodes and the decisions each must keep producing: which issues
+        // open, when, what each is blamed on and why it ended.
+        //
+        // A semantic fix that changes them is expected to change these
+        // files, reviewed in the same diff. Regenerate with:
+        //   cargo run -- diagnose corpus [--only ID]
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_DIR);
+        let manifest = Manifest::load(&dir).expect("corpus manifest");
+        assert!(!manifest.entries.is_empty());
+        let failures: Vec<String> = manifest
+            .entries
+            .iter()
+            .filter_map(|entry| check_entry(&dir, entry).err())
+            .collect();
         assert!(
-            report.matches(),
-            "replay diverged from the recording: {:?}",
-            report.divergences.first()
+            failures.is_empty(),
+            "{} of {} corpus entries failed:\n{}",
+            failures.len(),
+            manifest.entries.len(),
+            failures.join("\n")
+        );
+        // An episode no row lists would never be checked.
+        let unlisted: Vec<PathBuf> = list(&dir)
+            .into_iter()
+            .filter(|p| !manifest.entries.iter().any(|e| &e.episode_path(&dir) == p))
+            .collect();
+        assert!(unlisted.is_empty(), "not in {MANIFEST}: {unlisted:?}");
+    }
+
+    fn scratch_corpus(name: &str, manifest: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nw-corpus-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MANIFEST), manifest).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_manifest_entry_without_files_fails() {
+        let dir = scratch_corpus(
+            "missing",
+            "[[episode]]\nid = \"nowhere\"\nkind = \"synthetic\"\nrules = []\nnote = \"\"\n",
+        );
+        let manifest = Manifest::load(&dir).unwrap();
+        let err = check_entry(&dir, &manifest.entries[0]).unwrap_err();
+        assert!(err.starts_with("nowhere: "), "{err}");
+        // Nor can one be pinned: no scenario builds it.
+        let err = write_corpus(&dir, None).unwrap_err().to_string();
+        assert!(err.starts_with("nowhere: "), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_row_naming_an_unknown_rule_is_refused() {
+        let dir = scratch_corpus(
+            "typo",
+            "[[episode]]\nid = \"a\"\nkind = \"lab\"\nrules = [\"gateway.unreachabel\"]\nnote = \"\"\n",
+        );
+        let err = Manifest::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("gateway.unreachabel"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lab_entry_keeps_its_frames_and_rederives_decisions() {
+        let dir = scratch_corpus(
+            "lab",
+            "[[episode]]\nid = \"lab-gateway\"\nkind = \"lab\"\n\
+             rules = [\"gateway.rtt_spike\"]\nnote = \"\"\n",
+        );
+        let mut episode = incident().finished.remove(0);
+        // A live recording can disagree with its replay on a frame, e.g. an
+        // issue already open when recording began. Only the decisions, which
+        // replay derives, are pinned for a lab row.
+        let open_at = episode
+            .frames
+            .iter()
+            .position(|f| !f.open.is_empty())
+            .unwrap();
+        episode.frames[open_at].open.clear();
+        let ep_path = dir.join("lab-gateway.json.gz");
+        {
+            let file = std::fs::File::create(&ep_path).unwrap();
+            let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            serde_json::to_writer(&mut gz, &episode).unwrap();
+            gz.finish().unwrap();
+        }
+        let recorded = std::fs::read(&ep_path).unwrap();
+
+        assert!(write_corpus(&dir, Some("elsewhere")).is_err());
+        let written = write_corpus(&dir, Some("lab-gateway")).unwrap();
+        assert_eq!(written, vec![dir.join("lab-gateway.decisions.json")]);
+        assert_eq!(std::fs::read(&ep_path).unwrap(), recorded);
+        let mut entry = Manifest::load(&dir).unwrap().entries.remove(0);
+        check_entry(&dir, &entry).unwrap();
+        // The same files as a synthetic row fail: those must replay exactly.
+        entry.kind = CorpusKind::Synthetic;
+        let err = check_entry(&dir, &entry).unwrap_err();
+        assert!(err.contains(&format!("frame {open_at}")), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn close_reason_distinguishes_suppression_from_close() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 120.0, 5.0);
+        // Then the gateway stops answering at all, which explains the slow
+        // replies: the rtt spike stays open, but under the outage.
+        for _ in 0..24 {
+            s.tick_with(
+                GatewayObs {
+                    addr: Some(GW.into()),
+                    rtt_ms: None,
+                    loss_pct: 100.0,
+                    arp_ok: Some(false),
+                    icmp_ok: false,
+                    internet_reachable: Some(false),
+                },
+                5.0,
+            );
+        }
+        s.run(healthy, 1_800.0, 5.0);
+
+        let report = replay(&s.finished[0]);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        let reasons = |key: &str| -> Vec<Option<&str>> {
+            report
+                .issues
+                .iter()
+                .filter(|span| span.key == key)
+                .map(|span| span.close_reason.as_deref())
+                .collect()
+        };
+        // Under the outage the spike leaves the list without closing, comes
+        // back when the outage verifies closed, then verifies closed itself.
+        assert_eq!(
+            reasons("gateway.rtt_spike|host"),
+            vec![Some("suppressed"), Some("auto-closed")],
+            "{:#?}",
+            report.issues
         );
         assert_eq!(
-            decisions, pinned,
-            "the engine now reaches different decisions on the pinned episode; \
-             if that is intended, regenerate the corpus and review the diff"
+            reasons("gateway.unreachable|host"),
+            vec![Some("auto-closed")],
+            "{:#?}",
+            report.issues
         );
+        let (decisions, _) = CanonicalDecisions::of(&s.finished[0]);
+        let json = serde_json::to_string(&decisions).unwrap();
+        assert!(json.contains("\"close_reason\":\"suppressed\""), "{json}");
+    }
+
+    #[test]
+    fn a_span_pinned_before_close_reason_still_parses() {
+        let span: IssueSpan = serde_json::from_str(
+            r#"{"key": "gateway.rtt_spike|host", "opened": "2026-09-14 09:15:00",
+                "closed": "2026-09-14 09:27:00", "top_cause": null}"#,
+        )
+        .unwrap();
+        assert_eq!(span.closed.as_deref(), Some("2026-09-14 09:27:00"));
+        assert_eq!(span.close_reason, None);
+        // And an open span still writes no close_reason at all.
+        let open = IssueSpan {
+            closed: None,
+            ..span
+        };
+        assert!(!serde_json::to_string(&open)
+            .unwrap()
+            .contains("close_reason"));
     }
 
     #[test]
@@ -1495,6 +1822,8 @@ mod tests {
         // Muting really changed what was open, so replay had to apply it.
         let muted_frames = ep.frames.iter().filter(|f| f.open.is_empty()).count();
         assert!(muted_frames > 0);
+        // And the span the mute ended says so, rather than looking fixed.
+        assert_eq!(report.issues[0].close_reason.as_deref(), Some("muted"));
     }
 
     #[test]
