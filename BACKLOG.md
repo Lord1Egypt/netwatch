@@ -12,7 +12,7 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 
 ## 0.34
 
-- [ ] P08 diagnose/034-controller (X01)
+- [x] P08 diagnose/034-controller (X01)
 - [ ] P09 diagnose/034-thresholds-config (B01)
 - [ ] P10 diagnose/034-observation-kind (B05)
 - [ ] P11 diagnose/034-corpus-manifest (C02, C08)
