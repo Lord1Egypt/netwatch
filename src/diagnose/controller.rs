@@ -916,15 +916,26 @@ mod tests {
     /// config said, so no threshold a user could set reached a detector.
     #[test]
     fn the_engine_starts_with_configured_thresholds() {
-        let config: NetwatchConfig =
-            toml::from_str("[diagnose_thresholds]\ndns_ceiling_ms = 30\nsigma_k = 0\n").unwrap();
+        let config: NetwatchConfig = toml::from_str(
+            "[diagnose_thresholds]\ndns_ceiling_ms = 30\nsigma_k = 0\nsocket_rtt_ms = inf\n",
+        )
+        .unwrap();
         let mut app = App::prepare_with_config(config);
-        let t = app.diagnose.engine.settings().thresholds;
+        let settings = *app.diagnose.engine.settings();
+        let t = settings.thresholds;
         assert_eq!(t.dns_ceiling_ms, 30.0);
         assert_eq!(
             t.sigma_k,
             Thresholds::default().sigma_k,
             "an invalid σ multiple falls back to the default"
+        );
+        assert_eq!(t.socket_rtt_ms, Thresholds::default().socket_rtt_ms);
+        // Every episode embeds these settings, and JSON writes infinity as
+        // null, which would not load again.
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::diagnose::engine::Settings>(&json).unwrap(),
+            settings
         );
         assert!(a_40ms_resolver_opens_an_issue(&mut app));
 

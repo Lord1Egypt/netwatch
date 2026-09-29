@@ -143,9 +143,9 @@ wifi_retry_pct = 20.0
 ```
 
 A value that cannot mean anything (a σ multiple of 0 or less, `consecutive_n =
-0`, a percentage outside 0–100, `nan`) is replaced by its default and logged;
-`diagnose run` also prints it to stderr. The table is read at startup, and
-coverage's **r** reload leaves it alone: each recorded episode keeps the
+0`, a percentage outside 0–100, `nan` or `inf`) is replaced by its default and
+logged; `diagnose run` also prints it to stderr. The table is read at startup,
+and coverage's **r** reload leaves it alone: each recorded episode keeps the
 thresholds it ran with, so a replay judges it by the same numbers.
 `--generate-config` and the Settings editor's save write the table only once it
 differs from the defaults. Then they write every key, and a key in the file

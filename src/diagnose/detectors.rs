@@ -93,14 +93,19 @@ impl Thresholds {
     ///
     /// They come from a hand-edited file, and a typo there should cost one
     /// setting, not the tab: a σ multiple of 0 calls every sample a
-    /// deviation, and a share above 100% can never be reached. NaN is
-    /// refused everywhere, because every comparison with it is false and the
-    /// rule it feeds would never fire.
+    /// deviation, and a share above 100% can never be reached. NaN and
+    /// infinity are refused everywhere: every comparison with NaN is false,
+    /// so the rule it feeds would never fire, and every episode embeds these
+    /// values, where JSON writes either as `null` and the episode no longer
+    /// loads.
     pub fn validated(self) -> (Self, Vec<String>) {
         type Rule = (fn(f64) -> bool, &'static str);
-        let above_zero: Rule = (|v| v > 0.0, "must be above 0");
+        let above_zero: Rule = (
+            |v| v > 0.0 && v.is_finite(),
+            "must be a finite number above 0",
+        );
         let share: Rule = (|v| (0.0..=100.0).contains(&v), "must be within 0..=100");
-        let number: Rule = (|v| !v.is_nan(), "must be a number");
+        let number: Rule = (|v| v.is_finite(), "must be a finite number");
 
         let mut t = self;
         let mut warnings = Vec::new();
@@ -3510,6 +3515,10 @@ mod tests {
             saturation_pct: 150.0,
             dns_tc_pct: -1.0,
             dns_ceiling_ms: f64::NAN,
+            // TOML reads `inf`, a natural way to switch a rule off, but an
+            // episode that embeds it would not load again.
+            loaded_rtt_delta_ms: f64::INFINITY,
+            iface_drop_floor: f64::NEG_INFINITY,
             // Valid values that are not the defaults are kept, the edges
             // of a share included.
             dns_mismatch_pct: 100.0,
@@ -3532,12 +3541,25 @@ mod tests {
         assert_eq!(
             warnings,
             [
-                "diagnose_thresholds.sigma_k = 0 must be above 0, so the default 3 is used",
-                "diagnose_thresholds.dns_ceiling_ms = NaN must be a number, so the default 100 is used",
+                "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
+                "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
+                "diagnose_thresholds.loaded_rtt_delta_ms = inf must be a finite number, so the default 100 is used",
                 "diagnose_thresholds.saturation_pct = 150 must be within 0..=100, so the default 90 is used",
+                "diagnose_thresholds.iface_drop_floor = -inf must be a finite number, so the default 60 is used",
                 "diagnose_thresholds.dns_tc_pct = -1 must be within 0..=100, so the default 10 is used",
                 "diagnose_thresholds.consecutive_n = 0 must be at least 1, so the default 3 is used",
             ]
+        );
+
+        let (t, warnings) = Thresholds {
+            sigma_k: f64::INFINITY,
+            ..default
+        }
+        .validated();
+        assert_eq!(t, default);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_k = inf must be a finite number above 0, so the default 3 is used"]
         );
     }
 
