@@ -125,10 +125,14 @@ that explain one of them, such as a gateway failure that hides the target's
 own, and the host, interface and resolver issues that could lie on the
 target's route. An issue that names an interface or resolver the target's
 lookup did not use is left out, and so is a resolver issue when the target is
-an address. A target on a loopback address keeps none of them. A failure of the service itself, such as a refused port or an HTTP
-503, is reported as a medium issue and exits 1. The Diagnose tab lists it as
-an info observation marked "service, not network", because the network is not
-at fault; the run was asked whether the target works.
+an address. A target on a loopback address keeps only an issue that hides one
+of its own findings. Nothing lies on a target's route until a probe of it
+arrives, so a target that is disabled, or not probed inside the budget, exits
+with status 2 whatever else is open. A failure of the service itself, such as
+a refused port, an HTTP 503 or a name that does not exist, is reported as a
+medium issue and exits 1. The Diagnose tab lists it as an info observation
+marked "service, not network", because the network is not at fault; the run
+was asked whether the target works.
 
 Budgets accept `30s`, `2m` or a bare number of seconds, between 5s and 10m.
 JSON output carries the ruleset size, the sampling window, the coverage object
