@@ -142,6 +142,16 @@ pub fn parse_budget(raw: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Print to stderr what the engine will log about invalid
+/// `[diagnose_thresholds]`. It replaces them with defaults and logs each one,
+/// but the `diagnose` subcommands run before the log file opens, so the log
+/// line goes nowhere and stderr is where their caller looks.
+pub(crate) fn print_threshold_warnings(thresholds: &crate::diagnose::detectors::Thresholds) {
+    for warning in thresholds.validated().1 {
+        eprintln!("warning: {warning}");
+    }
+}
+
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     // Exit codes are the interface here, so the error path owns its own
     // status rather than inheriting whatever main does with an `Err`.
@@ -163,11 +173,7 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()
     };
-    // The engine replaces these with defaults and logs them, but a
-    // subcommand has no log file open, so say so where the caller looks.
-    for warning in config.diagnose_thresholds.validated().1 {
-        eprintln!("warning: {warning}");
-    }
+    print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(name) = &opts.target {
         anyhow::ensure!(
             config.diagnose_targets.iter().any(|t| &t.name == name),
