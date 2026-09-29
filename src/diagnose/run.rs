@@ -6,8 +6,10 @@
 //! and *not enough evidence*: a run that could not gather what it needed must
 //! never be read as a healthy host, which is why those are different exits.
 
+use crate::diagnose::coverage::Coverage;
 use crate::diagnose::detectors::Observations;
-use crate::diagnose::issue::{Availability, CheckResult, Issue};
+use crate::diagnose::issue::{Availability, CheckResult, Issue, Kind};
+use serde::Serialize;
 use std::time::{Duration, Instant};
 
 /// What a run concluded, and the exit status it reports.
@@ -16,10 +18,12 @@ use std::time::{Duration, Instant};
 /// the interface, not an implementation detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The run completed and found nothing. Not a claim that the host is
+    /// The run completed and found no Issue. Not a claim that the host is
     /// healthy — only that the rules that could be evaluated did not fire.
+    /// Observations may still be listed.
     NoFinding = 0,
-    /// The run completed and found at least one open issue.
+    /// The run completed and found at least one open Issue. An Observation,
+    /// such as a symmetric NAT, never sets this.
     Finding = 1,
     /// The budget ran out before enough evidence existed to decide. The
     /// caller should retry with a longer budget rather than read this as
@@ -42,11 +46,13 @@ impl Outcome {
 
 /// Decide the outcome of a finished run.
 ///
-/// `evidence` is whether the run ever saw a usable observation for what it
-/// was asked about. Without one there is nothing to conclude, however quiet
-/// the issue list looks.
-pub fn outcome(issues: &[&Issue], evidence: bool) -> Outcome {
-    if !issues.is_empty() {
+/// Only an Issue is a finding. An Observation says something worth knowing,
+/// not something wrong, so a host whose only finding is a symmetric NAT
+/// exits 0. `evidence` is whether the run ever saw a usable observation for
+/// what it was asked about. Without one there is nothing to conclude,
+/// however quiet the issue list looks.
+pub fn outcome(findings: &[&Issue], evidence: bool) -> Outcome {
+    if findings.iter().any(|f| f.kind() == Kind::Issue) {
         Outcome::Finding
     } else if evidence {
         Outcome::NoFinding
@@ -246,61 +252,133 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
     app.packet_collector.stop_capture();
 
     let all = app.diagnose.engine.primary();
-    let issues: Vec<&Issue> = match &opts.target {
+    let findings: Vec<&Issue> = match &opts.target {
         Some(name) => all
             .into_iter()
             .filter(|i| i.subject.label() == *name)
             .collect(),
         None => all,
     };
-    let outcome = outcome(&issues, saw_evidence);
+    let outcome = outcome(&findings, saw_evidence);
+    let sampling = Sampling {
+        target: opts.target,
+        started_at: started_at.to_rfc3339(),
+        seconds: started.elapsed().as_secs_f64(),
+        samples,
+        evidence: saw_evidence,
+    };
 
     if opts.json {
-        let report = serde_json::json!({
-            "schema": 1,
-            "version": env!("CARGO_PKG_VERSION"),
-            "ruleset": super::rules::CATALOGUE.len(),
-            "outcome": outcome.label(),
-            "exit": outcome as i32,
-            "target": opts.target,
-            "started_at": started_at.to_rfc3339(),
-            "window_seconds": started.elapsed().as_secs_f64(),
-            "samples": samples,
-            "evidence": saw_evidence,
-            "completeness": if saw_evidence {
-                "the rules that could be evaluated were; an empty list is not a health claim"
-            } else {
-                "no usable observation arrived inside the budget; nothing was concluded"
-            },
-            "coverage": app.diagnose.engine.coverage(),
-            "issues": issues,
-        });
+        let report = json_report(
+            outcome,
+            &sampling,
+            app.diagnose.engine.coverage(),
+            &findings,
+        );
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!(
-            "{} · {samples} samples in {:.0}s",
-            outcome.label(),
-            started.elapsed().as_secs_f64()
-        );
-        for issue in &issues {
-            println!("  {}", issue.summary_line());
-            if let Some(cause) = issue.top_cause() {
-                println!(
-                    "    {} ({}, {})",
-                    cause.label,
-                    cause.confidence().label(),
-                    cause.checks_label()
-                );
-                if let Some(missing) = cause.missing_discriminator() {
-                    println!("    {}", missing_line(missing));
-                }
-            }
-        }
-        if outcome == Outcome::Incomplete {
-            println!("  no usable observation arrived inside the budget");
-        }
+        print!("{}", text_report(outcome, &sampling, &findings));
     }
     Ok(outcome)
+}
+
+/// What a run sampled, apart from what it found.
+struct Sampling {
+    target: Option<String>,
+    started_at: String,
+    seconds: f64,
+    samples: usize,
+    evidence: bool,
+}
+
+/// One finding as schema 2 writes it: the issue, with its kind beside it.
+#[derive(Serialize)]
+struct Finding<'a> {
+    kind: Kind,
+    #[serde(flatten)]
+    issue: &'a Issue,
+}
+
+/// The JSON report, schema 2. Issues and Observations are separate arrays,
+/// each entry says which it is, and checks carry `state` without `passed`.
+/// Schema 1 listed both kinds under `issues`.
+fn json_report(
+    outcome: Outcome,
+    sampling: &Sampling,
+    coverage: &Coverage,
+    findings: &[&Issue],
+) -> serde_json::Value {
+    let of = |kind: Kind| -> Vec<Finding> {
+        findings
+            .iter()
+            .filter(|f| f.kind() == kind)
+            .map(|&issue| Finding { kind, issue })
+            .collect()
+    };
+    serde_json::json!({
+        "schema": 2,
+        "version": env!("CARGO_PKG_VERSION"),
+        "ruleset": super::rules::CATALOGUE.len(),
+        "outcome": outcome.label(),
+        "exit": outcome as i32,
+        "target": sampling.target,
+        "started_at": sampling.started_at,
+        "window_seconds": sampling.seconds,
+        "samples": sampling.samples,
+        "evidence": sampling.evidence,
+        "completeness": if sampling.evidence {
+            "the rules that could be evaluated were; an empty list is not a health claim"
+        } else {
+            "no usable observation arrived inside the budget; nothing was concluded"
+        },
+        "coverage": coverage,
+        "issues": of(Kind::Issue),
+        "observations": of(Kind::Observation),
+    })
+}
+
+/// The text report: the outcome, the Issues under it, then the Observations
+/// under their own heading, since they do not set the exit status.
+fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[&Issue]) -> String {
+    let mut out = format!(
+        "{} · {} samples in {:.0}s\n",
+        outcome.label(),
+        sampling.samples,
+        sampling.seconds
+    );
+    let (issues, observations): (Vec<&Issue>, Vec<&Issue>) =
+        findings.iter().partition(|f| f.kind() == Kind::Issue);
+    for issue in issues {
+        out.push_str(&finding_lines(issue));
+    }
+    if outcome == Outcome::Incomplete {
+        out.push_str("  no usable observation arrived inside the budget\n");
+    }
+    if !observations.is_empty() {
+        out.push_str("observations · not counted in the exit status\n");
+        for observation in observations {
+            out.push_str(&finding_lines(observation));
+        }
+    }
+    out
+}
+
+/// A finding's summary line, then its top cause and the check that cause is
+/// still missing.
+fn finding_lines(finding: &Issue) -> String {
+    let mut out = format!("  {}\n", finding.summary_line());
+    if let Some(cause) = finding.top_cause() {
+        out.push_str(&format!(
+            "    {} ({}, {})\n",
+            cause.label,
+            cause.confidence().label(),
+            cause.checks_label()
+        ));
+        if let Some(missing) = cause.missing_discriminator() {
+            out.push_str(&format!("    {}\n", missing_line(missing)));
+        }
+    }
+    out
 }
 
 /// The check a qualified cause is still missing, led by why it did not run
@@ -515,6 +593,151 @@ mod tests {
         assert_eq!(outcome(&[&issue], true), Outcome::Finding);
         assert_eq!(outcome(&[&issue], false), Outcome::Finding);
         assert_eq!(Outcome::Finding as i32, 1);
+    }
+
+    /// An engine that opens an issue on its first sample, after one sample
+    /// of `obs`.
+    fn engine_after(obs: &Observations) -> crate::diagnose::engine::Engine {
+        use crate::diagnose::engine::{Engine, FixedClock};
+        let engine = Engine::new(Box::new(FixedClock::at("2026-09-15 10:00:00")));
+        let mut settings = *engine.settings();
+        settings.thresholds.consecutive_n = 1;
+        let mut engine = engine.with_settings(settings);
+        engine.observe(obs, &crate::diagnose::fixture::baselines());
+        engine
+    }
+
+    /// A host whose only finding is a symmetric NAT: an Observation.
+    fn symmetric_nat() -> Issue {
+        use crate::diagnose::detectors::NatObs;
+        let engine = engine_after(&Observations {
+            nat: Some(NatObs {
+                mappings: vec![
+                    ("stun1".into(), "198.51.100.7:40001".into()),
+                    ("stun2".into(), "198.51.100.7:40517".into()),
+                ],
+                symmetric: true,
+            }),
+            ..Default::default()
+        });
+        let found = engine.primary();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].rule, "nat.symmetric");
+        assert_eq!(found[0].kind(), Kind::Observation);
+        found[0].clone()
+    }
+
+    fn sampling(evidence: bool) -> Sampling {
+        Sampling {
+            target: None,
+            started_at: "2026-09-15T10:00:00+00:00".into(),
+            seconds: 30.0,
+            samples: 30,
+            evidence,
+        }
+    }
+
+    /// D33-B06: the exit code counts Issues only. Schema 1 exited 1 on any
+    /// finding, Info included.
+    #[test]
+    fn observations_alone_exit_zero() {
+        let nat = symmetric_nat();
+        let outcome = outcome(&[&nat], true);
+        assert_eq!(outcome, Outcome::NoFinding);
+        assert_eq!(outcome as i32, 0);
+        // An Observation is no evidence either way: with nothing measured
+        // the run is still incomplete, not healthy.
+        assert_eq!(super::outcome(&[&nat], false), Outcome::Incomplete);
+
+        let json = json_report(outcome, &sampling(true), &Coverage::default(), &[&nat]);
+        assert_eq!(json["exit"], 0);
+        assert_eq!(json["issues"], serde_json::json!([]));
+        assert_eq!(json["observations"][0]["rule"], "nat.symmetric");
+        let text = text_report(outcome, &sampling(true), &[&nat]);
+        let (above, below) = text
+            .split_once("observations · not counted in the exit status\n")
+            .expect("observations have their own heading");
+        assert!(!above.contains("symmetric"), "{text}");
+        assert!(below.contains(&nat.summary_line()), "{text}");
+    }
+
+    #[test]
+    fn one_issue_exits_one() {
+        let nat = symmetric_nat();
+        let (engine, _) = crate::diagnose::fixture::run();
+        let issue = engine.primary_issues()[0];
+        assert_eq!(outcome(&[&nat, issue], true), Outcome::Finding);
+        assert_eq!(outcome(&[issue, &nat], false), Outcome::Finding);
+
+        let text = text_report(Outcome::Finding, &sampling(true), &[&nat, issue]);
+        let (above, below) = text
+            .split_once("observations · not counted in the exit status\n")
+            .expect("observations have their own heading");
+        assert!(above.starts_with("finding · 30 samples in 30s\n"), "{text}");
+        assert!(above.contains(&issue.summary_line()), "{text}");
+        assert!(below.contains(&nat.summary_line()), "{text}");
+    }
+
+    #[test]
+    fn json_separates_issues_from_observations() {
+        let nat = symmetric_nat();
+        let (engine, _) = crate::diagnose::fixture::run();
+        let mut findings = engine.primary();
+        let issues = findings.len();
+        findings.push(&nat);
+        let json = json_report(
+            outcome(&findings, true),
+            &sampling(true),
+            engine.coverage(),
+            &findings,
+        );
+        assert_eq!(json["schema"], 2);
+        assert_eq!(json["outcome"], "finding");
+        assert_eq!(json["exit"], 1);
+        let listed = |key: &str| json[key].as_array().unwrap().clone();
+        assert_eq!(listed("issues").len(), issues);
+        for entry in listed("issues") {
+            assert_eq!(entry["kind"], "issue", "{entry}");
+            assert_ne!(entry["severity"], "info", "{entry}");
+        }
+        let observations = listed("observations");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["kind"], "observation");
+        assert_eq!(observations[0]["rule"], "nat.symmetric");
+        // The finding's own `kind` sits beside the subject's, not over it.
+        assert_eq!(observations[0]["subject"]["kind"], "host");
+    }
+
+    #[test]
+    fn schema_2_checks_have_state_not_passed() {
+        let (engine, _) = crate::diagnose::fixture::run();
+        let findings = engine.primary();
+        let json = json_report(
+            outcome(&findings, true),
+            &sampling(true),
+            engine.coverage(),
+            &findings,
+        );
+        let mut states = std::collections::BTreeSet::new();
+        for entry in json["issues"].as_array().unwrap() {
+            for cause in entry["causes"].as_array().unwrap() {
+                for check in cause["checks"].as_array().unwrap() {
+                    assert!(check.get("passed").is_none(), "{check}");
+                    let state = check["state"].as_str().expect("every check has a state");
+                    assert_eq!(
+                        state == "not_run",
+                        check.get("why_not").is_some(),
+                        "{check}"
+                    );
+                    states.insert(state.to_string());
+                }
+            }
+        }
+        // The fixture exercises all three, so none is vacuous.
+        assert_eq!(
+            states.into_iter().collect::<Vec<_>>(),
+            ["failed", "not_run", "passed"]
+        );
     }
 
     #[test]

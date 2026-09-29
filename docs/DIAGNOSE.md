@@ -102,8 +102,8 @@ part of the interface:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | completed, no finding — the rules that could be evaluated did not fire |
-| 1 | completed, at least one open finding |
+| 0 | completed, no issue — the rules that could be evaluated did not fire |
+| 1 | completed, at least one open issue |
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
 
@@ -115,10 +115,20 @@ could send nothing, because ICMP is blocked and the gateway answers no TCP port,
 does not. With `--target`, only that target's own probes count: another target
 completing says nothing about this one.
 
+Only an issue sets exit 1. An observation, such as a symmetric NAT or a route
+change that added 20 ms or less, is reported but says nothing is wrong, so a
+host whose only finding is an observation exits 0. Text output lists
+observations under their own heading, after the issues.
+
 Budgets accept `30s`, `2m` or a bare number of seconds, between 5s and 10m.
 JSON output carries the ruleset size, the sampling window, the coverage object
-and the issues, so a support engineer can see what was evaluated rather than
-inferring it from an empty list.
+and the findings, so a support engineer can see what was evaluated rather than
+inferring it from an empty list. It is `"schema": 2`: `issues` holds issues
+only, `observations` holds the rest, and each finding carries a `kind` of
+`issue` or `observation`. Each check carries a `state` of `passed`, `failed`
+or `not_run`, and a `why_not` when it did not run. Schema 1 listed
+observations under `issues` and wrote `passed` (`true`, `false` or `null`) on
+each check; recordings that carry `passed` still load.
 
 ## Thresholds
 
