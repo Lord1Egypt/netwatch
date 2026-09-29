@@ -152,8 +152,12 @@ and a key left out keeps its default:
 ```toml
 [diagnose_thresholds]
 sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
+sigma_close_k = 2.0        # σ multiple an issue must fall below to close
 sigma_floor_ms = 0.5       # smallest σ a baseline is judged against
 sigma_floor_pct = 5.0      # or this percentage of the baseline's mean, if larger
+gateway_delta_floor_ms = 10.0  # ms the gateway must be slower than its mean, too
+dns_delta_floor_ms = 5.0   # ms a resolver must be slower than its mean, too
+dns_delta_multiple = 2.0   # and the multiple of its mean it must reach
 consecutive_n = 3          # samples a condition must show before an issue opens
 verdict_hold_secs = 30     # how long a socket verdict must persist
 dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or not
@@ -169,14 +173,15 @@ wifi_retry_pct = 20.0
 ```
 
 A value that cannot mean anything (a σ multiple of 0 or less, a negative σ
-floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or `inf`) is
-replaced by its default and logged; `diagnose run` and `diagnose coverage` also
-print it to stderr. The
+or delta floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or
+`inf`) is replaced by its default and logged; `diagnose run` and `diagnose
+coverage` also print it to stderr. So is a `sigma_close_k` at or above
+`sigma_k`: it becomes 2, or two thirds of a `sigma_k` of 2 or less. The
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
-threshold's default: one from before 0.34 is judged against the σ floor it ran
-without.
+threshold's default: one from before 0.34 is judged against the σ and delta
+floors and the 2σ close line it ran without.
 `--generate-config` and the Settings editor's save write the table only once it
 differs from the defaults. Then they write every key, and a key in the file
 keeps its value when a later release retunes that default.
@@ -187,10 +192,29 @@ rather than 1.35 ms, and a 40 ms resolver is judged against at least 2 ms. The
 Dashboard's latency tiles show the floored σ too. Setting both floors to 0
 judges the raw σ.
 
+Many σ can still be a move nobody feels, so two rules also need an absolute
+rise. `gateway.rtt_spike` needs the gateway 10 ms slower than its mean: a wired
+gateway moving from 2 to 9 ms is 14σ over the floor. `dns.slow_resolver` needs
+the resolver's median 5 ms slower than its mean and at least twice it before
+its baseline opens an issue: a LAN resolver moving from 1.2 to 2.7 ms is 3σ,
+and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from
+1 to 4 ms is never reported, on purpose. The 100 ms ceiling does not wait for
+a baseline. Setting these three to 0 judges by σ alone. The Dashboard's tiles
+do not apply them, so a move under these floors can turn one red with no issue
+raised.
+
+`gateway.rtt_spike`, `path.rtt_spike` and `target.slow_stage` open at 3σ and
+close only once the metric has stayed under 2σ for the verify hold. With one
+line for both, a gateway hovering at 3σ closed each time it dipped under for
+two minutes and reopened each time it rose. A noisy link now takes longer to
+close.
+
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
-above normal is left out, so an incident does not become the new normal. A low
-value leaves out ordinary peaks too, so the saved baselines settle lower and
-flag more, and they take time to relearn after the value is raised again.
+above normal is left out, so an incident does not become the new normal. A
+reading between `sigma_close_k` and `sigma_k` is learned, so an issue that
+settles there closes once its baseline has caught up with it. A low value
+leaves out ordinary peaks too, so the saved baselines settle lower and flag
+more, and they take time to relearn after the value is raised again.
 
 ## Diagnose coverage in terminal Netwatch
 

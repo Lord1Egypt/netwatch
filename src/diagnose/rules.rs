@@ -74,7 +74,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "slow dns resolver",
         category: "dns",
         severity: Severity::Medium,
-        trigger: "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
+        trigger: "resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples",
         suppresses: &[],
         status: RuleStatus::Active,
         evidence: &[],
@@ -184,7 +184,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "gateway slow to answer",
         category: "link",
         severity: Severity::Medium,
-        trigger: "gateway rtt > 3σ above baseline for 3 samples",
+        trigger: "gateway rtt > 3σ and at least 10ms above baseline for 3 samples",
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
         evidence: &[],
@@ -774,6 +774,9 @@ pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
 /// more specific one. Every active rule must have one — enforced by a test,
 /// because §4's rule is that a remediation without a testable success
 /// condition is an instruction, not something netwatch can claim to have fixed.
+///
+/// The three σ rules close at the default `sigma_close_k`, 2σ. This cannot
+/// read `Thresholds`, so their detectors put the configured value in its place.
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
         "dns.slow_resolver" => Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60),
@@ -781,14 +784,14 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
-        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 3.0, "σ").holding_for(120),
+        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 2.0, "σ").holding_for(120),
         "link.down" => Verify::above("iface.carrier", 0.0, "").holding_for(30),
         "iface.errors" => Verify::below("iface.error_rate", 1.0, "/min").holding_for(300),
         "iface.saturated" => Verify::below("iface.utilisation", 90.0, "%").holding_for(60),
         "wifi.weak_signal" => Verify::above("wifi.rssi", -70.0, "dBm").holding_for(120),
         "path.changed" => Verify::below("path.hop_changes", 1.0, "").holding_for(300),
         "path.high_loss" => Verify::below("path.hop_loss", 1.0, "%").holding_for(120),
-        "path.rtt_spike" => Verify::below("path.rtt_sigma", 3.0, "σ").holding_for(120),
+        "path.rtt_spike" => Verify::below("path.rtt_sigma", 2.0, "σ").holding_for(120),
         "tcp.bufferbloat_local" => {
             Verify::below("tcp.loaded_rtt_delta", 100.0, "ms").holding_for(60)
         }
@@ -807,7 +810,7 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "target.connect_failed" => Verify::above("target.connect_ok", 0.5, "").holding_for(120),
         "target.tls_failed" => Verify::above("target.tls_ok", 0.5, "").holding_for(120),
         "target.http_error" => Verify::above("target.http_ok", 0.5, "").holding_for(120),
-        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 3.0, "σ").holding_for(180),
+        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 2.0, "σ").holding_for(180),
         "egress.drift" => Verify::below("egress.new_destinations", 1.0, "").holding_for(300),
         "egress.policy_violation" => {
             Verify::below("egress.denied_flows", 1.0, "observed destinations").holding_for(300)
@@ -870,11 +873,6 @@ mod tests {
     /// skips them. The item rewrites the text and removes its row; a row
     /// whose text has already changed fails, so none outlives its reason.
     const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
-        (
-            "dns.slow_resolver",
-            "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
-            "B10: the ceiling applies with a baseline too",
-        ),
         (
             "dns.failing",
             "servfail/timeout rate > 5%, or the pipeline dns stage fails",
@@ -986,7 +984,20 @@ mod tests {
         // both 3) need the number twice.
         const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
             ("dns.truncation_retry", &["dns_tc_pct"]),
-            ("gateway.rtt_spike", &["sigma_k", "consecutive_n"]),
+            (
+                "dns.slow_resolver",
+                &[
+                    "sigma_k",
+                    "dns_delta_floor_ms",
+                    "dns_delta_multiple",
+                    "dns_ceiling_ms",
+                    "consecutive_n",
+                ],
+            ),
+            (
+                "gateway.rtt_spike",
+                &["sigma_k", "gateway_delta_floor_ms", "consecutive_n"],
+            ),
             ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
             ("tcp.bufferbloat_local", &["loaded_rtt_delta_ms"]),
             ("target.resolve_failed", &["consecutive_n"]),

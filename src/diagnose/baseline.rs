@@ -45,8 +45,10 @@ pub const MAX_STEP_SECS: f64 = 60.0;
 pub const NOMINAL_STEP_SECS: f64 = 5.0;
 
 /// A reading this many σ above a ready baseline is not learned. Matches the
-/// detectors' default `sigma_k`, so any sample that can hold an issue open is
-/// also one the baseline refuses to normalise.
+/// detectors' default `sigma_k`, so any sample that can open an issue is one
+/// the baseline refuses to normalise. A σ issue stays open down to
+/// `sigma_close_k`, and a reading between the two is learned: an issue that
+/// settles there is slowly absorbed and then closes.
 pub const DEFAULT_GATE_SIGMA: f64 = 3.0;
 
 /// How long a baseline may refuse readings before it concedes the network has
