@@ -19,7 +19,7 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [x] P12 diagnose/034-catalogue-texts (B33a)
 - [ ] P13 diagnose/034-exit-code (B06, B07)
 - [x] P14 diagnose/034-verify-and-config (B03, B04)
-- [ ] P15 diagnose/034-sigma-floor (B09)
+- [x] P15 diagnose/034-sigma-floor (B09)
 - [x] P16 diagnose/034-expired (B24)
 - [ ] P17 diagnose/034-delta-floor-deadband (B10, B11)
 - [ ] P18 diagnose/034-expiry-guard (B25)
