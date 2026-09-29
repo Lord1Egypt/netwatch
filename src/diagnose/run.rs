@@ -988,11 +988,9 @@ mod tests {
         assert_eq!(super::outcome(&findings, true) as i32, 0);
     }
 
-    /// REVIEW §2.1: the filter matched on the subject's label, so a gateway
-    /// failure that suppressed the target's own finding was dropped and the
-    /// run exited 0 with the target down.
-    #[test]
-    fn a_gateway_root_cause_survives_the_target_filter() {
+    /// One sample in which `api` times out on connect and the fixture's
+    /// gateway loses every probe. `edit` adjusts the target's probe first.
+    fn gateway_down(edit: impl FnOnce(&mut TargetObs)) -> Observations {
         use crate::diagnose::detectors::GatewayObs;
         use crate::diagnose::targets::{Stage, StageError};
         let mut target = probe(
@@ -1009,7 +1007,8 @@ mod tests {
         target.connect_v4 = target.connect.clone();
         target.tls_stage = None;
         target.http_stage = None;
-        let observations = Observations {
+        edit(&mut target);
+        Observations {
             iface: crate::diagnose::fixture::observations_at(0).iface,
             gateway: Some(GatewayObs {
                 addr: Some("192.168.8.1".into()),
@@ -1021,7 +1020,15 @@ mod tests {
             }),
             targets: vec![target],
             ..Default::default()
-        };
+        }
+    }
+
+    /// REVIEW §2.1: the filter matched on the subject's label, so a gateway
+    /// failure that suppressed the target's own finding was dropped and the
+    /// run exited 0 with the target down.
+    #[test]
+    fn a_gateway_root_cause_survives_the_target_filter() {
+        let observations = gateway_down(|_| {});
         let engine = engine_after(&observations);
         let tab = engine.primary();
         assert_eq!(tab.len(), 1, "{tab:?}");
@@ -1044,6 +1051,42 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule, "gateway.unreachable");
         assert_eq!(findings[0].consequences, vec![hidden.id.clone()]);
+        assert_eq!(outcome(&findings, true), Outcome::Finding);
+    }
+
+    /// P13 review: the gateway above lies on the target's route as well, so
+    /// that test passes without the consequence edge. A loopback target
+    /// takes no host-wide Issue, and only the edge keeps the gateway failure
+    /// the engine hid its finding under. Without it the run exited 0 with
+    /// the target down.
+    #[test]
+    fn a_root_that_hides_the_target_is_kept_off_its_route() {
+        let observations = gateway_down(|target| {
+            target.host = "127.0.0.1".into();
+            target.addresses = vec!["127.0.0.1".into()];
+            target.lookups.clear();
+        });
+        let engine = engine_after(&observations);
+        let tab = engine.primary();
+        assert_eq!(tab.len(), 1, "{tab:?}");
+        let gateway = tab[0];
+        assert_eq!(gateway.rule, "gateway.unreachable");
+        let hidden = engine
+            .issues()
+            .iter()
+            .find(|i| i.subject.label() == "api")
+            .expect("the target's own finding");
+        assert_eq!(hidden.suppressed_by.as_ref(), Some(&gateway.id));
+
+        let mut api = asked("name = \"api\"\nhost = \"127.0.0.1\"");
+        api.saw(&observations);
+        assert!(
+            !api.routes_through(gateway),
+            "nothing host-wide is on its route"
+        );
+        let findings = select(engine.issues(), Some(&api));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule, "gateway.unreachable");
         assert_eq!(outcome(&findings, true), Outcome::Finding);
     }
 
