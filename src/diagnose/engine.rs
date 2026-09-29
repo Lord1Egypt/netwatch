@@ -797,7 +797,12 @@ impl Engine {
     ) {
         let mut closed: Vec<IssueId> = Vec::new();
         let floor = self.settings.thresholds.sigma_floor();
-        let expire_after = Duration::seconds(self.settings.expire_after_secs as i64);
+        // A replayed episode's settings come from its file unchecked, and
+        // one too long for a Duration means never.
+        let expire_after = i64::try_from(self.settings.expire_after_secs)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .unwrap_or(Duration::MAX);
         for issue in self.issues.iter_mut() {
             if !issue.state.is_open() {
                 continue;
@@ -2502,6 +2507,40 @@ mod tests {
                 e.get(&id).unwrap().state,
                 expired(reason, "2026-09-03 06:49:11")
             );
+        }
+    }
+
+    #[test]
+    fn an_expiry_window_too_long_for_a_duration_never_expires() {
+        // A replayed episode's settings are whatever its file says. Cast
+        // straight to i64, u64::MAX was -1 s and expired on the first tick
+        // gone; 1e17 s panicked out of TimeDelta::seconds.
+        for secs in [u64::MAX, 100_000_000_000_000_000] {
+            let (e, clock) = engine_at("2026-09-03 06:48:10");
+            let settings = Settings {
+                expire_after_secs: secs,
+                ..*e.settings()
+            };
+            let mut e = e.with_settings(settings);
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![target_obs("target-config:aaaa", true)],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            let removed = Observations {
+                config: targets_config(&[]),
+                ..Default::default()
+            };
+            for _ in 0..60 {
+                clock.advance_secs(60);
+                e.observe(&removed, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{secs}");
         }
     }
 
