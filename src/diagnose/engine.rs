@@ -316,6 +316,12 @@ impl Engine {
         self.issues.iter().find(|i| i.id == id)
     }
 
+    /// The issue filed under `rule|subject`: the open one, or the last to
+    /// close. `None` once history pruning has dropped it.
+    pub fn get_by_key(&self, key: &str) -> Option<&Issue> {
+        self.by_key.get(key).and_then(|id| self.get(id))
+    }
+
     /// One tick. Detections are merged into the existing list, issues whose
     /// condition has cleared are moved toward auto-close, and the suppression
     /// graph is recomputed.
@@ -480,10 +486,7 @@ impl Engine {
     }
 
     fn is_open_key(&self, key: &str) -> bool {
-        self.by_key
-            .get(key)
-            .and_then(|id| self.issues.iter().find(|i| &i.id == id))
-            .is_some_and(|i| i.state.is_open())
+        self.get_by_key(key).is_some_and(|i| i.state.is_open())
     }
 
     /// Hysteresis for a condition that isn't open yet: it has to hold for

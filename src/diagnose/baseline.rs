@@ -18,7 +18,7 @@
 //! starts in `Learning` where no baseline rule can fire.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// EWMA time constant. Smoothing is defined in seconds, not samples: probes
@@ -577,8 +577,9 @@ pub struct BaselineSnapshot {
     pub min_observed_secs: f64,
     pub min_samples: u32,
     pub gate_sigma: f64,
-    /// Keyed as in `baselines.json`: `"subject\u{1f}metric"`.
-    pub metrics: HashMap<String, Baseline>,
+    /// Keyed as in `baselines.json`: `"subject\u{1f}metric"`. Ordered, so a
+    /// recorded episode serializes the same way on every run.
+    pub metrics: BTreeMap<String, Baseline>,
 }
 
 impl BaselineStore {
@@ -593,7 +594,7 @@ impl BaselineStore {
             metrics: self
                 .networks
                 .get(&self.current.key())
-                .map(|n| n.metrics.clone())
+                .map(|n| n.metrics.clone().into_iter().collect())
                 .unwrap_or_default(),
         }
     }
@@ -610,7 +611,7 @@ impl BaselineStore {
         self.networks.insert(
             snap.network.key(),
             NetworkBaselines {
-                metrics: snap.metrics.clone(),
+                metrics: snap.metrics.clone().into_iter().collect(),
                 label: snap.network.label(),
             },
         );

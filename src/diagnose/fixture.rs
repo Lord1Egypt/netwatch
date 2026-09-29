@@ -19,10 +19,21 @@
 //! * one LAN socket (`ncat` → 10.88.0.3:9000) shows receiver-side bufferbloat
 //!   at 184ms with 12 retransmits, since 06:49:31;
 //! * gateway, loss and throughput are nominal, and stay that way.
+//!
+//! The same machinery builds the replay corpus's synthetic episodes: a
+//! [`Scenario`] is a frame function and a collector [`Cadence`], and
+//! [`record`] runs it through the engine and the episode recorder. The demo
+//! incident is [`Scenario::incident`].
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
-use super::detectors::{DnsObs, GatewayObs, HopObs, IfaceObs, Observations, PathObs, SocketObs};
-use super::engine::{Clock, Engine, FixedClock};
+use super::detectors::{
+    DnsObs, GatewayObs, HopObs, IfaceObs, Observations, PathObs, SocketObs, Thresholds,
+};
+use super::engine::{format_ts, Clock, Engine, FixedClock, ObservationTimes, Settings};
+use super::episode::{EnvProfile, Episode, Recorder, Tick};
 use super::report::{Environment, Report, TimelineEvent};
 
 /// When the demo window ends. Every timestamp in the fixture is relative to
@@ -320,46 +331,172 @@ pub fn report() -> Report {
     }
 }
 
-/// A deterministic recorded episode of the scenario above.
-///
-/// The corpus DG08 pins replays this: same frames, same decisions, every
-/// time. Its id is fixed rather than a fresh uuid, so two runs produce
-/// byte-identical files and a diff means a decision changed.
-pub fn episode() -> crate::diagnose::episode::Episode {
-    use crate::diagnose::engine::{Clock, Engine, FixedClock, ObservationTimes};
-    use crate::diagnose::episode;
-    let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:44:00"));
-    let mut engine = Engine::new(Box::new(clock.clone()));
-    let mut base = baselines();
-    let mut rec = episode::Recorder::new(episode::EnvProfile::detect("root", 1000), 1.789e9);
-    rec.schedule_quiet_sample(f64::MAX);
-    let start = std::time::Instant::now() + std::time::Duration::from_secs(86_400);
-    for t in 0..=SCENARIO_SECS {
-        let mut obs = observations_at(t);
-        for s in &mut obs.sockets {
-            s.process = Some("firefox".into());
+// ------------------------------------------------------------------ scenarios
+
+/// Unix seconds of every scenario's first frame. Only differences between
+/// frame times are ever read, and a fixed origin keeps a recording
+/// independent of the timezone its `start` is read in.
+const SCENARIO_UNIX_START: f64 = 1.789e9;
+
+/// How often each collector completes, in seconds. Each frame is stamped
+/// with the last completion on that grid, as the live tick is: stamping
+/// every frame would count each second as a new sample. A collector left
+/// `None` never completes, and the engine drops its input as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cadence {
+    pub interface: Option<u64>,
+    pub sockets: Option<u64>,
+    /// The DNS, gateway and internet probes, which complete together.
+    pub health: Option<u64>,
+    pub path: Option<u64>,
+}
+
+impl Cadence {
+    /// The app's: interface and sockets every tick, the health prober every
+    /// 5 s, a trace every 30 s.
+    pub fn live() -> Self {
+        Self {
+            interface: Some(1),
+            sockets: Some(1),
+            health: Some(5),
+            path: Some(30),
         }
-        let now = start + std::time::Duration::from_secs(t);
+    }
+
+    /// The last completion on a `period`-second grid, `t` seconds in.
+    fn stamp(period: Option<u64>, start: Instant, t: u64) -> Option<Instant> {
+        let period = period?.max(1);
+        Some(start + Duration::from_secs(t - t % period))
+    }
+}
+
+/// The stretches of a scenario's story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Healthy,
+    Fault,
+    Clear,
+}
+
+/// The phase `t` falls in: the last one starting at or before it, so
+/// `phase(t, &[(0, Healthy), (120, Fault), (300, Clear)])` is a fault from
+/// 120 s to 299 s.
+pub fn phase(t: u64, phases: &[(u64, Phase)]) -> Phase {
+    phases
+        .iter()
+        .rev()
+        .find(|(from, _)| *from <= t)
+        .or(phases.first())
+        .map(|(_, p)| *p)
+        .expect("a scenario has at least one phase")
+}
+
+/// A synthetic episode: observations as a function of time, run through the
+/// real engine and the real recorder by [`record`]. Every `synthetic` row of
+/// the corpus manifest is one of [`scenarios`].
+#[derive(Debug, Clone, Copy)]
+pub struct Scenario {
+    /// The corpus id, which names its files.
+    pub id: &'static str,
+    /// Local time of the first frame, `YYYY-MM-DD HH:MM:SS`.
+    pub start: &'static str,
+    /// Seconds from the first frame to the last; one frame a second.
+    pub secs: u64,
+    pub baselines: fn() -> BaselineStore,
+    /// The observations `t` seconds after `start`.
+    pub obs: fn(u64) -> Observations,
+    pub cadence: Cadence,
+    pub thresholds: Thresholds,
+}
+
+impl Scenario {
+    /// The demo incident at the top of this file.
+    pub fn incident() -> Self {
+        Self {
+            id: "fixture-scenario",
+            start: WINDOW_START,
+            secs: SCENARIO_SECS,
+            baselines,
+            obs: incident_frame,
+            // The demo re-traces every second: that is what opens
+            // path.changed at 06:44:04, on the third trace after the reroute.
+            cadence: Cadence {
+                path: Some(1),
+                ..Cadence::live()
+            },
+            thresholds: Thresholds::default(),
+        }
+    }
+}
+
+fn incident_frame(t: u64) -> Observations {
+    let mut obs = observations_at(t);
+    for s in &mut obs.sockets {
+        s.process = Some("firefox".into());
+    }
+    obs
+}
+
+/// Every scenario the corpus can pin, by id.
+pub fn scenarios() -> Vec<Scenario> {
+    vec![Scenario::incident()]
+}
+
+/// The profile every synthetic episode carries. Detected, it held this
+/// host's kernel and netwatch's version, so the same scenario recorded on
+/// another machine, or after a release, made a different file.
+fn synthetic_env() -> EnvProfile {
+    EnvProfile {
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        kernel: None,
+        netwatch_version: "synthetic".into(),
+        capability: "root".into(),
+        refresh_rate_ms: 1000,
+    }
+}
+
+/// Run `scenario` through the real engine and recorder, one frame a second,
+/// and return the episode. Two runs give byte-identical files.
+///
+/// The recorder starts a quiet sample on the first frame, so a scenario that
+/// opens nothing still yields its frames, and one that does keeps up to 10
+/// minutes of them as pre-roll, as live. Panics if the recorder ends the
+/// episode before `secs`: a quiet sample lasts 15 minutes, and an incident
+/// ends 10 minutes after its last issue closes.
+pub fn record(scenario: &Scenario) -> Episode {
+    let clock = Arc::new(FixedClock::at(scenario.start));
+    let mut engine = Engine::new(Box::new(clock.clone())).with_settings(Settings {
+        thresholds: scenario.thresholds,
+        ..Settings::default()
+    });
+    let mut base = (scenario.baselines)();
+    let mut rec = Recorder::new(synthetic_env(), SCENARIO_UNIX_START);
+    rec.schedule_quiet_sample(SCENARIO_UNIX_START);
+    let start = Instant::now() + Duration::from_secs(86_400);
+    let cadence = scenario.cadence;
+    for t in 0..=scenario.secs {
+        let obs = (scenario.obs)(t);
+        let now = start + Duration::from_secs(t);
         let mut times = ObservationTimes {
-            interface: Some(now),
-            sockets: Some(now),
-            path: Some(now),
+            interface: Cadence::stamp(cadence.interface, start, t),
+            sockets: Cadence::stamp(cadence.sockets, start, t),
+            path: Cadence::stamp(cadence.path, start, t),
             ..Default::default()
         };
         // Without health times the live engine drops the DNS and gateway
         // observations as stale, so the corpus could not see a regression in
-        // either. The prober completes on its own 5s grid, not every tick;
-        // stamping every frame would count each second as a new sample.
-        let probed = start + std::time::Duration::from_secs(t - t % 5);
-        times.health.dns = Some(probed);
-        times.health.gateway = Some(probed);
-        times.health.internet = Some(probed);
+        // either.
+        let probed = Cadence::stamp(cadence.health, start, t);
+        times.health.dns = probed;
+        times.health.gateway = probed;
+        times.health.internet = probed;
         times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
         times.health.gateway_target = obs.gateway.as_ref().and_then(|g| g.addr.clone());
         engine.observe_live_at(&obs, &base, &times, now);
-        let _ = rec.record(episode::Tick {
-            at: 1.789e9 + t as f64,
-            ts: crate::diagnose::engine::format_ts(clock.now()),
+        let ended = rec.record(Tick {
+            at: SCENARIO_UNIX_START + t as f64,
+            ts: format_ts(clock.now()),
             now,
             obs: &obs,
             times: &times,
@@ -368,14 +505,35 @@ pub fn episode() -> crate::diagnose::episode::Episode {
             baselines: &base,
             events: vec![],
         });
+        assert!(
+            ended.is_none(),
+            "{}: the recorder ended the episode {t}s in, before the scenario's {}s",
+            scenario.id,
+            scenario.secs
+        );
         base.set_gate_sigma(engine.settings().thresholds.sigma_k);
         clock.advance_secs(1);
     }
     let mut ep = rec
-        .flush(&engine, &crate::diagnose::engine::format_ts(clock.now()))
-        .expect("the scenario opens issues, so an episode exists");
-    ep.id = "fixture-scenario".into();
+        .flush(&engine, &format_ts(clock.now()))
+        .expect("a quiet sample starts on the first frame");
+    ep.id = scenario.id.into();
     ep
+}
+
+/// A deterministic recorded episode of the demo incident. The corpus pins
+/// it as `fixture-scenario`: same frames, same decisions, every time.
+pub fn episode() -> Episode {
+    record(&Scenario::incident())
+}
+
+/// The synthetic corpus episode `id`, rebuilt. `None` for an id no scenario
+/// here builds; `diagnose corpus` refuses a manifest row naming one.
+pub fn synthetic(id: &str) -> Option<Episode> {
+    scenarios()
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| record(&s))
 }
 
 #[cfg(test)]
@@ -578,6 +736,156 @@ mod tests {
             assert_eq!(f.ages.dns_target.as_deref(), Some(RESOLVER), "{}", f.ts);
             assert_eq!(f.ages.gateway_target.as_deref(), Some(GATEWAY), "{}", f.ts);
         }
+    }
+
+    fn gzip(episode: &Episode) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        serde_json::to_writer(&mut gz, episode).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn record_is_deterministic() {
+        let scenario = Scenario::incident();
+        assert!(
+            gzip(&record(&scenario)) == gzip(&record(&scenario)),
+            "two recordings of one scenario differ"
+        );
+    }
+
+    /// `Err` unless the pinned corpus episode `id` is what `rebuilt` holds:
+    /// the frames the corpus replays, the settings and the profile. Issue
+    /// snapshots are left out; they are the engine's output, which the
+    /// pinned decisions already cover.
+    fn is_pinned(id: &str, rebuilt: &Episode) -> Result<(), String> {
+        use crate::diagnose::episode::{load, CORPUS_DIR};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(CORPUS_DIR)
+            .join(format!("{id}.json.gz"));
+        let mut pinned = load(&path).map_err(|e| format!("{id}: {}: {e}", path.display()))?;
+        // Through JSON, as the pinned copy went, so floats parse alike.
+        let mut rebuilt: Episode =
+            serde_json::from_str(&serde_json::to_string(rebuilt).unwrap()).unwrap();
+        pinned.issues.clear();
+        rebuilt.issues.clear();
+        if rebuilt == pinned {
+            return Ok(());
+        }
+        Err(format!(
+            "{id}: its scenario no longer records the pinned episode; if that is intended, \
+             run `cargo run -- diagnose corpus --only {id}` and review the diff"
+        ))
+    }
+
+    /// The pinned `fixture-scenario` is what [`Scenario::incident`] records.
+    #[test]
+    fn the_incident_episode_is_unchanged_by_the_refactor() {
+        is_pinned("fixture-scenario", &episode()).unwrap();
+    }
+
+    /// The replay test holds a pinned episode only to itself, so a scenario
+    /// renamed, removed or edited without regenerating still passed it, and
+    /// the next `diagnose corpus` failed on that row or quietly rewrote it.
+    #[test]
+    fn every_synthetic_corpus_entry_is_what_its_scenario_records() {
+        use crate::diagnose::episode::{CorpusKind, Manifest, CORPUS_DIR};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_DIR);
+        let manifest = Manifest::load(&dir).expect("corpus manifest");
+        let failures: Vec<String> = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == CorpusKind::Synthetic)
+            .filter_map(|entry| match synthetic(&entry.id) {
+                Some(rebuilt) => is_pinned(&entry.id, &rebuilt).err(),
+                None => Some(format!("{}: no scenario in fixture.rs builds it", entry.id)),
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// What a new corpus scenario costs: a frame function and a `Scenario`.
+    /// The gateway and everything past it stop answering for three minutes.
+    fn gateway_outage(t: u64) -> Observations {
+        use Phase::*;
+        let mut obs = observations_at(0);
+        if phase(t, &[(0, Healthy), (120, Fault), (300, Clear)]) == Fault {
+            obs.gateway = Some(GatewayObs {
+                rtt_ms: None,
+                loss_pct: 100.0,
+                arp_ok: Some(false),
+                icmp_ok: false,
+                internet_reachable: Some(false),
+                ..healthy_gateway()
+            });
+        }
+        obs
+    }
+
+    #[test]
+    fn a_new_scenario_records_an_open_and_a_close() {
+        let ep = record(&Scenario {
+            id: "gateway-outage",
+            start: WINDOW_START,
+            secs: 600,
+            baselines,
+            obs: gateway_outage,
+            cadence: Cadence::live(),
+            thresholds: Thresholds::default(),
+        });
+        // A quiet sample from the first frame, so the pre-roll is all there.
+        assert_eq!(ep.frames.len(), 601);
+        let (decisions, report) = crate::diagnose::episode::CanonicalDecisions::of(&ep);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        let spans: Vec<_> = decisions
+            .issues
+            .iter()
+            .map(|s| (s.key.as_str(), s.close_reason.as_deref()))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![("gateway.unreachable|host", Some("auto-closed"))],
+            "{:#?}",
+            decisions.issues
+        );
+    }
+
+    #[test]
+    fn a_scenario_that_opens_nothing_still_records_its_frames() {
+        let ep = record(&Scenario {
+            id: "quiet",
+            // Before the reroute, and with the resolver still fast.
+            obs: |_| observations_at(0),
+            secs: 60,
+            cadence: Cadence::live(),
+            ..Scenario::incident()
+        });
+        assert_eq!(ep.frames.len(), 61);
+        assert!(ep.issue_keys().is_empty(), "{:?}", ep.issue_keys());
+    }
+
+    #[test]
+    fn a_phase_runs_from_its_start_to_the_next() {
+        use Phase::*;
+        let story = [(0, Healthy), (120, Fault), (300, Clear)];
+        assert_eq!(phase(0, &story), Healthy);
+        assert_eq!(phase(119, &story), Healthy);
+        assert_eq!(phase(120, &story), Fault);
+        assert_eq!(phase(299, &story), Fault);
+        assert_eq!(phase(300, &story), Clear);
+        assert_eq!(phase(10_000, &story), Clear);
+    }
+
+    #[test]
+    fn live_cadence_stamps_each_collector_on_its_own_grid() {
+        let start = Instant::now();
+        let c = Cadence::live();
+        let at =
+            |period, t| Cadence::stamp(period, start, t).map(|i: Instant| (i - start).as_secs());
+        assert_eq!(at(c.interface, 37), Some(37));
+        assert_eq!(at(c.sockets, 37), Some(37));
+        assert_eq!(at(c.health, 37), Some(35));
+        assert_eq!(at(c.path, 37), Some(30));
+        assert_eq!(at(None, 37), None);
     }
 
     #[test]
