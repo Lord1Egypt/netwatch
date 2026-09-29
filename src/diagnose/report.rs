@@ -463,6 +463,11 @@ impl Report {
             }
             IssueState::Open => m.push_str(" · not yet met"),
         }
+        // An open issue nothing has measured lately cannot meet its verify,
+        // and says since when.
+        if let Some(stale) = issue.stale_since.as_ref().filter(|_| issue.state.is_open()) {
+            m.push_str(&format!(" · stale since {}", time_of(stale)));
+        }
         m.push_str("\n\n");
 
         // --- consequences: symptoms that were this issue all along
@@ -624,6 +629,36 @@ mod tests {
         for issue in &report.issues {
             assert!(md.contains(&issue.id));
         }
+    }
+
+    #[test]
+    fn a_stale_finding_says_since_when() {
+        let mut report = report();
+        let id = report.issues[0].id.clone();
+        report.issues[0].stale_since = Some("2026-09-03 06:50:02".into());
+        let json = report.to_json().unwrap();
+        assert!(
+            json.contains(r#""stale_since": "2026-09-03 06:50:02""#),
+            "{json}"
+        );
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
+
+        let md = restored.to_markdown();
+        let section = md
+            .split("## ")
+            .find(|s| s.contains(&format!("`{id}`")) && s.contains("**Verify:**"))
+            .unwrap();
+        assert!(
+            section.contains("· not yet met · stale since 06:50:02"),
+            "{section}"
+        );
+        // Only the one issue, and nothing about the others.
+        assert_eq!(md.matches("stale since").count(), 1, "{md}");
+        // A finding that was never stale writes nothing for it.
+        assert!(!serde_json::to_string(&report.issues[1])
+            .unwrap()
+            .contains("stale_since"));
     }
 
     #[test]
