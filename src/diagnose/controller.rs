@@ -211,22 +211,11 @@ impl App {
             self.diagnose.baselines.set_network(fingerprint);
         }
 
-        if let Some(interval) = self
-            .user_config
-            .diagnose_probes
-            .trace_refresh_secs
-            .filter(|s| (30..=3600).contains(s))
-        {
+        if let Some(interval) = self.user_config.diagnose_probes.periodic_trace_secs() {
             if self
                 .diagnose
                 .last_trace_started
                 .is_none_or(|at| at.elapsed().as_secs() >= interval)
-                && self
-                    .user_config
-                    .diagnose_probes
-                    .trace_target
-                    .parse::<std::net::IpAddr>()
-                    .is_ok()
             {
                 self.traceroute_runner
                     .run(&self.user_config.diagnose_probes.trace_target);

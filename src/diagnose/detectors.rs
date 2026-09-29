@@ -418,6 +418,36 @@ pub struct GatewayObs {
     pub internet_reachable: Option<bool>,
 }
 
+/// The configuration a sample ran with. Whether an issue's subject went
+/// away or only stopped being measured depends on it: a socket that closed,
+/// a target the user removed, a resolver that left the system config. It is
+/// recorded with the readings so a replay decides the same way.
+///
+/// The resolver and interface lists are the app's last read of each, taken
+/// every tenth tick in the TUI and only at start under `diagnose run`, and
+/// neither carries a time of its own.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservedConfig {
+    /// The system resolvers, in the order the platform lists them. `None`
+    /// when it listed none: the collector returns the same empty list when
+    /// it cannot read the resolver config, so an empty list never says a
+    /// resolver left.
+    pub resolvers: Option<Vec<String>>,
+    /// Enabled `[[diagnose_targets]]` as (name, revision). The revision is
+    /// the target's baseline key, which changes when any field of its entry
+    /// does.
+    pub targets: Vec<(String, String)>,
+    /// `diagnose_probes.trace_target`.
+    pub trace_target: String,
+    /// Seconds between periodic traces; `None` while periodic tracing is
+    /// off, as it always is under `diagnose run`.
+    pub trace_refresh_secs: Option<u64>,
+    /// Every interface the platform lists, up or down. `None` when it
+    /// listed none, as after a read that failed at start.
+    pub interfaces: Option<Vec<String>>,
+}
+
 /// Everything a detector pass gets to look at.
 /// Serialisable so an episode can store exactly what the detectors saw and
 /// replay it. `default` keeps older recordings loadable as fields are added.
@@ -444,6 +474,10 @@ pub struct Observations {
     pub nat: Option<NatObs>,
     /// Configured developer targets with a fresh probe result.
     pub targets: Vec<super::targets::TargetObs>,
+    /// The configuration the sample ran with. `None` means unknown: a
+    /// recording made before it was recorded, or a synthetic episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ObservedConfig>,
 }
 
 /// A candidate issue. The engine supplies identity and history.
@@ -5353,6 +5387,13 @@ mod tests {
                 traced_at: "2026-09-14 09:59:30".into(),
             }],
             idle_rtt_ms: Some(18.0),
+            config: Some(ObservedConfig {
+                resolvers: Some(vec!["192.168.8.1".into(), "fe80::1%wlan0".into()]),
+                targets: vec![("api".into(), "target-config:0123abcd".into())],
+                trace_target: "1.1.1.1".into(),
+                trace_refresh_secs: Some(120),
+                interfaces: Some(vec!["lo".into(), "wlan0".into()]),
+            }),
             ..Default::default()
         };
         let json = serde_json::to_string(&obs).unwrap();
@@ -5360,6 +5401,11 @@ mod tests {
         // A recording from before a field existed still loads.
         let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
         assert_eq!(old.now, "2026-09-14 10:00:00");
+        // Without a configuration it is unknown, not empty, and a sample
+        // that has none writes nothing for it.
+        assert_eq!(old.config, None);
+        let unknown = serde_json::to_value(&old).unwrap();
+        assert!(unknown.get("config").is_none(), "{unknown}");
     }
 
     #[test]
