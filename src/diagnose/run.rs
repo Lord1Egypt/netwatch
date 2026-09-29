@@ -165,14 +165,23 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     std::process::exit(outcome as i32);
 }
 
+/// The user's configuration as a run uses it. A run never traces on a
+/// timer: only the TUI's controller does. Each sample records the interval
+/// it ran with, so the run's copy has none.
+fn run_config(loaded: crate::config::NetwatchConfig) -> crate::config::NetwatchConfig {
+    let mut config = crate::config::NetwatchConfig {
+        insights_enabled: false,
+        diagnose_record_episodes: false,
+        ..loaded
+    };
+    config.diagnose_probes.trace_refresh_secs = None;
+    config
+}
+
 fn run(opts: Options) -> anyhow::Result<Outcome> {
     use crate::{app::App, config::NetwatchConfig, diagnose::live::LiveSampler};
 
-    let config = NetwatchConfig {
-        insights_enabled: false,
-        diagnose_record_episodes: false,
-        ..NetwatchConfig::load()
-    };
+    let config = run_config(NetwatchConfig::load());
     print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(name) = &opts.target {
         anyhow::ensure!(
@@ -317,6 +326,32 @@ mod tests {
         assert!(parse_budget("1s").is_err(), "shorter than a probe interval");
         assert!(parse_budget("30m").is_err(), "that is a session, not a run");
         assert!(parse_budget("soon").is_err());
+    }
+
+    /// D33-B04 review: a run never traces on a timer, so its samples must
+    /// not record periodic tracing as on. B30 and the expiry guard read that
+    /// field.
+    #[test]
+    fn a_run_records_periodic_tracing_as_off() {
+        let loaded: crate::config::NetwatchConfig = toml::from_str(
+            r#"
+            [diagnose_probes]
+            trace_target = "9.9.9.9"
+            trace_refresh_secs = 120
+            "#,
+        )
+        .unwrap();
+        assert_eq!(loaded.diagnose_probes.periodic_trace_secs(), Some(120));
+        let app = crate::app::App::prepare_with_config(run_config(loaded));
+        let observed = crate::diagnose::live::LiveSampler::new()
+            .sample(&app, &app.diagnose.engine.settings().thresholds)
+            .config
+            .expect("a live sample records its configuration");
+        assert_eq!(observed.trace_refresh_secs, None);
+        assert_eq!(
+            observed.trace_target, "9.9.9.9",
+            "the target is still known"
+        );
     }
 
     #[test]

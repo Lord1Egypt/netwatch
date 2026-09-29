@@ -440,7 +440,8 @@ pub struct ObservedConfig {
     pub targets: Vec<(String, String)>,
     /// `diagnose_probes.trace_target`.
     pub trace_target: String,
-    /// Seconds between periodic traces; `None` while periodic tracing is off.
+    /// Seconds between periodic traces; `None` while periodic tracing is
+    /// off, as it always is under `diagnose run`.
     pub trace_refresh_secs: Option<u64>,
     /// Every interface the platform lists, up or down. `None` when it
     /// listed none, as after a read that failed at start.
