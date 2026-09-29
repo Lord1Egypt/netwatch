@@ -749,12 +749,15 @@ fn nat(app: &App) -> Option<NatObs> {
 }
 
 /// The configuration this tick runs with, as the collectors and probes
-/// read it: the system resolvers, the targets the prober will probe, the
-/// trace the controller will run and the interfaces the platform lists.
+/// read it: the system resolvers, the enabled targets, the trace the
+/// controller will run and the interfaces the platform lists.
 fn observed_config(app: &App) -> ObservedConfig {
+    // Neither collector tells a failed read from one that found nothing,
+    // so an empty list is recorded as unknown rather than as "none".
+    let known = |list: Vec<String>| (!list.is_empty()).then_some(list);
     let probes = &app.user_config.diagnose_probes;
     ObservedConfig {
-        resolvers: app.config_collector.config.dns_servers.clone(),
+        resolvers: known(app.config_collector.config.dns_servers.clone()),
         targets: app
             .user_config
             .diagnose_targets
@@ -764,7 +767,7 @@ fn observed_config(app: &App) -> ObservedConfig {
             .collect(),
         trace_target: probes.trace_target.clone(),
         trace_refresh_secs: probes.periodic_trace_secs(),
-        interfaces: app.interface_info.iter().map(|i| i.name.clone()).collect(),
+        interfaces: known(app.interface_info.iter().map(|i| i.name.clone()).collect()),
     }
 }
 
@@ -1046,7 +1049,10 @@ mod tests {
             .sample(&app, &thresholds)
             .config
             .expect("a live sample records its configuration");
-        assert_eq!(observed.resolvers, ["192.0.2.53", "fe80::1"]);
+        assert_eq!(
+            observed.resolvers,
+            Some(vec!["192.0.2.53".into(), "fe80::1".into()])
+        );
         assert_eq!(
             observed.targets,
             [("api".to_string(), revision.clone())],
@@ -1054,7 +1060,10 @@ mod tests {
         );
         assert_eq!(observed.trace_target, "9.9.9.9");
         assert_eq!(observed.trace_refresh_secs, Some(120));
-        assert_eq!(observed.interfaces, ["nwtest0", "nwtest1"]);
+        assert_eq!(
+            observed.interfaces,
+            Some(vec!["nwtest0".into(), "nwtest1".into()])
+        );
 
         // An edited target is a new revision under the same name, and an
         // interval the controller ignores records as no periodic tracing.
@@ -1066,7 +1075,16 @@ mod tests {
         assert_eq!(observed.targets[0].0, "api");
         assert_ne!(observed.targets[0].1, revision);
         assert_eq!(observed.trace_refresh_secs, None);
-        assert_eq!(observed.interfaces, ["nwtest0"]);
+        assert_eq!(observed.interfaces, Some(vec!["nwtest0".into()]));
+
+        // Collectors that came back empty read nothing: resolv.conf could
+        // not be read, or the interface list failed at start. That is
+        // unknown, never "every resolver and interface went away".
+        app.config_collector.config.dns_servers.clear();
+        app.interface_info.clear();
+        let observed = LiveSampler::new().sample(&app, &thresholds).config.unwrap();
+        assert_eq!(observed.resolvers, None, "an empty read is unknown");
+        assert_eq!(observed.interfaces, None, "an empty read is unknown");
     }
 
     #[test]

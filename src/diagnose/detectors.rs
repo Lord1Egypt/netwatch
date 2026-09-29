@@ -422,11 +422,18 @@ pub struct GatewayObs {
 /// away or only stopped being measured depends on it: a socket that closed,
 /// a target the user removed, a resolver that left the system config. It is
 /// recorded with the readings so a replay decides the same way.
+///
+/// The resolver and interface lists are the app's last read of each, taken
+/// every tenth tick in the TUI and only at start under `diagnose run`, and
+/// neither carries a time of its own.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObservedConfig {
-    /// The system resolvers, in the order the platform lists them.
-    pub resolvers: Vec<String>,
+    /// The system resolvers, in the order the platform lists them. `None`
+    /// when it listed none: the collector returns the same empty list when
+    /// it cannot read the resolver config, so an empty list never says a
+    /// resolver left.
+    pub resolvers: Option<Vec<String>>,
     /// Enabled `[[diagnose_targets]]` as (name, revision). The revision is
     /// the target's baseline key, which changes when any field of its entry
     /// does.
@@ -435,8 +442,9 @@ pub struct ObservedConfig {
     pub trace_target: String,
     /// Seconds between periodic traces; `None` while periodic tracing is off.
     pub trace_refresh_secs: Option<u64>,
-    /// Every interface the platform lists, up or down.
-    pub interfaces: Vec<String>,
+    /// Every interface the platform lists, up or down. `None` when it
+    /// listed none, as after a read that failed at start.
+    pub interfaces: Option<Vec<String>>,
 }
 
 /// Everything a detector pass gets to look at.
@@ -5379,11 +5387,11 @@ mod tests {
             }],
             idle_rtt_ms: Some(18.0),
             config: Some(ObservedConfig {
-                resolvers: vec!["192.168.8.1".into(), "fe80::1%wlan0".into()],
+                resolvers: Some(vec!["192.168.8.1".into(), "fe80::1%wlan0".into()]),
                 targets: vec![("api".into(), "target-config:0123abcd".into())],
                 trace_target: "1.1.1.1".into(),
                 trace_refresh_secs: Some(120),
-                interfaces: vec!["lo".into(), "wlan0".into()],
+                interfaces: Some(vec!["lo".into(), "wlan0".into()]),
             }),
             ..Default::default()
         };

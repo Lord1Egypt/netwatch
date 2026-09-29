@@ -826,14 +826,14 @@ mod tests {
             // The probed target, one configured target no frame has a
             // result for, and a trace target that is not an address.
             frame.obs.config = Some(crate::diagnose::detectors::ObservedConfig {
-                resolvers: vec!["192.168.8.53".into()],
+                resolvers: Some(vec!["192.168.8.53".into()]),
                 targets: vec![
                     ("dns".into(), "target-config:private-test-revision".into()),
                     ("ledger".into(), "target-config:unprobed-revision".into()),
                 ],
                 trace_target: "tracehost".into(),
                 trace_refresh_secs: Some(120),
-                interfaces: vec!["wlan0".into()],
+                interfaces: Some(vec!["wlan0".into()]),
             });
         }
         ep.labels.push(episode::Label {
@@ -871,7 +871,7 @@ mod tests {
         );
         assert!(config.targets[1].0.starts_with("target:"));
         assert!(config.targets[1].1.starts_with("target-config:"));
-        assert_eq!(config.interfaces, ["wlan0"]);
+        assert_eq!(config.interfaces, Some(vec!["wlan0".to_string()]));
         assert!(safe.frames[0].obs.targets[0].name.starts_with("target:"));
         assert!(safe.labels[0]
             .issue
