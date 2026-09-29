@@ -1151,9 +1151,9 @@ fn merge_remediation(existing: &mut Vec<super::issue::Step>, fresh: Vec<super::i
 /// What the verdict line says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Baselines are ready and nothing is open.
+    /// Baselines are ready and no Issue is open.
     Clear,
-    /// Nothing is open, but netwatch doesn't yet have the baselines to say so
+    /// No Issue is open, but netwatch doesn't yet have the baselines to say so
     /// with confidence.
     Learning {
         detail: String,

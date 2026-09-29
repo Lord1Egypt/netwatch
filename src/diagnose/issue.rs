@@ -67,8 +67,9 @@ impl fmt::Display for Severity {
 ///
 /// An Issue is a fault: the verdict line counts it, and it can hide the
 /// findings it explains. An Observation, such as a symmetric NAT or a route
-/// that changed without adding latency, is listed with the findings, but the
-/// verdict line does not count it and it never hides an Issue.
+/// change that added 20 ms or less, or whose added latency was not measured,
+/// is listed with the findings, but the verdict line does not count it and it
+/// never hides an Issue.
 ///
 /// Derived from [`Severity`], never stored, so the two cannot disagree and a
 /// recording that says "info" loads as an Observation.

@@ -38,7 +38,8 @@ pub struct Rule {
     /// Plain-English trigger, shown in the "how issues are found" panel.
     pub trigger: &'static str,
     /// Rules whose issues become consequences of this one when both are open
-    /// and they share a subject scope. Explicit — never inferred.
+    /// and they share a subject scope. Explicit — never inferred. An
+    /// Observation of this rule still never hides an Issue.
     pub suppresses: &'static [RuleId],
     pub status: RuleStatus,
     /// What must be measured before this rule may fire. Empty means the rule
@@ -714,9 +715,10 @@ pub fn apply_suppression(issues: &mut [Issue]) {
             }
             // An Observation never hides an Issue. The edge stays in the
             // catalogue because a detector can raise the same rule to an
-            // Issue: path.changed is Medium once the new hop adds 20 ms, and
-            // then it does explain the path's rtt spike. At Info it is a
-            // route that changed, which explains nothing a user would fix.
+            // Issue: path.changed is Medium once the new hop adds more than
+            // 20 ms, and then it does explain the path's rtt spike. At Info
+            // it is a route that changed, which explains nothing a user
+            // would fix.
             if root.kind() == Kind::Observation && child.kind() == Kind::Issue {
                 continue;
             }

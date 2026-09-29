@@ -412,8 +412,8 @@ fn session_retrans(app: &App) -> (f64, Option<(String, f64)>) {
 /// it needs. The two disagreeing is normal and often correct — but a red
 /// border beside a status line reading "no issues" is a contradiction on
 /// screen, so the tile says which of the two it is. An Observation, such as a
-/// route change that added no latency, does not count: the status line does
-/// not count it either.
+/// route change that added 20 ms or less, does not count: the status line
+/// does not count it either.
 fn issue_behind(app: &App, rules: &[&str]) -> bool {
     app.diagnose
         .engine
