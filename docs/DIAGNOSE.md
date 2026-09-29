@@ -150,7 +150,9 @@ replaced by its default and logged; `diagnose run` and `diagnose coverage` also
 print it to stderr. The
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
-same numbers.
+same numbers. An episode recorded before a threshold existed replays with that
+threshold's default: one from before 0.34 is judged against the σ floor it ran
+without.
 `--generate-config` and the Settings editor's save write the table only once it
 differs from the defaults. Then they write every key, and a key in the file
 keeps its value when a later release retunes that default.
