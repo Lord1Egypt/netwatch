@@ -1171,6 +1171,12 @@ pub fn short_time(ts: &str) -> &str {
     ts.split(' ').next_back().unwrap_or(ts)
 }
 
+/// `"2026-09-03 06:48:10"` → `"06:48"`, for a column or a status line with no
+/// room for seconds.
+pub fn hh_mm(ts: &str) -> String {
+    short_time(ts).chars().take(5).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -663,8 +663,27 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
 }
 
-/// The verdict row: a glyph, then the words.
+/// The verdict row: a glyph, then the words, then how many issues it leaves
+/// out because they are muted.
 fn verdict_spans(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> Vec<Span<'static>> {
+    let mut spans = verdict_state_spans(engine, baselines, t);
+    // A muted issue leaves the count but not the screen: without this the row
+    // reads "no issues found" over a fault that is still there.
+    let muted = engine.muted_count();
+    if muted > 0 {
+        spans.push(Span::styled(
+            format!(" · {muted} muted"),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    spans
+}
+
+fn verdict_state_spans(
+    engine: &Engine,
+    baselines: &BaselineStore,
+    t: &Theme,
+) -> Vec<Span<'static>> {
     let verdict = engine.verdict(baselines);
 
     let coverage = engine.coverage();
@@ -1035,10 +1054,14 @@ fn render_chronology(f: &mut Frame, view: &View, area: Rect) {
     for issue in tracked {
         let is_selected = selected_id.as_deref() == Some(issue.id.as_str());
         let open = issue.state.is_open();
+        let muted_until = issue.state.muted_until();
 
         // A closed issue keeps its place in the order but stops shouting: the
-        // severity colour is what "still wrong" looks like.
-        let (marker, marker_style) = if !open {
+        // severity colour is what "still wrong" looks like. A muted one is
+        // neither: still wrong, only quiet, and never the ✓ of a fix.
+        let (marker, marker_style) = if muted_until.is_some() {
+            ("◌", Style::default().fg(t.text_muted))
+        } else if !open {
             ("✓", Style::default().fg(t.status_good))
         } else if issue.suppressed_by.is_some() {
             ("└", Style::default().fg(t.text_muted))
@@ -1057,10 +1080,7 @@ fn render_chronology(f: &mut Frame, view: &View, area: Rect) {
         // `since` is a full `%Y-%m-%d %H:%M:%S`; the date is the same for
         // every row in a window and the seconds are in the detail pane, so
         // the column carries `06:48` and spends the rest on the title.
-        let stamp: String = crate::diagnose::issue::short_time(&issue.since)
-            .chars()
-            .take(5)
-            .collect();
+        let stamp = crate::diagnose::issue::hh_mm(&issue.since);
         let used = 1 + stamp.chars().count() + 2 + 2;
         let mut spans = vec![
             Span::styled(
@@ -1078,7 +1098,12 @@ fn render_chronology(f: &mut Frame, view: &View, area: Rect) {
                 title_style,
             ),
         ];
-        if !open {
+        if let Some(until) = muted_until {
+            let muted = format!("  muted until {}", crate::diagnose::issue::hh_mm(until));
+            if used + issue.title.chars().count() + muted.chars().count() <= inner {
+                spans.push(Span::styled(muted, Style::default().fg(t.text_muted)));
+            }
+        } else if !open {
             let closed = format!("  {}", issue.state.label());
             if used + issue.title.chars().count() + closed.chars().count() <= inner {
                 spans.push(Span::styled(closed, Style::default().fg(t.status_good)));
@@ -2115,6 +2140,86 @@ mod tests {
                     "{name}: green {:?} at column {x} of {row}",
                     cell.symbol()
                 );
+            }
+        }
+    }
+
+    /// A muted issue drew the green ✓ and green label of a fixed one. It is
+    /// still wrong, only quiet: a muted `◌`, the time the mute ends, and a
+    /// count on the verdict row, never a green cell. Checked with one issue
+    /// muted beside open ones, and with every issue muted.
+    #[test]
+    fn muted_is_never_drawn_green() {
+        let (mut one, baselines) = fixture::run();
+        let id = one.primary()[0].id.clone();
+        assert!(one.mute(&id, 60));
+        let (mut all, _) = fixture::run();
+        while let Some(id) = all.primary().first().map(|i| i.id.clone()) {
+            assert!(all.mute(&id, 60));
+        }
+        assert!(all.muted_count() > 1);
+
+        for engine in [&one, &all] {
+            let muted = engine
+                .issues()
+                .iter()
+                .filter(|i| i.state.muted_until().is_some())
+                .count();
+            for name in crate::theme::THEME_NAMES {
+                let theme = crate::theme::by_name(name);
+                let view = View {
+                    engine,
+                    baselines: &baselines,
+                    theme: &theme,
+                    selected: 0,
+                    show_report: false,
+                    capability: Capability::Root,
+                    ai: None,
+                    endpoint: "local".to_string(),
+                    status: None,
+                    demo_banner: None,
+                    running_tests: vec![],
+                    history: None,
+                };
+                let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+                terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+                let buf = terminal.backend().buffer().clone();
+                let row = |y: u16| -> Vec<String> {
+                    (0..buf.area.width)
+                        .map(|x| buf.get(x, y).symbol().to_string())
+                        .collect()
+                };
+
+                let verdict = row(0).concat();
+                assert!(
+                    verdict.contains(&format!(" · {} muted", engine.muted_count())),
+                    "{name}: {verdict}"
+                );
+
+                // Each muted row, from its left edge to the end of its label.
+                let label = "muted until 07:51";
+                let mut rows = 0;
+                for y in 0..buf.area.height {
+                    let cells = row(y);
+                    let Some(start) =
+                        (0..cells.len()).find(|&x| cells[x..].concat().starts_with(label))
+                    else {
+                        continue;
+                    };
+                    rows += 1;
+                    let end = start + label.len();
+                    let text = cells[..end].concat();
+                    assert!(text.contains('◌') && !text.contains('✓'), "{name}: {text}");
+                    for x in 0..end {
+                        let cell = buf.get(x as u16, y);
+                        assert!(
+                            cell.symbol() == " " || cell.fg != theme.status_good,
+                            "{name}: green {:?} at column {x} of {text}",
+                            cell.symbol()
+                        );
+                    }
+                }
+                assert_eq!(rows, muted, "{name}: one row per muted issue");
             }
         }
     }
