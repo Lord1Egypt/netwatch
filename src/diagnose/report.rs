@@ -200,11 +200,15 @@ impl Report {
             .iter()
             .filter(|i| !i.state.is_open())
             .map(|i| {
-                vec![
-                    format!("`{}`", i.id),
-                    i.title.clone(),
-                    i.state.label().to_string(),
-                ]
+                // An expiry says what went away, so it cannot pass for one
+                // more close that netwatch watched clear.
+                let state = match &i.state {
+                    IssueState::Expired { reason, .. } => {
+                        format!("expired, evidence gone: {reason}")
+                    }
+                    s => s.label().to_string(),
+                };
+                vec![format!("`{}`", i.id), i.title.clone(), state]
             })
             .collect();
         if !closed.is_empty() {
@@ -439,6 +443,10 @@ impl Report {
             IssueState::Resolved { at } => {
                 m.push_str(&format!(" · marked resolved {}", time_of(at)))
             }
+            IssueState::Expired { at, reason } => m.push_str(&format!(
+                " · expired {}, evidence gone: {reason}",
+                time_of(at)
+            )),
             IssueState::Acked => m.push_str(" · acknowledged, still open"),
             IssueState::Muted { until } => {
                 m.push_str(&format!(" · muted until {}", time_of(until)))
@@ -611,6 +619,37 @@ mod tests {
         for issue in &report.issues {
             assert!(md.contains(&issue.id));
         }
+    }
+
+    #[test]
+    fn an_expired_finding_says_its_evidence_went() {
+        let mut report = report();
+        report.issues[0].state = IssueState::Expired {
+            at: "2026-09-03 07:00:00".into(),
+            reason: "socket closed".into(),
+        };
+        let json = report.to_json().unwrap();
+        assert!(
+            json.contains(r#""state": "expired""#) && json.contains(r#""reason": "socket closed""#),
+            "{json}"
+        );
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
+
+        let md = restored.to_markdown();
+        let closed = md
+            .split("## Retained closed findings")
+            .nth(1)
+            .expect("an expired finding is retained");
+        let row = closed
+            .lines()
+            .find(|l| l.contains(&report.issues[0].id))
+            .unwrap();
+        assert!(
+            row.contains("expired, evidence gone: socket closed"),
+            "{row}"
+        );
+        assert!(!row.contains("auto-closed"), "{row}");
     }
 
     #[test]

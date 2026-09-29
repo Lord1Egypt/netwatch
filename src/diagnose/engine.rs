@@ -540,8 +540,12 @@ impl Engine {
                     // Within the recurrence window this is the same problem
                     // coming back, so it keeps its id and gains a count.
                     // Outside it, the old issue stays closed and we file new.
+                    // An expired issue counts too: a resolver that left the
+                    // config and came back still slow is the same problem.
                     let closed_at = match &issue.state {
-                        IssueState::Resolved { at } | IssueState::AutoClosed { at } => parse_ts(at),
+                        IssueState::Resolved { at }
+                        | IssueState::AutoClosed { at }
+                        | IssueState::Expired { at, .. } => parse_ts(at),
                         _ => None,
                     };
                     let within = closed_at
@@ -915,7 +919,8 @@ impl Engine {
     }
 
     /// Decide pending verifications: closed issues recovered (fully, unless a
-    /// re-run test still points at the cause); open ones past their deadline
+    /// re-run test still points at the cause), except hand-resolved and
+    /// expired ones, which nothing measured; open ones past their deadline
     /// did not.
     fn decide_verifications(&mut self, now: DateTime<Local>) {
         use super::issue::VerifyOutcome;
@@ -959,9 +964,12 @@ impl Engine {
             });
             // Only an auto-close is measured: netwatch watched the verify
             // condition hold. A hand-resolved issue closed because someone
-            // said so, which is not evidence that the step worked.
+            // said so, and an expired one because its subject went away;
+            // neither is evidence that the step worked.
             let outcome = if matches!(issue.state, IssueState::Resolved { .. }) {
                 Some(VerifyOutcome::ClosedByOperator)
+            } else if matches!(issue.state, IssueState::Expired { .. }) {
+                Some(VerifyOutcome::NotMeasured)
             } else if !issue.state.is_open() {
                 Some(if still_supported {
                     VerifyOutcome::Partial
@@ -1868,6 +1876,106 @@ mod tests {
             issue.verification.as_ref().unwrap().outcome,
             Some(super::super::issue::VerifyOutcome::Recovered)
         );
+    }
+
+    /// Close `id` as Expired at the clock's time. The engine only reads this
+    /// state so far; deciding that a subject is gone is the expiry guard's
+    /// job (D33-B25), so these tests close the issue the way it will.
+    fn expire(e: &mut Engine, id: &str, reason: &str) {
+        let at = format_ts(e.clock.now());
+        let issue = e.issues.iter_mut().find(|i| i.id == id).unwrap();
+        issue.state = IssueState::Expired {
+            at,
+            reason: reason.into(),
+        };
+        e.verifying_since.remove(id);
+        e.verification_samples.remove(id);
+    }
+
+    #[test]
+    fn expired_is_closed_and_not_a_recovery() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        expire(&mut e, &id, "resolver left the config");
+
+        // The resolver is fast again afterwards. That is not the issue's
+        // verify holding, because nothing watches a closed issue: it stays
+        // Expired and never turns into a close netwatch saw clear.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        let issue = e.get(&id).unwrap();
+        assert!(!issue.state.is_open());
+        assert_eq!(e.open_count(), 0);
+        assert!(
+            matches!(&issue.state, IssueState::Expired { reason, .. } if reason == "resolver left the config"),
+            "{:?}",
+            issue.state
+        );
+        assert_eq!(issue.state.label(), "expired");
+    }
+
+    #[test]
+    fn a_step_before_expiry_is_not_credited() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+
+        // The verify condition holds for half its window, then the subject
+        // goes. Counting that close as a recovery would credit the step
+        // with a fix nothing finished measuring.
+        for _ in 0..30 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            None
+        );
+        expire(&mut e, &id, "resolver left the config");
+        clock.advance_secs(1);
+        e.observe(&obs(1.3), &b);
+
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, Some(VerifyOutcome::NotMeasured));
+        assert_eq!(v.decided_at.as_deref(), Some("2026-09-03 06:48:41"));
+        assert_eq!(
+            VerifyOutcome::NotMeasured.label(),
+            "closed without a measurement"
+        );
+    }
+
+    #[test]
+    fn an_expired_condition_that_returns_within_the_window_reopens() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        expire(&mut e, &id, "resolver left the config");
+
+        // Back five minutes later and still slow: the same problem, once
+        // more, not a second finding.
+        clock.advance_secs(5 * 60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(issue.recurrence, 1);
+        assert_eq!(issue.since, "2026-09-03 06:53:10");
+
+        // Past the recurrence window it is a new incident.
+        expire(&mut e, &id, "resolver left the config");
+        clock.advance_secs((RECURRENCE_WINDOW_MINS + 1) * 60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 2);
+        assert_eq!(e.primary()[0].recurrence, 0);
+        assert_ne!(e.primary()[0].id, id);
     }
 
     #[test]

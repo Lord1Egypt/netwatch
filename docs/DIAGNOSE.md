@@ -334,8 +334,9 @@ document cannot drift from the rules again.
 
 `tests/diagnose/corpus/` holds recorded episodes and the decisions each must
 keep producing: which issues open, when, what each is blamed on, and why each
-left the list (`close_reason`: auto-closed, resolved, muted, suppressed, or
-pruned when the history limit dropped it on the tick it closed).
+left the list (`close_reason`: auto-closed, expired, resolved, muted,
+suppressed, or pruned when the history limit dropped it on the tick it
+closed).
 The replay test compares against those files rather than against a recording
 it just made, so a change that moves both sides still shows up.
 
