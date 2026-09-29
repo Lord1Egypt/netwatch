@@ -14,7 +14,7 @@
 use chrono::{DateTime, Duration, Local, TimeZone};
 use std::collections::HashMap;
 
-use super::baseline::BaselineStore;
+use super::baseline::{BaselineStore, SigmaFloor};
 use super::detectors::{self, Detection, Observations, Thresholds};
 use super::issue::{Issue, IssueId, IssueState, Severity};
 use super::rules;
@@ -461,7 +461,11 @@ impl Engine {
         base: &BaselineStore,
         times: Option<&ObservationTimes>,
     ) {
-        self.coverage = super::coverage::Coverage::from_observations(obs, base);
+        self.coverage = super::coverage::Coverage::from_observations(
+            obs,
+            base,
+            self.settings.thresholds.sigma_floor(),
+        );
         let now = self.clock.now();
         let detections: Vec<_> = detectors::detect(obs, base, &self.settings.thresholds)
             .into_iter()
@@ -637,6 +641,7 @@ impl Engine {
         times: Option<&ObservationTimes>,
     ) {
         let mut closed: Vec<IssueId> = Vec::new();
+        let floor = self.settings.thresholds.sigma_floor();
         for issue in self.issues.iter_mut() {
             if !issue.state.is_open() {
                 continue;
@@ -671,7 +676,7 @@ impl Engine {
                 _ => {}
             }
             let mut values = metric_values(&scoped);
-            add_sigma_metrics(&mut values, &scoped, base);
+            add_sigma_metrics(&mut values, &scoped, base, floor);
             let holding = if issue.rule.starts_with("egress.") {
                 obs.egress
                     .as_ref()
@@ -1215,19 +1220,25 @@ impl Verdict {
     }
 }
 
-/// Derive the σ-denominated metrics from the raw readings and the baselines.
+/// Derive the σ-denominated metrics from the raw readings and the baselines,
+/// scored against the same floored σ the detectors open on.
 ///
 /// A rule that opened because a value was 3σ above baseline closes when it is
 /// back inside 3σ — not when it drops below some absolute number, which would
 /// be a different claim on every network.
-fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base: &BaselineStore) {
+fn add_sigma_metrics(
+    values: &mut HashMap<String, f64>,
+    obs: &Observations,
+    base: &BaselineStore,
+    floor: SigmaFloor,
+) {
     if let Some(t) = obs.targets.first() {
         let readings = t.stage_readings();
         let worst = readings
             .iter()
             .filter_map(|(metric, ms)| {
                 base.get(t.baseline_subject(), metric)
-                    .and_then(|b| b.sigma_above(*ms))
+                    .and_then(|b| b.sigma_above(*ms, floor))
             })
             .reduce(f64::max);
         // Every stage within its baseline, or none has one yet: nothing slow.
@@ -1237,7 +1248,7 @@ fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base
         if let (Some(addr), Some(rtt)) = (&gw.addr, gw.rtt_ms) {
             if let Some(sigma) = base
                 .get(addr, "gateway.rtt")
-                .and_then(|b| b.sigma_above(rtt))
+                .and_then(|b| b.sigma_above(rtt, floor))
             {
                 values.insert("gateway.rtt_sigma".to_string(), sigma);
             }
@@ -1251,7 +1262,7 @@ fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base
         let sigma = base
             .get(&path.target, "path.rtt")
             .or_else(|| base.get("internet", "path.rtt"))
-            .and_then(|b| b.sigma_above(rtt));
+            .and_then(|b| b.sigma_above(rtt, floor));
         if let Some(sigma) = sigma {
             values.insert("path.rtt_sigma".to_string(), sigma);
             values.insert("path.rtt".to_string(), rtt);
@@ -2537,6 +2548,46 @@ mod tests {
         assert!(
             closed <= 3,
             "history limit not enforced: {closed} closed issues"
+        );
+    }
+
+    /// The verify reads `gateway.rtt_sigma`, scored against the same floored
+    /// σ as the open. Scored raw, a 0.9ms gateway with σ 0.05 that settles
+    /// at 1.3ms would sit at 8σ and its issue would never close.
+    #[test]
+    fn a_gateway_back_inside_the_floor_closes() {
+        let gw = "192.168.8.1";
+        let mut b = base();
+        b.seed(gw, "gateway.rtt", 0.9, 0.05, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:00:00");
+        let gateway = |rtt: f64| Observations {
+            gateway: Some(GatewayObs {
+                addr: Some(gw.into()),
+                rtt_ms: Some(rtt),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            ..Default::default()
+        };
+        let state = |e: &Engine| {
+            e.issues()
+                .iter()
+                .find(|i| i.rule == "gateway.rtt_spike")
+                .map(|i| i.state.clone())
+        };
+        e.observe(&gateway(5.0), &b);
+        assert_eq!(state(&e), Some(IssueState::Open), "8.2σ over the floor");
+
+        for _ in 0..=24 {
+            clock.advance_secs(5);
+            e.observe(&gateway(1.3), &b);
+        }
+        assert!(
+            matches!(state(&e), Some(IssueState::AutoClosed { .. })),
+            "0.8σ held for 120s: {:?}",
+            state(&e)
         );
     }
 

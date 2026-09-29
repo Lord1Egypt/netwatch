@@ -275,7 +275,9 @@ impl App {
         );
         self.record_episode_tick(&observations, &readings, events, now, wall);
 
-        self.diagnose.baselines.set_gate_sigma(thresholds.sigma_k);
+        self.diagnose
+            .baselines
+            .set_gate(thresholds.sigma_k, thresholds.sigma_floor());
         crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
 
         // Keep the cursor on a real row as issues open and close.

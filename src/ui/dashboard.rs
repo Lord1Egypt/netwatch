@@ -148,8 +148,11 @@ impl Reading {
             );
         };
 
-        let sigma = base.sigma();
-        let above = base.sigma_above(v).unwrap_or(0.0);
+        // The floored σ Diagnose judges with, so a move the tab calls
+        // nominal does not turn this tile red.
+        let floor = app.diagnose.engine.settings().thresholds.sigma_floor();
+        let sigma = base.sigma_floored(floor);
+        let above = base.sigma_above(v, floor).unwrap_or(0.0);
         // Only deviation upward is interesting for a latency metric: a
         // resolver answering faster than baseline is not a finding.
         let (qualifier, severity) = if above >= 3.0 {

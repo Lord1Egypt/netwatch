@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::baseline::BaselineStore;
+use super::baseline::{BaselineStore, SigmaFloor, DEFAULT_SIGMA_FLOOR_MS, DEFAULT_SIGMA_FLOOR_PCT};
 use super::issue::{
     Action, Availability, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject,
     Verify,
@@ -30,6 +30,11 @@ use super::rules;
 pub struct Thresholds {
     /// σ multiple that counts as a deviation.
     pub sigma_k: f64,
+    /// Smallest σ, in ms, a baseline is judged against, so a baseline that
+    /// has barely varied does not score an unnoticeable move as many σ.
+    pub sigma_floor_ms: f64,
+    /// Smallest σ as a percentage of the baseline's mean.
+    pub sigma_floor_pct: f64,
     /// Consecutive violating samples before an issue opens (hysteresis).
     pub consecutive_n: u32,
     /// A socket verdict must persist this long before it becomes an issue.
@@ -71,6 +76,8 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             sigma_k: 3.0,
+            sigma_floor_ms: DEFAULT_SIGMA_FLOOR_MS,
+            sigma_floor_pct: DEFAULT_SIGMA_FLOOR_PCT,
             consecutive_n: 3,
             verdict_hold_secs: 30,
             dns_ceiling_ms: 100.0,
@@ -88,6 +95,14 @@ impl Default for Thresholds {
 }
 
 impl Thresholds {
+    /// The floor under every baseline's σ, for scoring and for learning.
+    pub fn sigma_floor(&self) -> SigmaFloor {
+        SigmaFloor {
+            ms: self.sigma_floor_ms,
+            pct: self.sigma_floor_pct,
+        }
+    }
+
     /// These thresholds with every value that cannot mean anything put back
     /// to its default, and one warning per value put back.
     ///
@@ -103,6 +118,10 @@ impl Thresholds {
         let above_zero: Rule = (
             |v| v > 0.0 && v.is_finite(),
             "must be a finite number above 0",
+        );
+        let at_least_zero: Rule = (
+            |v| v >= 0.0 && v.is_finite(),
+            "must be a finite number of 0 or more",
         );
         let share: Rule = (|v| (0.0..=100.0).contains(&v), "must be within 0..=100");
         let number: Rule = (|v| v.is_finite(), "must be a finite number");
@@ -120,6 +139,8 @@ impl Thresholds {
             }
         };
         check("sigma_k", |t| &mut t.sigma_k, above_zero);
+        check("sigma_floor_ms", |t| &mut t.sigma_floor_ms, at_least_zero);
+        check("sigma_floor_pct", |t| &mut t.sigma_floor_pct, share);
         check("dns_ceiling_ms", |t| &mut t.dns_ceiling_ms, number);
         check("socket_rtt_ms", |t| &mut t.socket_rtt_ms, number);
         check(
@@ -1052,8 +1073,8 @@ fn target_detection(
                     *cause,
                     *word,
                     ms,
-                    b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
-                    b.map(|b| b.mean),
+                    b.and_then(|b| ms.and_then(|v| b.sigma_above(v, t.sigma_floor()))),
+                    b.map(|b| (b.mean, b.sigma_floored(t.sigma_floor()))),
                     *applies,
                 )
             })
@@ -1066,14 +1087,14 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
-        let (_, word, ms, _, mean, _) = worst.0;
+        let (_, word, ms, _, baseline, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
             ms.unwrap_or_default(),
             "ms",
         );
-        if let Some(mean) = mean {
-            ev = ev.with_baseline(*mean, 0.0);
+        if let Some((mean, sigma)) = baseline {
+            ev = ev.with_baseline(*mean, *sigma);
         }
         d.evidence.push(ev);
         d.evidence
@@ -1627,7 +1648,7 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
         // without a baseline this rule stays quiet rather than guessing.
         return vec![];
     };
-    let Some(sigma) = b.sigma_above(rtt) else {
+    let Some(sigma) = b.sigma_above(rtt, t.sigma_floor()) else {
         return vec![];
     };
     if sigma < t.sigma_k {
@@ -1638,7 +1659,7 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
     d.subject = Subject::Host;
     d.evidence.push(
         Evidence::new("gateway.rtt", rtt, "ms")
-            .with_baseline(b.mean, b.sigma())
+            .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
             .with_window(30, 30),
     );
     d.evidence
@@ -1946,7 +1967,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     let baseline = base.get(&dns.resolver, "dns.rtt_p50");
     let over_ceiling = p50 > t.dns_ceiling_ms;
     let over_sigma = baseline
-        .and_then(|b| b.sigma_above(p50))
+        .and_then(|b| b.sigma_above(p50, t.sigma_floor()))
         .map(|s| s >= t.sigma_k)
         .unwrap_or(false);
 
@@ -1956,7 +1977,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
 
     let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(dns.window_secs, dns.queries);
     if let Some(b) = baseline {
-        ev = ev.with_baseline(b.mean, b.sigma());
+        ev = ev.with_baseline(b.mean, b.sigma_floored(t.sigma_floor()));
     }
 
     let mut d = Detection::new(
@@ -2279,7 +2300,7 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
     let b = base
         .get(&path.target, "path.rtt")
         .or_else(|| base.get("internet", "path.rtt"))?;
-    let sigma = b.sigma_above(rtt)?;
+    let sigma = b.sigma_above(rtt, t.sigma_floor())?;
     if sigma < t.sigma_k {
         return None;
     }
@@ -2303,7 +2324,7 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
     );
     d.evidence.push(
         Evidence::new("path.rtt", rtt, "ms")
-            .with_baseline(b.mean, b.sigma())
+            .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
             .with_window(60, 60),
     );
     d.evidence
@@ -3484,6 +3505,34 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_resolver_baseline_is_judged_against_the_floor() {
+        // 1.2ms with σ 0.05: raw, 1.5ms is 6σ; against the 0.5ms floor it is
+        // 0.6σ, and 3ms is 3.6σ.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.05, 2_000);
+        let slow = |p50: f64, t: &Thresholds| {
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            detect(&obs_with_dns(dns), &base, t)
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+        };
+        let t = Thresholds::default();
+        assert!(slow(1.5, &t).is_none());
+        let unfloored = Thresholds {
+            sigma_floor_ms: 0.0,
+            sigma_floor_pct: 0.0,
+            ..t
+        };
+        assert!(slow(1.5, &unfloored).is_some());
+
+        let d = slow(3.0, &t).expect("3.6σ against the floor");
+        // The evidence carries the σ the resolver was judged against.
+        assert_eq!(d.evidence[0].sigma, Some(0.5));
+        assert!((d.evidence[0].sigma_above().unwrap() - 3.6).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_lowered_dns_ceiling_fires_where_the_default_does_not() {
         // A 40ms resolver on a first run, with no baseline: under the 100ms
         // default it is ordinary, under a configured 30ms ceiling it is slow.
@@ -3511,6 +3560,7 @@ mod tests {
 
         let (t, warnings) = Thresholds {
             sigma_k: 0.0,
+            sigma_floor_ms: -0.5,
             consecutive_n: 0,
             saturation_pct: 150.0,
             dns_tc_pct: -1.0,
@@ -3521,6 +3571,7 @@ mod tests {
             iface_drop_floor: f64::NEG_INFINITY,
             // Valid values that are not the defaults are kept, the edges
             // of a share included.
+            sigma_floor_pct: 0.0,
             dns_mismatch_pct: 100.0,
             wifi_retry_pct: 0.0,
             wifi_rssi_dbm: -80.0,
@@ -3531,6 +3582,7 @@ mod tests {
         assert_eq!(
             t,
             Thresholds {
+                sigma_floor_pct: 0.0,
                 dns_mismatch_pct: 100.0,
                 wifi_retry_pct: 0.0,
                 wifi_rssi_dbm: -80.0,
@@ -3542,6 +3594,7 @@ mod tests {
             warnings,
             [
                 "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
+                "diagnose_thresholds.sigma_floor_ms = -0.5 must be a finite number of 0 or more, so the default 0.5 is used",
                 "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
                 "diagnose_thresholds.loaded_rtt_delta_ms = inf must be a finite number, so the default 100 is used",
                 "diagnose_thresholds.saturation_pct = 150 must be within 0..=100, so the default 90 is used",
@@ -4372,7 +4425,7 @@ mod tests {
         let base = fixture::baselines();
         let found = detect(&obs, &base, &Thresholds::default());
         assert!(!rules_of(&found).contains(&"link.down"));
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let link_down = coverage
             .rules
             .iter()
@@ -4485,7 +4538,11 @@ mod tests {
             iface: Some(uncounted_drops(3)),
             ..Default::default()
         };
-        let coverage = crate::diagnose::coverage::Coverage::from_observations(&obs, &store());
+        let coverage = crate::diagnose::coverage::Coverage::from_observations(
+            &obs,
+            &store(),
+            Default::default(),
+        );
         let row = coverage
             .rules
             .iter()
@@ -4693,7 +4750,7 @@ mod tests {
         }
 
         let coverage_of = |dns: DnsObs| {
-            Coverage::from_observations(&obs_with_dns(dns), &store())
+            Coverage::from_observations(&obs_with_dns(dns), &store(), Default::default())
                 .rules
                 .into_iter()
                 .find(|r| r.rule == "dns.slow_resolver")

@@ -661,6 +661,7 @@ mod tests {
         r.coverage = crate::diagnose::coverage::Coverage::from_observations(
             &crate::diagnose::detectors::Observations::default(),
             &base,
+            Default::default(),
         );
         let md = r.to_markdown();
         assert!(md.contains("| Area "), "{md}");

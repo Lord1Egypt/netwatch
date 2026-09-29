@@ -1029,6 +1029,7 @@ mod tests {
                 ..Default::default()
             },
             &crate::diagnose::fixture::baselines(),
+            Default::default(),
         );
         let weak_signal = coverage
             .rules

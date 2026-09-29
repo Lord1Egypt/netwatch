@@ -511,7 +511,8 @@ pub fn record(scenario: &Scenario) -> Episode {
             scenario.id,
             scenario.secs
         );
-        base.set_gate_sigma(engine.settings().thresholds.sigma_k);
+        let thresholds = engine.settings().thresholds;
+        base.set_gate(thresholds.sigma_k, thresholds.sigma_floor());
         clock.advance_secs(1);
     }
     let mut ep = rec

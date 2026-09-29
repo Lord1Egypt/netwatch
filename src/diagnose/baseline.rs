@@ -54,6 +54,13 @@ pub const DEFAULT_GATE_SIGMA: f64 = 3.0;
 /// learning, clamped to the gate so the move is gradual.
 pub const MAX_HOLD_SECS: f64 = 6.0 * 3_600.0;
 
+/// Smallest σ, in ms, a baseline is scored against. Every baselined metric is
+/// a latency in ms.
+pub const DEFAULT_SIGMA_FLOOR_MS: f64 = 0.5;
+
+/// Smallest σ as a percentage of the baseline's mean.
+pub const DEFAULT_SIGMA_FLOOR_PCT: f64 = 5.0;
+
 /// Seconds credited per sample when migrating a v1 file, which counted
 /// samples only. One probe every 5 ticks at the default 1s refresh.
 const V1_SECS_PER_SAMPLE: f64 = 5.0;
@@ -144,6 +151,31 @@ impl NetworkFingerprint {
     }
 }
 
+/// The smallest σ a baseline is judged against: the larger of `ms` and `pct`
+/// percent of the mean.
+///
+/// ## Why σ has a floor
+///
+/// A resolver that answers from cache in 1.2ms, give or take 0.05ms, learns
+/// a σ of 0.05ms, and a 1.35ms answer then scores 3σ. Nobody can feel that
+/// difference, but the rule fires, and the learning gate refuses the reading
+/// as an outlier. The floor makes a σ score mean a move a person could
+/// notice: that baseline is judged against 0.5ms, so 3σ is 2.7ms.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SigmaFloor {
+    pub ms: f64,
+    pub pct: f64,
+}
+
+impl Default for SigmaFloor {
+    fn default() -> Self {
+        Self {
+            ms: DEFAULT_SIGMA_FLOOR_MS,
+            pct: DEFAULT_SIGMA_FLOOR_PCT,
+        }
+    }
+}
+
 /// One metric's learned distribution on one subject.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Baseline {
@@ -190,15 +222,25 @@ impl Baseline {
         }
     }
 
+    /// The σ this baseline learned, with no floor. Only the Packets overlay
+    /// shows it; every judgement uses [`Self::sigma_floored`].
     pub fn sigma(&self) -> f64 {
         self.variance.max(0.0).sqrt()
     }
 
-    /// How many σ above the mean `value` sits. `None` when σ is zero — a
-    /// metric that has never varied cannot be scored in σ, and dividing by
-    /// zero would make every sample infinitely anomalous.
-    pub fn sigma_above(&self, value: f64) -> Option<f64> {
-        let s = self.sigma();
+    /// σ raised to `floor`: `max(σ, floor.ms, floor.pct% of |mean|)`.
+    pub fn sigma_floored(&self, floor: SigmaFloor) -> f64 {
+        self.sigma()
+            .max(floor.ms)
+            .max(floor.pct / 100.0 * self.mean.abs())
+    }
+
+    /// How many floored σ above the mean `value` sits. `None` only when the
+    /// floored σ is zero, which takes a floor configured to zero — a metric
+    /// that has never varied cannot be scored in σ, and dividing by zero
+    /// would make every sample infinitely anomalous.
+    pub fn sigma_above(&self, value: f64, floor: SigmaFloor) -> Option<f64> {
+        let s = self.sigma_floored(floor);
         if s <= f64::EPSILON {
             None
         } else {
@@ -299,6 +341,9 @@ pub struct BaselineStore {
     min_observed_secs: f64,
     min_samples: u32,
     gate_sigma: f64,
+    /// The floor under σ for the gate and its clamp, kept in step with the
+    /// detectors' by [`Self::set_gate`].
+    sigma_floor: SigmaFloor,
     /// Set when `current` changed since load — the UI says so, and rules stay
     /// quiet until the new network's baselines are ready.
     switched: bool,
@@ -314,6 +359,7 @@ impl BaselineStore {
             min_observed_secs: DEFAULT_MIN_OBSERVED_SECS,
             min_samples: DEFAULT_MIN_SAMPLES,
             gate_sigma: DEFAULT_GATE_SIGMA,
+            sigma_floor: SigmaFloor::default(),
             switched: false,
             dirty: false,
         }
@@ -334,10 +380,11 @@ impl BaselineStore {
         self
     }
 
-    /// Keep the learning gate in step with the detectors' `sigma_k`, which a
-    /// user can change in settings.
-    pub fn set_gate_sigma(&mut self, sigma: f64) {
+    /// Keep the learning gate in step with the detectors' `sigma_k` and σ
+    /// floor, which a user can change in settings.
+    pub fn set_gate(&mut self, sigma: f64, floor: SigmaFloor) {
         self.gate_sigma = sigma;
+        self.sigma_floor = floor;
     }
 
     pub fn fingerprint(&self) -> &NetworkFingerprint {
@@ -376,7 +423,7 @@ impl BaselineStore {
     /// plain EWMA a sustained slowdown pulls the mean up until the detector
     /// stops firing, and the issue auto-closes while the user is still
     /// suffering it. So once a baseline is ready, a reading at or above
-    /// `gate_sigma` is not learned. If that lasts longer than
+    /// `gate_sigma` floored σ is not learned. If that lasts longer than
     /// [`MAX_HOLD_SECS`] the network has most likely changed for good, and
     /// readings are learned again but clamped to the gate, so the baseline
     /// walks toward the new level instead of jumping to it.
@@ -394,9 +441,10 @@ impl BaselineStore {
                 label,
             });
         self.dirty = true;
-        let (tau, gate, min_samples, min_secs) = (
+        let (tau, gate, floor, min_samples, min_secs) = (
             self.tau_secs,
             self.gate_sigma,
+            self.sigma_floor,
             self.min_samples,
             self.min_observed_secs,
         );
@@ -408,7 +456,7 @@ impl BaselineStore {
 
         let dt = b.step(at);
         let ready = b.samples >= min_samples && b.observed_secs >= min_secs;
-        let over_gate = ready && b.sigma_above(value).is_some_and(|s| s >= gate);
+        let over_gate = ready && b.sigma_above(value, floor).is_some_and(|s| s >= gate);
         if !over_gate {
             b.held_secs = 0.0;
             b.update(value, dt, tau);
@@ -418,7 +466,7 @@ impl BaselineStore {
         if b.held_secs <= MAX_HOLD_SECS {
             return Learned::Gated;
         }
-        let ceiling = b.mean + gate * b.sigma();
+        let ceiling = b.mean + gate * b.sigma_floored(floor);
         b.update(value.min(ceiling), dt, tau);
         Learned::Clamped
     }
@@ -577,6 +625,10 @@ pub struct BaselineSnapshot {
     pub min_observed_secs: f64,
     pub min_samples: u32,
     pub gate_sigma: f64,
+    /// Absent from episodes recorded before the floor existed, which replay
+    /// with today's default.
+    #[serde(default)]
+    pub sigma_floor: SigmaFloor,
     /// Keyed as in `baselines.json`: `"subject\u{1f}metric"`. Ordered, so a
     /// recorded episode serializes the same way on every run.
     pub metrics: BTreeMap<String, Baseline>,
@@ -591,6 +643,7 @@ impl BaselineStore {
             min_observed_secs: self.min_observed_secs,
             min_samples: self.min_samples,
             gate_sigma: self.gate_sigma,
+            sigma_floor: self.sigma_floor,
             metrics: self
                 .networks
                 .get(&self.current.key())
@@ -608,6 +661,7 @@ impl BaselineStore {
         self.min_observed_secs = snap.min_observed_secs;
         self.min_samples = snap.min_samples;
         self.gate_sigma = snap.gate_sigma;
+        self.sigma_floor = snap.sigma_floor;
         self.networks.insert(
             snap.network.key(),
             NetworkBaselines {
@@ -801,7 +855,7 @@ mod tests {
         }
         let after = s.get("r", "m").unwrap();
         assert_eq!(after.mean, before.mean);
-        assert!(after.sigma_above(90.0).unwrap() >= DEFAULT_GATE_SIGMA);
+        assert!(after.sigma_above(90.0, SigmaFloor::default()).unwrap() >= DEFAULT_GATE_SIGMA);
     }
 
     #[test]
@@ -820,7 +874,8 @@ mod tests {
 
         assert_eq!(s.observe("r", "m", 40.0, t), Learned::Clamped);
         let b = s.get("r", "m").unwrap();
-        let ceiling = before.mean + DEFAULT_GATE_SIGMA * before.sigma();
+        let ceiling =
+            before.mean + DEFAULT_GATE_SIGMA * before.sigma_floored(SigmaFloor::default());
         assert!(
             b.mean > before.mean,
             "a clamped reading still moves the mean"
@@ -880,13 +935,73 @@ mod tests {
     }
 
     #[test]
-    fn sigma_is_none_for_a_metric_that_never_varied() {
+    fn a_flat_baseline_scores_against_the_floor_not_zero() {
+        // A LAN resolver answering from cache: 1.2ms, σ 0.05ms. Raw, 2.7ms
+        // would be 30σ; against the 0.5ms floor it is 3σ.
+        let mut s = BaselineStore::new(office());
+        s.seed("r", "m", 1.2, 0.05, 2_400);
+        let b = s.get("r", "m").unwrap();
+        let floor = SigmaFloor::default();
+        assert!((b.sigma() - 0.05).abs() < 1e-9, "raw σ is kept");
+        assert_eq!(b.sigma_floored(floor), 0.5);
+        assert!((b.sigma_above(2.7, floor).unwrap() - 3.0).abs() < 1e-9);
+
+        // A metric that never varied is scored against the floor too,
+        // rather than not at all.
         let mut s = BaselineStore::new(office())
             .with_min_samples(2)
             .with_min_observed_secs(10.0);
         feed(&mut s, 5.0, 0.0, 5.0, 50.0);
         let b = s.get("r", "m").unwrap();
-        assert_eq!(b.sigma_above(500.0), None);
+        assert_eq!(b.sigma(), 0.0);
+        assert!((b.sigma_above(6.5, floor).unwrap() - 3.0).abs() < 1e-9);
+        // With both floors set to zero there is nothing to divide by.
+        let none = SigmaFloor { ms: 0.0, pct: 0.0 };
+        assert_eq!(b.sigma_above(500.0, none), None);
+    }
+
+    #[test]
+    fn the_floor_is_five_percent_of_a_large_mean() {
+        // A 40ms mobile resolver with σ 0.4ms: 5% of the mean, 2ms, is the
+        // largest of the three, so 3σ is 46ms, not 41.2ms.
+        let mut s = BaselineStore::new(office());
+        s.seed("r", "m", 40.0, 0.4, 2_400);
+        let b = s.get("r", "m").unwrap();
+        let floor = SigmaFloor::default();
+        assert!((b.sigma_floored(floor) - 2.0).abs() < 1e-9);
+        assert!((b.sigma_above(46.0, floor).unwrap() - 3.0).abs() < 1e-9);
+        // A baseline noisier than either floor keeps its own σ.
+        s.seed("r", "m", 40.0, 3.0, 2_400);
+        assert_eq!(s.get("r", "m").unwrap().sigma_floored(floor), 3.0);
+    }
+
+    #[test]
+    fn the_gate_uses_the_floored_sigma() {
+        let flat = || {
+            let mut s = BaselineStore::new(office());
+            s.seed("r", "m", 1.2, 0.05, 2_400);
+            s
+        };
+        // 2.0ms is 16σ raw but 1.6σ floored: an ordinary reading, learned.
+        let mut s = flat();
+        assert_eq!(s.observe("r", "m", 2.0, 0.0), Learned::Accepted);
+        let mut unfloored = flat();
+        unfloored.set_gate(DEFAULT_GATE_SIGMA, SigmaFloor { ms: 0.0, pct: 0.0 });
+        assert_eq!(unfloored.observe("r", "m", 2.0, 0.0), Learned::Gated);
+
+        // 3.0ms is 3.6σ floored, so it is held out, and after the hold the
+        // clamp is 3 floored σ, 2.7ms, not 3 raw σ, 1.35ms.
+        assert_eq!(flat().observe("r", "m", 3.0, 0.0), Learned::Gated);
+        let mut s = flat();
+        let t = feed(&mut s, 3.0, 0.0, 5.0, MAX_HOLD_SECS);
+        assert_eq!(s.get("r", "m").unwrap().mean, 1.2, "held for six hours");
+        assert_eq!(s.observe("r", "m", 3.0, t), Learned::Clamped);
+        let alpha = 1.0 - (-5.0 / DEFAULT_TAU_SECS).exp();
+        let mean = s.get("r", "m").unwrap().mean;
+        assert!(
+            (mean - (1.2 + alpha * (2.7 - 1.2))).abs() < 1e-9,
+            "clamped to {mean}"
+        );
     }
 
     #[test]
@@ -910,7 +1025,7 @@ mod tests {
             b.sigma()
         );
         // A 12ms sample on a ±2 metric is not a 3σ event.
-        assert!(b.sigma_above(12.0).unwrap() < 3.0);
+        assert!(b.sigma_above(12.0, SigmaFloor::default()).unwrap() < 3.0);
     }
 
     #[test]
@@ -971,10 +1086,15 @@ mod tests {
             .with_min_samples(10)
             .with_min_observed_secs(100.0);
         let t = ready_noisy(&mut s, 10.0, 0.0, 5.0, 300.0);
+        // A floor of 5ms makes 12ms 0.4σ, where the default makes it 4σ, so
+        // a snapshot that dropped the floor would gate what this one learns.
+        s.set_gate(DEFAULT_GATE_SIGMA, SigmaFloor { ms: 5.0, pct: 0.0 });
         let snap = s.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         let mut back = BaselineStore::from_snapshot(&serde_json::from_str(&json).unwrap());
         assert_eq!(back.get("r", "m"), s.get("r", "m"));
+        assert_eq!(s.observe("r", "m", 12.0, t), Learned::Accepted);
+        assert_eq!(back.observe("r", "m", 12.0, t), Learned::Accepted);
         assert_eq!(
             back.observe("r", "m", 90.0, t),
             s.observe("r", "m", 90.0, t)
