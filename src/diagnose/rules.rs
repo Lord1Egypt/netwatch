@@ -898,7 +898,9 @@ mod tests {
 
     /// The quantities a trigger quotes. Digits glued to a word name
     /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
-    /// number (100ms, 30s, 3σ) is part of one.
+    /// number (100ms, 30s, 3σ) is part of one. Any other suffix panics
+    /// rather than being skipped, so a new one (2x, 10min) must be listed
+    /// here as a unit or a name before the guard can pass.
     fn quoted_numbers(text: &str) -> Vec<f64> {
         let chars: Vec<char> = text.chars().collect();
         let mut out = Vec::new();
@@ -917,10 +919,15 @@ mod tests {
                 .iter()
                 .take_while(|c| c.is_alphabetic())
                 .collect();
-            if !matches!(unit.as_str(), "" | "ms" | "s" | "σ") {
-                continue;
+            match unit.as_str() {
+                "" | "ms" | "s" | "σ" => {}
+                "xx" => continue,
+                _ => panic!("{text:?}: is {digits}{unit} a quantity or a name? list {unit:?} in quoted_numbers"),
             }
-            let value: f64 = digits.trim_end_matches('.').parse().expect("a number");
+            let value: f64 = digits
+                .trim_end_matches('.')
+                .parse()
+                .unwrap_or_else(|_| panic!("{text:?}: {digits:?} is not a number"));
             let negative = start > 0
                 && matches!(chars[start - 1], '-' | '−')
                 && (start < 2 || !chars[start - 2].is_alphanumeric());
@@ -940,6 +947,19 @@ mod tests {
             [-70.0, 20.0, 30.0]
         );
         assert!(quoted_numbers("a v6 route while v4 works answers 5xx").is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "\"p50 ≥ 2x mean\": is 2x a quantity or a name?")]
+    fn quoted_numbers_refuses_a_suffix_it_does_not_know() {
+        // Skipping it would let "2x" or "10min" leave the guard unchecked.
+        quoted_numbers("p50 ≥ 2x mean");
+    }
+
+    #[test]
+    #[should_panic(expected = "\"answers 1.1.1.1\": \"1.1.1.1\" is not a number")]
+    fn quoted_numbers_names_the_text_it_cannot_read() {
+        quoted_numbers("answers 1.1.1.1");
     }
 
     /// The drift test above only proves the document matches the catalogue.
