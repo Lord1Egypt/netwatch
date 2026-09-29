@@ -152,6 +152,11 @@ same numbers.
 differs from the defaults. Then they write every key, and a key in the file
 keeps its value when a later release retunes that default.
 
+`sigma_k` also sets what the baselines learn: a reading that many σ or more
+above normal is left out, so an incident does not become the new normal. A low
+value leaves out ordinary peaks too, so the saved baselines settle lower and
+flag more, and they take time to relearn after the value is raised again.
+
 ## Diagnose coverage in terminal Netwatch
 
 Press **9**, then **c** to inspect every check. Use **↑/↓** to select a row.
