@@ -156,8 +156,8 @@ coverage` also print it to stderr. So is a `sigma_close_k` at or above
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
-threshold's default: one from before 0.34 is judged against the σ floor it ran
-without.
+threshold's default: one from before 0.34 is judged against the σ and delta
+floors and the 2σ close line it ran without.
 `--generate-config` and the Settings editor's save write the table only once it
 differs from the defaults. Then they write every key, and a key in the file
 keeps its value when a later release retunes that default.
@@ -173,9 +173,11 @@ rise. `gateway.rtt_spike` needs the gateway 10 ms slower than its mean: a wired
 gateway moving from 2 to 9 ms is 14σ over the floor. `dns.slow_resolver` needs
 the resolver's median 5 ms slower than its mean and at least twice it before
 its baseline opens an issue: a LAN resolver moving from 1.2 to 2.7 ms is 3σ,
-and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from 1 to
-4 ms is never reported, on purpose. The 100 ms ceiling does not wait for a
-baseline. Setting these three to 0 judges by σ alone.
+and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from
+1 to 4 ms is never reported, on purpose. The 100 ms ceiling does not wait for
+a baseline. Setting these three to 0 judges by σ alone. The Dashboard's tiles
+do not apply them, so a move under these floors can turn one red with no issue
+raised.
 
 `gateway.rtt_spike`, `path.rtt_spike` and `target.slow_stage` open at 3σ and
 close only once the metric has stayed under 2σ for the verify hold. With one
