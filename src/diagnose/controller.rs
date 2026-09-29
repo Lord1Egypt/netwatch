@@ -4,7 +4,7 @@
 //! This is `App` code kept out of `app.rs`. The tick reads collectors that
 //! `App` owns (the health prober, the traceroute runner, the config), so the
 //! methods stay on `App` and only the file changed. `App` holds all of the
-//! tab's state in one field, [`DiagnoseState`].
+//! tab's state in one field, [`DiagnoseController`].
 
 use crate::app::{export_dir, App};
 
@@ -14,7 +14,7 @@ use crate::app::{export_dir, App};
 /// because they are only meaningful together: an issue's σ figures come from
 /// the baselines, and its "applied" status comes from the journal. Splitting
 /// them across `App` would let a render read one without the others.
-pub struct DiagnoseState {
+pub struct DiagnoseController {
     pub engine: crate::diagnose::Engine,
     pub baselines: crate::diagnose::baseline::BaselineStore,
     pub sampler: crate::diagnose::live::LiveSampler,
@@ -55,7 +55,7 @@ pub struct DiagnoseState {
     pub target_prober: crate::diagnose::targets::TargetProber,
 }
 
-impl DiagnoseState {
+impl DiagnoseController {
     pub(crate) fn new() -> Self {
         let fingerprint =
             crate::diagnose::baseline::NetworkFingerprint::new(String::new(), None, vec![], None);

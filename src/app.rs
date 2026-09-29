@@ -14,7 +14,7 @@ use crate::collectors::whois::WhoisCache;
 use crate::config::NetwatchConfig;
 use crate::diagnose::controller::{
     apply_pending_remediation, diagnose_summary, export_diagnose_report, selected_issue_id,
-    stage_remediation, DiagnoseState,
+    stage_remediation, DiagnoseController,
 };
 use crate::event::{AppEvent, EventHandler};
 use crate::platform::{self, InterfaceInfo};
@@ -526,8 +526,8 @@ pub struct App {
     /// does not report worker resource readiness or confinement.
     pub sandbox_report: crate::sandbox::Report,
     workers_started: bool,
-    /// Issue detection, baselines and remediation. See [`DiagnoseState`].
-    pub diagnose: DiagnoseState,
+    /// Issue detection, baselines and remediation. See [`DiagnoseController`].
+    pub diagnose: DiagnoseController,
 }
 
 /// State of the PKTAP attribution path for status display. macOS-only;
@@ -674,7 +674,7 @@ impl App {
             pktap_handle: None,
             sandbox_report: crate::sandbox::Report::default(),
             workers_started: false,
-            diagnose: DiagnoseState::new(),
+            diagnose: DiagnoseController::new(),
         }
     }
 
