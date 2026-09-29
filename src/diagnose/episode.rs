@@ -19,7 +19,7 @@
 //!
 //! Recording is local. Nothing here uploads or redacts; exports do that.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -345,7 +345,10 @@ struct Active {
     /// Network of the last snapshot kept, so later frames only carry one
     /// when it changes.
     network: Option<super::baseline::NetworkFingerprint>,
-    open: HashMap<String, Issue>,
+    /// By key, so issues that open or close on the same tick, and the final
+    /// snapshots, are written in one order. A hashed map wrote them in a
+    /// different order each run, and the pinned corpus with them.
+    open: BTreeMap<String, Issue>,
     started_at: f64,
     all_closed_since: Option<f64>,
 }
@@ -379,7 +382,7 @@ impl Recorder {
     /// Record one tick. Returns an episode when one finished on this tick.
     pub fn record(&mut self, tick: Tick<'_>) -> Option<Episode> {
         let frame = self.frame(&tick);
-        let open: HashMap<String, &Issue> = tick
+        let open: BTreeMap<String, &Issue> = tick
             .engine
             .primary()
             .into_iter()
@@ -543,14 +546,14 @@ impl Recorder {
                 labels: vec![],
             },
             network,
-            open: HashMap::new(),
+            open: BTreeMap::new(),
             started_at,
             all_closed_since: None,
         });
     }
 
     /// Snapshot issues as they open and close.
-    fn track(&mut self, tick: &Tick<'_>, open: &HashMap<String, &Issue>) {
+    fn track(&mut self, tick: &Tick<'_>, open: &BTreeMap<String, &Issue>) {
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -1786,6 +1789,22 @@ mod tests {
         assert!(!serde_json::to_string(&open)
             .unwrap()
             .contains("close_reason"));
+    }
+
+    #[test]
+    fn snapshots_taken_on_one_tick_are_in_key_order() {
+        // Three issues are still open when the fixture episode ends. A hashed
+        // map wrote their final snapshots in a new order each run, so the
+        // pinned corpus changed on every regeneration.
+        let ep = crate::diagnose::fixture::episode();
+        let finals: Vec<String> = ep
+            .issues
+            .iter()
+            .filter(|s| s.reason == SnapshotReason::Final)
+            .map(|s| issue_key(&s.issue))
+            .collect();
+        assert_eq!(finals.len(), 3, "{finals:?}");
+        assert!(finals.is_sorted(), "{finals:?}");
     }
 
     #[test]
