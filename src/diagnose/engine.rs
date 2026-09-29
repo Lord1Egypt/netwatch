@@ -2508,6 +2508,44 @@ mod tests {
                 expired(reason, "2026-09-03 06:49:11")
             );
         }
+
+        // Still there: a duplicated name, one of whose entries keeps the
+        // revision, and an issue found with no revision to compare against.
+        let mut unrevised = target_obs("", true);
+        unrevised.baseline_key = None;
+        for (found, after, case) in [
+            (
+                target_obs("target-config:aaaa", true),
+                targets_config(&["target-config:bbbb", "target-config:aaaa"]),
+                "duplicated name",
+            ),
+            (
+                unrevised,
+                targets_config(&["target-config:bbbb"]),
+                "no revision",
+            ),
+        ] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![found],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            let after = Observations {
+                config: after,
+                ..Default::default()
+            };
+            for _ in 0..120 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{case}");
+        }
     }
 
     #[test]
