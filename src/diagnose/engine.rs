@@ -138,7 +138,7 @@ fn sample_time(
 /// | Target | its name has left the config, or no entry under its name has the revision the issue was found under |
 /// | Resolver | it has left the system resolvers, and so has any resolver an applied step switched to |
 /// | Path (`path.*`) | it was the periodic trace target while open, periodic tracing is still on, and the trace target is now another |
-/// | Iface | the interface collector is fresh (≤ 15 s) and the platform no longer lists it |
+/// | Iface | the interface collector is fresh (≤ 15 s) and does not read it, and the platform no longer lists it |
 /// | Host, anything else, or no recorded config | never |
 ///
 /// The returned reason is authored text, never the subject's name, because
@@ -201,7 +201,10 @@ fn subject_gone(
                 .then_some("trace target changed")
         }
         Subject::Iface { name } => {
-            let listed = config.interfaces.as_ref()?.contains(name);
+            // The list lags the collector, and on Windows may name adapters
+            // differently, so a fresh reading of the interface keeps it.
+            let listed = config.interfaces.as_ref()?.contains(name)
+                || obs.iface.as_ref().is_some_and(|i| &i.name == name);
             (!listed && fresh(|t| t.interface, 15)).then_some("interface removed")
         }
         _ => None,
@@ -2785,7 +2788,21 @@ mod tests {
             config: listing(&["lo"]),
             ..Default::default()
         };
-        for collector_runs in [true, false] {
+        // Replugged, or brought up after `diagnose run` read the list: the
+        // collector reads it while the list does not name it yet.
+        let unlisted = Observations {
+            iface: Some(IfaceObs {
+                carrier: None,
+                ..down.iface.clone().unwrap()
+            }),
+            config: listing(&["lo"]),
+            ..Default::default()
+        };
+        for (after, collector_runs, gone) in [
+            (&pulled, true, true),
+            (&pulled, false, false),
+            (&unlisted, true, false),
+        ] {
             let (mut e, clock) = engine_at("2026-09-03 06:48:10");
             let start = std::time::Instant::now();
             let at = |t| start + std::time::Duration::from_secs(t);
@@ -2794,10 +2811,10 @@ mod tests {
             for t in 1..=61 {
                 clock.advance_secs(1);
                 let ran = if collector_runs { t } else { 0 };
-                e.observe_live_at(&pulled, &b, &ran_at(start, ran), at(t));
+                e.observe_live_at(after, &b, &ran_at(start, ran), at(t));
             }
             let state = e.get(&id).unwrap().state.clone();
-            if collector_runs {
+            if gone {
                 assert_eq!(state, expired("interface removed", "2026-09-03 06:49:11"));
             } else {
                 assert_eq!(state, IssueState::Open);
