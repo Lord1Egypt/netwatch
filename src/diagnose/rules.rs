@@ -950,7 +950,9 @@ mod tests {
         use crate::diagnose::detectors::Thresholds;
 
         // The `Thresholds` fields each trigger quotes. A rule listed in
-        // neither table quotes no number.
+        // neither table quotes no number. Every field needs its own quote,
+        // so two fields that share a value (sigma_k and consecutive_n are
+        // both 3) need the number twice.
         const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
             ("dns.truncation_retry", &["dns_tc_pct"]),
             ("gateway.rtt_spike", &["sigma_k", "consecutive_n"]),
@@ -984,7 +986,6 @@ mod tests {
         };
         let sorted = |mut v: Vec<f64>| {
             v.sort_by(f64::total_cmp);
-            v.dedup();
             v
         };
 
