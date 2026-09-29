@@ -446,6 +446,15 @@ impl Engine {
             .count()
     }
 
+    /// The Issues the verdict line leaves out because they are muted, so the
+    /// line that stops counting them can say how many it left out.
+    pub fn muted_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|i| i.state.muted_until().is_some() && i.kind() == Kind::Issue)
+            .count()
+    }
+
     pub fn open_count(&self) -> usize {
         self.primary().len()
     }
@@ -605,6 +614,7 @@ impl Engine {
             self.settings.thresholds.sigma_floor(),
         );
         let now = self.clock.now();
+        self.end_mutes(now);
         let detections: Vec<_> = detectors::detect(obs, base, &self.settings.thresholds)
             .into_iter()
             .filter(|d| {
@@ -617,7 +627,7 @@ impl Engine {
         self.pending.retain(|key, _| seen.contains(key));
 
         for d in detections {
-            if self.is_open_key(&d.key()) {
+            if self.is_tracked_key(&d.key()) {
                 self.merge(d, now, now);
             } else if let Some(since) = self.confirmed(&d, live.map(|(t, _)| t), now) {
                 self.pending.remove(&d.key());
@@ -633,8 +643,27 @@ impl Engine {
         self.prune();
     }
 
-    fn is_open_key(&self, key: &str) -> bool {
-        self.get_by_key(key).is_some_and(|i| i.state.is_open())
+    /// Whether `key` already has an issue the engine is watching. A muted
+    /// issue counts: its condition coming back each tick is the same issue,
+    /// not a new one to confirm and file beside it.
+    fn is_tracked_key(&self, key: &str) -> bool {
+        self.get_by_key(key).is_some_and(|i| i.state.is_tracked())
+    }
+
+    /// Return every issue whose mute has run out to Open. Read from the clock,
+    /// not a timer, so a replayed episode ends each mute on the frame the live
+    /// engine did. A mute whose end does not parse has ended: one that never
+    /// ends would hide the issue for good.
+    fn end_mutes(&mut self, now: DateTime<Local>) {
+        for issue in &mut self.issues {
+            let ended = issue
+                .state
+                .muted_until()
+                .is_some_and(|until| parse_ts(until).is_none_or(|u| u <= now));
+            if ended {
+                issue.state = IssueState::Open;
+            }
+        }
     }
 
     /// Hysteresis for a condition that isn't open yet: it has to hold for
@@ -688,7 +717,9 @@ impl Engine {
 
         if let Some(id) = self.by_key.get(&key).cloned() {
             if let Some(idx) = self.issues.iter().position(|i| i.id == id) {
-                let reopening = !self.issues[idx].state.is_open();
+                // A muted issue is not reopening: its mute has not ended, or
+                // `end_mutes` would have made it Open already.
+                let reopening = !self.issues[idx].state.is_tracked();
                 let issue = &mut self.issues[idx];
 
                 if reopening {
@@ -717,8 +748,8 @@ impl Engine {
                     }
                 }
 
-                // A muted issue keeps accruing evidence silently; it just
-                // doesn't reach the verdict line.
+                // A muted issue keeps accruing evidence silently and stays
+                // muted; it just doesn't reach the verdict line.
                 issue.last_seen = ts.clone();
                 issue.stale_since = None;
                 issue.severity = d.severity;
@@ -787,6 +818,9 @@ impl Engine {
     /// `expire_after_secs` closes as Expired instead. One whose evidence has
     /// only stopped arriving stays open and records `stale_since`: a probe
     /// that cannot run looks just like a fault that has not cleared.
+    ///
+    /// Muted issues age like open ones. A mute quiets an issue; it does not
+    /// stop netwatch watching it clear.
     fn age_unseen(
         &mut self,
         seen: &[String],
@@ -804,7 +838,7 @@ impl Engine {
             .and_then(Duration::try_seconds)
             .unwrap_or(Duration::MAX);
         for issue in self.issues.iter_mut() {
-            if !issue.state.is_open() {
+            if !issue.state.is_tracked() {
                 continue;
             }
             if let (super::issue::Subject::Path { target }, Some(config)) =
@@ -963,12 +997,15 @@ impl Engine {
         });
     }
 
+    /// Drops the oldest closed issues past `history_limit`. A muted issue is
+    /// not history: pruning it would drop its key, and the next detection of
+    /// its condition would file a second issue.
     fn prune(&mut self) {
         let closed: Vec<usize> = self
             .issues
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.state.is_open())
+            .filter(|(_, i)| !i.state.is_tracked())
             .map(|(n, _)| n)
             .collect();
         if closed.len() <= self.settings.history_limit {
@@ -1131,8 +1168,8 @@ impl Engine {
 
     /// Decide pending verifications: closed issues recovered (fully, unless a
     /// re-run test still points at the cause), except hand-resolved and
-    /// expired ones, which nothing measured; open ones past their deadline
-    /// did not.
+    /// expired ones, which nothing measured; open and muted ones past their
+    /// deadline did not.
     fn decide_verifications(&mut self, now: DateTime<Local>) {
         use super::issue::VerifyOutcome;
         let ts = format_ts(now);
@@ -1176,12 +1213,14 @@ impl Engine {
             // Only an auto-close is measured: netwatch watched the verify
             // condition hold. A hand-resolved issue closed because someone
             // said so, and an expired one because its subject went away;
-            // neither is evidence that the step worked.
+            // neither is evidence that the step worked. A muted issue has
+            // not closed at all, so it waits for its deadline as an open one
+            // does.
             let outcome = if matches!(issue.state, IssueState::Resolved { .. }) {
                 Some(VerifyOutcome::ClosedByOperator)
             } else if matches!(issue.state, IssueState::Expired { .. }) {
                 Some(VerifyOutcome::NotMeasured)
-            } else if !issue.state.is_open() {
+            } else if !issue.state.is_tracked() {
                 Some(if still_supported {
                     VerifyOutcome::Partial
                 } else {
@@ -3423,14 +3462,175 @@ mod tests {
 
     #[test]
     fn muted_issues_leave_the_verdict_line_but_stay_in_the_list() {
-        let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+
+        assert!(e.verdict(&b).is_clear(), "a muted issue must not shout");
+        assert_eq!(e.muted_count(), 1, "the verdict says what it left out");
+        assert_eq!(e.issues().len(), 1, "but it is still on the Diagnose tab");
+        assert_eq!(
+            e.get(&id).unwrap().state.muted_until(),
+            Some("2026-09-03 07:48:10")
+        );
+    }
+
+    /// Muting used to make an issue look closed to the engine. Its condition,
+    /// still firing, went back through hysteresis and filed a second issue
+    /// beside it after `consecutive_n` samples, while the first read "muted
+    /// until" long after its mute had ended.
+    #[test]
+    fn a_muted_condition_stays_one_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        for _ in 0..3 {
+            e.observe(&obs(40.0), &b);
+            clock.advance_secs(5);
+        }
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+
+        // Ten minutes more of the same fault.
+        for _ in 0..120 {
+            e.observe(&obs(38.0), &b);
+            clock.advance_secs(5);
+        }
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        let issue = e.get(&id).unwrap();
+        assert!(matches!(issue.state, IssueState::Muted { .. }));
+        assert_eq!(e.open_count(), 0);
+        assert!(e.verdict(&b).is_clear());
+        // The evidence keeps arriving, quietly.
+        assert_eq!(issue.last_seen, "2026-09-03 06:58:20");
+        assert_eq!(issue.headline().unwrap().value, 38.0);
+    }
+
+    #[test]
+    fn a_mute_ends_at_its_time() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
         let b = base();
         e.observe(&obs(40.0), &b);
         let id = e.primary()[0].id.clone();
         assert!(e.mute(&id, 60));
 
-        assert!(e.verdict(&b).is_clear(), "a muted issue must not shout");
-        assert_eq!(e.issues().len(), 1, "but it is still on the Diagnose tab");
+        for _ in 0..59 {
+            clock.advance_secs(60);
+            e.observe(&obs(40.0), &b);
+        }
+        assert!(matches!(
+            e.get(&id).unwrap().state,
+            IssueState::Muted { .. }
+        ));
+
+        // 07:48:10: the hour is up and the resolver is still slow.
+        clock.advance_secs(60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1);
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(issue.recurrence, 0, "the same incident, not a return");
+        assert_eq!(issue.since, "2026-09-03 06:48:10");
+        assert!(!e.verdict(&b).is_clear());
+        assert_eq!(e.muted_count(), 0);
+
+        // It ends on the clock, not on a detection: a mute that runs out
+        // while nothing fires is over too.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 1));
+        clock.advance_secs(60);
+        e.observe(&Observations::default(), &b);
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+    }
+
+    #[test]
+    fn a_muted_issue_still_closes_when_verify_holds() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+
+        // dns.slow_resolver verifies on p50 < 5ms held for 60s.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert!(
+            matches!(e.get(&id).unwrap().state, IssueState::AutoClosed { .. }),
+            "{:?}",
+            e.get(&id).unwrap().state
+        );
+        assert_eq!(e.muted_count(), 0);
+    }
+
+    #[test]
+    fn a_muted_socket_issue_still_expires() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let open = Observations {
+            sockets: vec![retransmitting()],
+            config: Some(ObservedConfig::default()),
+            ..Default::default()
+        };
+        e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+        let id = find(&e, "tcp.retrans_burst").id;
+        assert!(e.mute(&id, 60));
+
+        let closed = no_sockets(Some(ObservedConfig::default()));
+        for t in 1..=61 {
+            clock.advance_secs(1);
+            e.observe_live_at(&closed, &b, &ran_at(start, t), at(t));
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            expired("socket closed", "2026-09-03 06:49:11")
+        );
+    }
+
+    /// A mute is the user asking for quiet, not a fix. It used to count as
+    /// a close, so a step marked done before it was credited with a recovery
+    /// on the next tick.
+    #[test]
+    fn a_mute_after_a_step_is_not_a_recovery() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, None);
+
+        // Past the verify hold and its grace, still slow: it did not work.
+        clock.advance_secs(60 + VERIFY_GRACE_SECS);
+        e.observe(&obs(40.0), &b);
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, Some(VerifyOutcome::NotRecovered));
+    }
+
+    #[test]
+    fn a_muted_issue_is_not_pruned_as_history() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.settings.history_limit = 0;
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "a muted issue is still tracked");
+        assert!(e.get(&id).is_some());
     }
 
     #[test]
