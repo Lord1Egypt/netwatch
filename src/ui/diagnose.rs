@@ -1003,7 +1003,12 @@ fn issue_row_width(i: &&Issue) -> usize {
             value += m.len() + 3;
         }
     }
-    title.max(value)
+    let short = crate::diagnose::issue::short_time;
+    let mut when = short(&i.since).len() + 12;
+    if let Some(stale) = &i.stale_since {
+        when += short(stale).len() + 15;
+    }
+    title.max(value).max(when)
 }
 
 /// Every tracked issue in the window, oldest first.
@@ -2556,6 +2561,45 @@ mod tests {
         );
         let s = draw_engine(&engine, &baselines, 150, 44, |_| {});
         assert!(s.contains("since 06:48:10 · stale since 06:51:20"), "{s}");
+    }
+
+    #[test]
+    fn a_lone_stale_issue_sizes_the_list_to_its_stale_since() {
+        use crate::diagnose::detectors::{GatewayObs, Observations};
+        use crate::diagnose::engine::{Engine, FixedClock};
+
+        // The gateway outage behind blocked ICMP, alone: its title and
+        // subject are short, so only the when row can size the column.
+        let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:48:10"));
+        let engine = Engine::new(Box::new(clock.clone()));
+        let mut settings = *engine.settings();
+        settings.thresholds.consecutive_n = 1;
+        let mut engine = engine.with_settings(settings);
+        let baselines = fixture::baselines();
+        engine.observe(
+            &Observations {
+                gateway: Some(GatewayObs {
+                    addr: Some("192.168.8.1".into()),
+                    rtt_ms: None,
+                    loss_pct: 100.0,
+                    arp_ok: None,
+                    icmp_ok: false,
+                    internet_reachable: Some(false),
+                }),
+                ..Default::default()
+            },
+            &baselines,
+        );
+        clock.advance_secs(5);
+        engine.observe(&Observations::default(), &baselines);
+        assert_eq!(engine.primary().len(), 1);
+        for width in [120, 150, 200] {
+            let s = draw_engine(&engine, &baselines, width, 30, |_| {});
+            assert!(
+                s.contains("since 06:48:10 · stale since 06:48:15"),
+                "{width}: {s}"
+            );
+        }
     }
 
     #[test]
