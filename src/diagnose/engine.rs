@@ -2035,7 +2035,8 @@ mod tests {
         let b = base();
         e.observe(&obs(40.0), &b);
 
-        // dns.slow_resolver verifies on p50 < 5ms held for 60s.
+        // Against this baseline dns.slow_resolver closes once p50 has held
+        // under 4.96ms, 0.8 of its 6.2ms open line, for 60s.
         for _ in 0..61 {
             clock.advance_secs(1);
             e.observe(&obs(1.3), &b);
@@ -2081,8 +2082,8 @@ mod tests {
 
     #[test]
     fn an_auto_close_after_a_step_still_reports_a_measured_recovery() {
-        // The counterpart: the engine watched p50 hold under 5ms for the
-        // rule's window, so the step keeps its credit.
+        // The counterpart: the engine watched p50 hold under its close line
+        // for the rule's window, so the step keeps its credit.
         let (mut e, clock) = engine_at("2026-09-03 06:48:10");
         let b = base();
         e.observe(&obs(40.0), &b);
@@ -2981,7 +2982,7 @@ mod tests {
         assert_eq!(line(&e), 10.0);
 
         // Neither a later detection with another line nor the detector's
-        // own pass, with its constant 5 ms, moves it.
+        // own pass, with the line it derives from the baseline, moves it.
         clock.advance_secs(5);
         let now = clock.now();
         e.merge(slow(30.0), now, now);
@@ -3003,6 +3004,43 @@ mod tests {
         assert_eq!(e.issues()[0].state, IssueState::Open);
         assert_eq!(e.issues()[0].recurrence, 1);
         assert_eq!(line(&e), 20.0);
+    }
+
+    /// The verify used to be a flat 5 ms, which a router answering in 10 to
+    /// 11 ms never meets, so an issue opened on one stayed open until
+    /// netwatch restarted.
+    #[test]
+    fn a_router_resolver_issue_can_close() {
+        let mut b = base();
+        b.seed("169.254.1.1", "dns.rtt_p50", 10.5, 0.3, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(60.0), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        // It opened at twice the mean, 21ms, and closes under 0.8 of that.
+        let line = e.get(&id).unwrap().verify.threshold;
+        assert!((line - 16.8).abs() < 1e-9, "{line}");
+
+        // Five minutes at 18ms: under the open line, over the close line.
+        for _ in 0..300 {
+            clock.advance_secs(1);
+            e.observe(&obs(18.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+
+        // Back to 11ms: open through the hold, closed once 60s have held.
+        for _ in 0..60 {
+            clock.advance_secs(1);
+            e.observe(&obs(11.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&obs(11.0), &b);
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:54:11".into()
+            }
+        );
     }
 
     #[test]

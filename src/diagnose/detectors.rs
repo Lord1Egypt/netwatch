@@ -34,7 +34,8 @@ pub struct Thresholds {
     pub sigma_k: f64,
     /// σ multiple an issue opened on σ must fall below before it closes.
     /// Below `sigma_k`, so a metric hovering at the open line does not open
-    /// and close in turn.
+    /// and close in turn. `dns.slow_resolver` never closes on a line lower
+    /// than this many σ above the resolver's mean.
     pub sigma_close_k: f64,
     /// Smallest σ, in ms, a baseline is judged against, so a baseline that
     /// has barely varied does not score an unnoticeable move as many σ.
@@ -64,6 +65,7 @@ pub struct Thresholds {
     /// inside the normal range of ISP and mobile resolvers, so every first
     /// run on such a network opened a finding with no baseline behind it.
     /// Anything the baseline can catch, the 3σ test catches once it is ready.
+    /// With no baseline, an issue it opened closes under 0.8 of it.
     pub dns_ceiling_ms: f64,
     /// Socket rtt above this, with retransmits, reads as receiver-side queue.
     pub socket_rtt_ms: f64,
@@ -2306,7 +2308,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     ];
 
     d.remediation = dns_remediation(dns, Some(p50));
-    d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
+    d.verify.threshold = dns_close_line(baseline, t);
     d.scope = Scope {
         configuration: None,
         processes: vec![],
@@ -2335,14 +2337,43 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
 /// moving from 1.2 to 2.7 ms, and 5 ms over a 30 ms resolver is noise. `None`
 /// when the floored σ is zero and the baseline cannot be scored.
 ///
-/// This is the line the issue opened on, so a close line derived from it
-/// sits below what opened the issue.
+/// With the ceiling, one of the two lines an issue opens on; the close line
+/// is derived from the lower of them ([`dns_close_line`]).
 fn dns_open_line(b: &Baseline, t: &Thresholds) -> Option<f64> {
     let sigma = b.sigma_floored(t.sigma_floor());
     (sigma > f64::EPSILON).then(|| {
         (b.mean + t.sigma_k * sigma)
             .max(b.mean + t.dns_delta_floor_ms)
             .max(t.dns_delta_multiple * b.mean)
+    })
+}
+
+/// The share of its open line a slow resolver's p50 must fall under before
+/// the issue closes.
+const DNS_CLOSE_SHARE: f64 = 0.8;
+
+/// The p50 a `dns.slow_resolver` issue must stay under for its 60 s hold:
+/// `sigma_close_k` floored σ above the baseline mean, or 0.8 of the line the
+/// issue opened on, whichever is higher. With no baseline it is 0.8 of the
+/// ceiling. The engine keeps the line set at open.
+///
+/// The open line is the lower of the ceiling and the baseline's line,
+/// because crossing either opens the issue. A router answering in 10.5 ms
+/// opens at 21 ms and closes under 16.8 ms, whether a 60 ms or a 150 ms spike
+/// opened it. The σ term keeps the line above the resolver's normal range:
+/// 0.8 of the open line alone can fall inside it, and the issue would never
+/// close, as the flat 5 ms this replaces never did for a 10 ms router.
+///
+/// On a resolver whose normal range reaches the ceiling, the σ term can put
+/// the close line above it. The issue then closes once the p50 has stayed
+/// under the ceiling for the hold, because a p50 over it keeps the issue open.
+fn dns_close_line(baseline: Option<&Baseline>, t: &Thresholds) -> f64 {
+    let open = baseline
+        .and_then(|b| dns_open_line(b, t))
+        .map_or(t.dns_ceiling_ms, |line| line.min(t.dns_ceiling_ms));
+    let under_open = DNS_CLOSE_SHARE * open;
+    baseline.map_or(under_open, |b| {
+        under_open.max(b.mean + t.sigma_close_k * b.sigma_floored(t.sigma_floor()))
     })
 }
 
@@ -3749,6 +3780,63 @@ mod tests {
         base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.0, 2_000);
         let flat = base.get("169.254.1.1", "dns.rtt_p50").unwrap();
         assert_eq!(dns_open_line(flat, &unfloored), None);
+    }
+
+    #[test]
+    fn the_verify_line_sits_below_the_open_line() {
+        // The line `dns.slow_resolver` closes on, for a p50 that opens it
+        // against a baseline of (mean, σ), or none.
+        let close_line = |baseline: Option<(f64, f64)>, p50: f64, t: &Thresholds| {
+            let mut base = store();
+            if let Some((mean, sigma)) = baseline {
+                base.seed("169.254.1.1", "dns.rtt_p50", mean, sigma, 2_000);
+            }
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            let d = detect(&obs_with_dns(dns), &base, t)
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+                .unwrap_or_else(|| panic!("{p50}ms against {baseline:?} should open"));
+            assert_eq!(d.verify.metric, "dns.rtt_p50");
+            assert_eq!(d.verify.hold_secs, 60);
+            d.verify.threshold
+        };
+        let t = Thresholds::default();
+        // (baseline, the p50 that opens, the line it opened on, the close line)
+        for (baseline, p50, open, close) in [
+            // A router at 10.5ms opens at twice its mean. The flat 5ms this
+            // replaces was under anything it ever answers in.
+            (Some((10.5, 0.3)), 60.0, 21.0, 16.8),
+            // Over the ceiling too, but the baseline's line is the lower of
+            // the two it crossed: the issue opened there, not at 100ms.
+            (Some((10.5, 0.3)), 150.0, 21.0, 16.8),
+            // A LAN resolver opens 5ms above its mean.
+            (Some((1.2, 0.05)), 7.0, 6.2, 4.96),
+            // A noisy one: 2σ above its mean is over 0.8 of its line, 17.6ms,
+            // and a close line inside its normal range would never hold.
+            (Some((10.0, 4.0)), 25.0, 22.0, 18.0),
+            // Twice an 80ms mean is 160ms, so the ceiling opens it.
+            (Some((80.0, 5.0)), 120.0, 100.0, 90.0),
+            // No baseline: 0.8 of the ceiling.
+            (None, 160.0, 100.0, 80.0),
+        ] {
+            let line = close_line(baseline, p50, &t);
+            assert!(
+                (line - close).abs() < 1e-9,
+                "{baseline:?} at {p50}ms closes under {line}, not {close}"
+            );
+            assert!(line < open, "{baseline:?}: {line} is not below {open}");
+        }
+
+        // The catalogue's line is the one with no baseline.
+        let catalogued = rules::default_verify("dns.slow_resolver").unwrap();
+        assert_eq!(catalogued.threshold, close_line(None, 160.0, &t));
+        // A configured ceiling moves it.
+        let low = Thresholds {
+            dns_ceiling_ms: 30.0,
+            ..t
+        };
+        assert!((close_line(None, 40.0, &low) - 24.0).abs() < 1e-9);
     }
 
     #[test]
