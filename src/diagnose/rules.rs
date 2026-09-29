@@ -133,7 +133,9 @@ pub const CATALOGUE: &[Rule] = &[
         category: "link",
         severity: Severity::Critical,
         // The root cause of nearly everything else, so it suppresses widely.
-        trigger: "arp or icmp to the default gateway fails",
+        // A quiet router alone is not enough: a failed internet probe has to
+        // corroborate it, and no ARP probe exists to consult.
+        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed",
         suppresses: &[
             "dns.slow_resolver",
             "dns.failing",
@@ -165,7 +167,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "link down",
         category: "link",
         severity: Severity::Critical,
-        trigger: "interface carrier lost",
+        // Each OS reports "up" differently, and macOS reports the admin flag
+        // rather than carrier. A09 moves macOS to the `status:` line and
+        // rewrites that clause.
+        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says \"Media disconnected\"",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
         evidence: &[],
@@ -846,6 +851,201 @@ mod tests {
             normalise(&coverage_markdown()),
             "run: cargo run -- diagnose coverage --doc"
         );
+    }
+
+    /// Triggers that still misdescribe their detector, each waiting on the
+    /// plan item that changes that detector: the rule, its text as it
+    /// stands, and the item with what the text gets wrong. The guard below
+    /// skips them. The item rewrites the text and removes its row; a row
+    /// whose text has already changed fails, so none outlives its reason.
+    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
+        (
+            "dns.slow_resolver",
+            "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
+            "B10: the ceiling applies with a baseline too",
+        ),
+        (
+            "dns.failing",
+            "servfail/timeout rate > 5%, or the pipeline dns stage fails",
+            "B15, then A14: servfail counts as a reply, and no pipeline branch exists",
+        ),
+        (
+            "iface.errors",
+            "rx/tx error, drop, overrun or fifo counters increment",
+            "B19: fires on the per-minute error and drop floors, not on any increment",
+        ),
+        (
+            "iface.saturated",
+            "throughput above 90% of link rate for 30s",
+            "B33: held for consecutive_n interface samples, not for 30 s",
+        ),
+        (
+            "path.high_loss",
+            "a hop loses packets and the loss propagates to later hops",
+            "B33: loss before a silent tail also opens, unattributed",
+        ),
+        (
+            "path.rtt_spike",
+            "end-to-end rtt > 3σ above baseline",
+            "B31: the baseline falls back to the internet probe's",
+        ),
+        (
+            "tcp.bufferbloat_remote",
+            "one socket's rtt rises with its own tx while the link-level test passes",
+            "B23: opens with no link test, and after a failed one",
+        ),
+    ];
+
+    /// The quantities a trigger quotes. Digits glued to a word name
+    /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
+    /// number (100ms, 30s, 3σ) is part of one. Any other suffix panics
+    /// rather than being skipped, so a new one (2x, 10min) must be listed
+    /// here as a unit or a name before the guard can pass.
+    fn quoted_numbers(text: &str) -> Vec<f64> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if !chars[i].is_ascii_digit() || (i > 0 && chars[i - 1].is_alphanumeric()) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            let unit: String = chars[i..]
+                .iter()
+                .take_while(|c| c.is_alphabetic())
+                .collect();
+            match unit.as_str() {
+                "" | "ms" | "s" | "σ" => {}
+                "xx" => continue,
+                _ => panic!("{text:?}: is {digits}{unit} a quantity or a name? list {unit:?} in quoted_numbers"),
+            }
+            let value: f64 = digits
+                .trim_end_matches('.')
+                .parse()
+                .unwrap_or_else(|_| panic!("{text:?}: {digits:?} is not a number"));
+            let negative = start > 0
+                && matches!(chars[start - 1], '-' | '−')
+                && (start < 2 || !chars[start - 2].is_alphanumeric());
+            out.push(if negative { -value } else { value });
+        }
+        out
+    }
+
+    #[test]
+    fn quoted_numbers_reads_quantities_not_names() {
+        assert_eq!(
+            quoted_numbers("p50 > 3σ for 3 samples, or > 100ms"),
+            [3.0, 3.0, 100.0]
+        );
+        assert_eq!(
+            quoted_numbers("at or below −70 dBm, or 20% for 30s."),
+            [-70.0, 20.0, 30.0]
+        );
+        assert!(quoted_numbers("a v6 route while v4 works answers 5xx").is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "\"p50 ≥ 2x mean\": is 2x a quantity or a name?")]
+    fn quoted_numbers_refuses_a_suffix_it_does_not_know() {
+        // Skipping it would let "2x" or "10min" leave the guard unchecked.
+        quoted_numbers("p50 ≥ 2x mean");
+    }
+
+    #[test]
+    #[should_panic(expected = "\"answers 1.1.1.1\": \"1.1.1.1\" is not a number")]
+    fn quoted_numbers_names_the_text_it_cannot_read() {
+        quoted_numbers("answers 1.1.1.1");
+    }
+
+    /// The drift test above only proves the document matches the catalogue.
+    /// This one ties the numbers a trigger quotes to the values the detector
+    /// judges with, so a retuned default cannot leave the text behind.
+    #[test]
+    fn catalogue_triggers_quote_the_default_thresholds() {
+        use crate::diagnose::detectors::Thresholds;
+
+        // The `Thresholds` fields each trigger quotes. A rule listed in
+        // neither table quotes no number. Every field needs its own quote,
+        // so two fields that share a value (sigma_k and consecutive_n are
+        // both 3) need the number twice.
+        const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
+            ("dns.truncation_retry", &["dns_tc_pct"]),
+            ("gateway.rtt_spike", &["sigma_k", "consecutive_n"]),
+            ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
+            ("tcp.bufferbloat_local", &["loaded_rtt_delta_ms"]),
+            ("target.resolve_failed", &["consecutive_n"]),
+            ("target.connect_failed", &["consecutive_n"]),
+            ("target.tls_failed", &["consecutive_n"]),
+            ("target.http_error", &["consecutive_n"]),
+            ("target.slow_stage", &["sigma_k", "consecutive_n"]),
+        ];
+        // Numbers `Thresholds` does not carry: three literals in the
+        // detectors, pinned by their own firing tests, and a protocol
+        // constant.
+        const QUOTED_LITERALS: &[(&str, f64)] = &[
+            // retrans_burst_fires_at_five_a_minute
+            ("tcp.retrans_burst", 5.0),
+            // kernel::tests::matched_positive_negative_and_unknown
+            ("tcp.connect_failures", 5.0),
+            ("tcp.timewait_exhaustion", 60.0),
+            // The status the portal probe expects.
+            ("captive.portal", 204.0),
+        ];
+
+        let defaults = serde_json::to_value(Thresholds::default()).expect("thresholds serialise");
+        let default_of = |field: &str| {
+            defaults
+                .get(field)
+                .and_then(|v| v.as_f64())
+                .unwrap_or_else(|| panic!("Thresholds has no numeric field {field}"))
+        };
+        let sorted = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v
+        };
+
+        for (id, text, why) in PENDING_TRIGGER_TEXTS {
+            let rule = lookup(id).unwrap_or_else(|| panic!("{id} is not in the catalogue"));
+            assert_eq!(
+                rule.trigger, *text,
+                "{id}'s trigger changed; if its item has landed ({why}), remove its row"
+            );
+        }
+        for (id, _) in QUOTED_THRESHOLDS {
+            assert!(lookup(id).is_some(), "{id} is not in the catalogue");
+        }
+        for (id, _) in QUOTED_LITERALS {
+            assert!(lookup(id).is_some(), "{id} is not in the catalogue");
+        }
+
+        for rule in CATALOGUE {
+            if PENDING_TRIGGER_TEXTS.iter().any(|(id, ..)| *id == rule.id) {
+                continue;
+            }
+            let expected = QUOTED_THRESHOLDS
+                .iter()
+                .filter(|(id, _)| *id == rule.id)
+                .flat_map(|(_, fields)| fields.iter().map(|f| default_of(f)))
+                .chain(
+                    QUOTED_LITERALS
+                        .iter()
+                        .filter(|(id, _)| *id == rule.id)
+                        .map(|(_, value)| *value),
+                )
+                .collect();
+            assert_eq!(
+                sorted(quoted_numbers(rule.trigger)),
+                sorted(expected),
+                "{}: \"{}\" does not quote the defaults its detector judges with",
+                rule.id,
+                rule.trigger
+            );
+        }
     }
 
     #[test]
