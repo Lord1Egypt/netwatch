@@ -1268,8 +1268,9 @@ impl Verdict {
 /// scored against the same floored σ the detectors open on.
 ///
 /// A rule that opened because a value was 3σ above baseline closes when it is
-/// back inside 3σ — not when it drops below some absolute number, which would
-/// be a different claim on every network.
+/// back under 2σ (`sigma_close_k`) — not when it drops below some absolute
+/// number, which would be a different claim on every network. The gap between
+/// the two lines keeps a value hovering at 3σ from opening and closing in turn.
 fn add_sigma_metrics(
     values: &mut HashMap<String, f64>,
     obs: &Observations,
@@ -2733,6 +2734,104 @@ mod tests {
             matches!(state(&e), Some(IssueState::AutoClosed { .. })),
             "0.8σ held for 120s: {:?}",
             state(&e)
+        );
+    }
+
+    /// A wireless gateway at 4ms, give or take 4: 3σ is 16ms, which is 12ms
+    /// slower and clears the delta floor, and 2σ is 12ms.
+    fn wireless_gateway() -> BaselineStore {
+        let mut b = base();
+        b.seed("192.168.8.1", "gateway.rtt", 4.0, 4.0, 2000);
+        b
+    }
+
+    /// That gateway answering `sigma` σ above its mean.
+    fn gateway_at_sigma(sigma: f64) -> Observations {
+        Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: Some(4.0 + sigma * 4.0),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn gateway_rtt_issues(e: &Engine) -> Vec<Issue> {
+        e.issues()
+            .iter()
+            .filter(|i| i.rule == "gateway.rtt_spike")
+            .cloned()
+            .collect()
+    }
+
+    /// The open and close lines used to be the same 3σ. A gateway hovering at
+    /// the line closed each time it sat just under it for the 120 s hold,
+    /// and reopened each time it rose back, so one condition read as a run of
+    /// recoveries. The dips here outlast the hold: alternating sample by
+    /// sample never closed even at 3σ/3σ, because each detection restarts
+    /// the hold.
+    #[test]
+    fn a_gateway_rtt_hovering_at_three_sigma_does_not_flap() {
+        let b = wireless_gateway();
+        let hover = |close_k: f64| {
+            let (e, clock) = hysteresis_engine_at("2026-09-03 06:00:00");
+            let mut settings = *e.settings();
+            settings.thresholds.sigma_close_k = close_k;
+            let mut e = e.with_settings(settings);
+            for _ in 0..3 {
+                // 30 s at 3.1σ, then 3 minutes at 2.9σ.
+                for sigma in [3.1; 6].into_iter().chain([2.9; 36]) {
+                    e.observe(&gateway_at_sigma(sigma), &b);
+                    clock.advance_secs(5);
+                }
+            }
+            gateway_rtt_issues(&e)
+        };
+
+        let issues = hover(2.0);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(issues[0].state, IssueState::Open);
+        assert_eq!(issues[0].recurrence, 0);
+
+        // With the close line on the open line, the same gateway closes after
+        // every dip and reopens after every rise.
+        let flapping = hover(3.0);
+        assert_eq!(flapping.len(), 1, "{flapping:#?}");
+        assert_eq!(flapping[0].recurrence, 2);
+        assert!(matches!(flapping[0].state, IssueState::AutoClosed { .. }));
+    }
+
+    #[test]
+    fn gateway_rtt_spike_closes_below_two_sigma() {
+        let b = wireless_gateway();
+        let (mut e, clock) = engine_at("2026-09-03 06:00:00");
+        e.observe(&gateway_at_sigma(4.0), &b);
+        let issues = gateway_rtt_issues(&e);
+        assert_eq!(issues[0].state, IssueState::Open, "20ms is 4σ, 16ms slower");
+        assert_eq!(issues[0].verify.threshold, 2.0);
+
+        // Five minutes at 2.1σ: under the open line, over the close line.
+        for _ in 0..60 {
+            clock.advance_secs(5);
+            e.observe(&gateway_at_sigma(2.1), &b);
+        }
+        assert_eq!(gateway_rtt_issues(&e)[0].state, IssueState::Open);
+
+        // 1.9σ held for the 120 s verify.
+        for _ in 0..=24 {
+            clock.advance_secs(5);
+            e.observe(&gateway_at_sigma(1.9), &b);
+        }
+        let issues = gateway_rtt_issues(&e);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            matches!(issues[0].state, IssueState::AutoClosed { .. }),
+            "{:?}",
+            issues[0].state
         );
     }
 

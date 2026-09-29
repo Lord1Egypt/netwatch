@@ -32,6 +32,10 @@ use super::rules;
 pub struct Thresholds {
     /// σ multiple that counts as a deviation.
     pub sigma_k: f64,
+    /// σ multiple an issue opened on σ must fall below before it closes.
+    /// Below `sigma_k`, so a metric hovering at the open line does not open
+    /// and close in turn.
+    pub sigma_close_k: f64,
     /// Smallest σ, in ms, a baseline is judged against, so a baseline that
     /// has barely varied does not score an unnoticeable move as many σ.
     pub sigma_floor_ms: f64,
@@ -91,6 +95,7 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             sigma_k: 3.0,
+            sigma_close_k: 2.0,
             sigma_floor_ms: DEFAULT_SIGMA_FLOOR_MS,
             sigma_floor_pct: DEFAULT_SIGMA_FLOOR_PCT,
             gateway_delta_floor_ms: 10.0,
@@ -157,6 +162,7 @@ impl Thresholds {
             }
         };
         check("sigma_k", |t| &mut t.sigma_k, above_zero);
+        check("sigma_close_k", |t| &mut t.sigma_close_k, above_zero);
         check("sigma_floor_ms", |t| &mut t.sigma_floor_ms, at_least_zero);
         check("sigma_floor_pct", |t| &mut t.sigma_floor_pct, share);
         check(
@@ -188,6 +194,24 @@ impl Thresholds {
         check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
         check("wifi_rssi_dbm", |t| &mut t.wifi_rssi_dbm, number);
         check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
+        // A close line at or above the open line is no deadband. When the
+        // default is not below a lowered `sigma_k` either, the fallback keeps
+        // the defaults' proportion.
+        if t.sigma_close_k >= t.sigma_k {
+            let default = Self::default();
+            let (fallback, used) = if default.sigma_close_k < t.sigma_k {
+                let v = default.sigma_close_k;
+                (v, format!("the default {v}"))
+            } else {
+                let v = t.sigma_k * default.sigma_close_k / default.sigma_k;
+                (v, format!("{v}, two thirds of it,"))
+            };
+            warnings.push(format!(
+                "diagnose_thresholds.sigma_close_k = {} must be below sigma_k = {}, so {used} is used",
+                t.sigma_close_k, t.sigma_k
+            ));
+            t.sigma_close_k = fallback;
+        }
         if t.consecutive_n == 0 {
             t.consecutive_n = Self::default().consecutive_n;
             warnings.push(format!(
@@ -1154,6 +1178,8 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
+        // Closes below the open line, as gateway.rtt_spike does.
+        d.verify.threshold = t.sigma_close_k;
         let (_, word, ms, _, baseline, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
@@ -1726,6 +1752,9 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
 
     let mut d = Detection::new("gateway.rtt_spike", Subject::Iface { name: addr.clone() });
     d.subject = Subject::Host;
+    // Closing below the open line keeps an rtt hovering at 3σ one issue.
+    // The catalogue's line is the default one; this is the configured one.
+    d.verify.threshold = t.sigma_close_k;
     d.evidence.push(
         Evidence::new("gateway.rtt", rtt, "ms")
             .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
@@ -2409,6 +2438,8 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
             target: path.target.clone(),
         },
     );
+    // Closes below the open line, as gateway.rtt_spike does.
+    d.verify.threshold = t.sigma_close_k;
     d.evidence.push(
         Evidence::new("path.rtt", rtt, "ms")
             .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
@@ -3755,6 +3786,7 @@ mod tests {
 
         let (t, warnings) = Thresholds {
             sigma_k: 0.0,
+            sigma_close_k: f64::NAN,
             sigma_floor_ms: -0.5,
             gateway_delta_floor_ms: -10.0,
             consecutive_n: 0,
@@ -3794,6 +3826,7 @@ mod tests {
             warnings,
             [
                 "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
+                "diagnose_thresholds.sigma_close_k = NaN must be a finite number above 0, so the default 2 is used",
                 "diagnose_thresholds.sigma_floor_ms = -0.5 must be a finite number of 0 or more, so the default 0.5 is used",
                 "diagnose_thresholds.gateway_delta_floor_ms = -10 must be a finite number of 0 or more, so the default 10 is used",
                 "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
@@ -3815,6 +3848,44 @@ mod tests {
             warnings,
             ["diagnose_thresholds.sigma_k = inf must be a finite number above 0, so the default 3 is used"]
         );
+    }
+
+    #[test]
+    fn a_close_line_at_or_above_the_open_line_is_refused() {
+        let default = Thresholds::default();
+        let (t, warnings) = Thresholds {
+            sigma_close_k: 3.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(t, default);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 3 must be below sigma_k = 3, so the default 2 is used"]
+        );
+
+        // A sigma_k lowered below the default close line takes the close
+        // line down with it, in the defaults' proportion.
+        let (t, warnings) = Thresholds {
+            sigma_k: 1.5,
+            ..default
+        }
+        .validated();
+        assert_eq!((t.sigma_k, t.sigma_close_k), (1.5, 1.0));
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 2 must be below sigma_k = 1.5, so 1, two thirds of it, is used"]
+        );
+
+        // Any line below the open one stands.
+        let (t, warnings) = Thresholds {
+            sigma_k: 4.0,
+            sigma_close_k: 3.5,
+            ..default
+        }
+        .validated();
+        assert_eq!((t.sigma_k, t.sigma_close_k), (4.0, 3.5));
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -5942,6 +6013,67 @@ mod target_tests {
         base.seed("api", "target.ttfb_ms", 5.0, 0.1, 2_400);
         let d = detect(&obs, &base, &Thresholds::default()).remove(0);
         assert_eq!(d.evidence[0].sigma, Some(0.5));
+    }
+
+    /// `default_verify` cannot read `Thresholds`, so each σ rule's detector
+    /// sets its own close line. 1.5 is not the default, so a line of 1.5
+    /// came from the configuration.
+    #[test]
+    fn the_sigma_rules_close_on_the_configured_close_line() {
+        let mut base = crate::diagnose::fixture::baselines();
+        base.seed("192.168.8.1", "gateway.rtt", 2.0, 0.3, 2_400);
+        base.seed("internet", "path.rtt", 10.0, 1.0, 2_400);
+        base.seed("api", "target.ttfb_ms", 40.0, 4.0, 2_400);
+        let mut target = healthy();
+        target.http_stage = ok(900.0);
+        let obs = Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: Some(40.0),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            paths: vec![PathObs {
+                target: "1.1.1.1".into(),
+                hops: vec![HopObs {
+                    number: 1,
+                    ip: Some("1.1.1.1".into()),
+                    asn: None,
+                    rtt_p50_ms: Some(90.0),
+                    rtt_p95_ms: Some(95.0),
+                    loss_pct: 0.0,
+                    silent: false,
+                }],
+                previous: None,
+                traced_at: "2026-09-14 09:59:30".into(),
+                destination_reached: Some(true),
+            }],
+            targets: vec![target],
+            ..Default::default()
+        };
+        let t = Thresholds {
+            sigma_close_k: 1.5,
+            ..Thresholds::default()
+        };
+        let found = detect(&obs, &base, &t);
+        for rule in ["gateway.rtt_spike", "path.rtt_spike", "target.slow_stage"] {
+            let d = found
+                .iter()
+                .find(|d| d.rule == rule)
+                .unwrap_or_else(|| panic!("{rule} should fire: {found:#?}"));
+            let catalogued = rules::default_verify(rule).unwrap();
+            assert_eq!(catalogued.threshold, Thresholds::default().sigma_close_k);
+            assert_eq!(
+                d.verify,
+                Verify {
+                    threshold: 1.5,
+                    ..catalogued
+                },
+                "{rule}"
+            );
+        }
     }
 
     #[test]

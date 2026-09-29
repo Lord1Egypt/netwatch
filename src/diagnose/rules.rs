@@ -774,6 +774,9 @@ pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
 /// more specific one. Every active rule must have one — enforced by a test,
 /// because §4's rule is that a remediation without a testable success
 /// condition is an instruction, not something netwatch can claim to have fixed.
+///
+/// The three σ rules close at the default `sigma_close_k`, 2σ. This cannot
+/// read `Thresholds`, so their detectors put the configured value in its place.
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
         "dns.slow_resolver" => Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60),
@@ -781,14 +784,14 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
-        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 3.0, "σ").holding_for(120),
+        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 2.0, "σ").holding_for(120),
         "link.down" => Verify::above("iface.carrier", 0.0, "").holding_for(30),
         "iface.errors" => Verify::below("iface.error_rate", 1.0, "/min").holding_for(300),
         "iface.saturated" => Verify::below("iface.utilisation", 90.0, "%").holding_for(60),
         "wifi.weak_signal" => Verify::above("wifi.rssi", -70.0, "dBm").holding_for(120),
         "path.changed" => Verify::below("path.hop_changes", 1.0, "").holding_for(300),
         "path.high_loss" => Verify::below("path.hop_loss", 1.0, "%").holding_for(120),
-        "path.rtt_spike" => Verify::below("path.rtt_sigma", 3.0, "σ").holding_for(120),
+        "path.rtt_spike" => Verify::below("path.rtt_sigma", 2.0, "σ").holding_for(120),
         "tcp.bufferbloat_local" => {
             Verify::below("tcp.loaded_rtt_delta", 100.0, "ms").holding_for(60)
         }
@@ -807,7 +810,7 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "target.connect_failed" => Verify::above("target.connect_ok", 0.5, "").holding_for(120),
         "target.tls_failed" => Verify::above("target.tls_ok", 0.5, "").holding_for(120),
         "target.http_error" => Verify::above("target.http_ok", 0.5, "").holding_for(120),
-        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 3.0, "σ").holding_for(180),
+        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 2.0, "σ").holding_for(180),
         "egress.drift" => Verify::below("egress.new_destinations", 1.0, "").holding_for(300),
         "egress.policy_violation" => {
             Verify::below("egress.denied_flows", 1.0, "observed destinations").holding_for(300)

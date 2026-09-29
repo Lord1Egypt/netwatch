@@ -128,6 +128,7 @@ and a key left out keeps its default:
 ```toml
 [diagnose_thresholds]
 sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
+sigma_close_k = 2.0        # σ multiple an issue must fall below to close
 sigma_floor_ms = 0.5       # smallest σ a baseline is judged against
 sigma_floor_pct = 5.0      # or this percentage of the baseline's mean, if larger
 gateway_delta_floor_ms = 10.0  # ms the gateway must be slower than its mean, too
@@ -150,7 +151,8 @@ wifi_retry_pct = 20.0
 A value that cannot mean anything (a σ multiple of 0 or less, a negative σ
 or delta floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or
 `inf`) is replaced by its default and logged; `diagnose run` and `diagnose
-coverage` also print it to stderr. The
+coverage` also print it to stderr. So is a `sigma_close_k` at or above
+`sigma_k`: it becomes 2, or two thirds of a `sigma_k` of 2 or less. The
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
@@ -174,6 +176,12 @@ its baseline opens an issue: a LAN resolver moving from 1.2 to 2.7 ms is 3σ,
 and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from 1 to
 4 ms is never reported, on purpose. The 100 ms ceiling does not wait for a
 baseline. Setting these three to 0 judges by σ alone.
+
+`gateway.rtt_spike`, `path.rtt_spike` and `target.slow_stage` open at 3σ and
+close only once the metric has stayed under 2σ for the verify hold. With one
+line for both, a gateway hovering at 3σ closed each time it dipped under for
+two minutes and reopened each time it rose. A noisy link now takes longer to
+close.
 
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
 above normal is left out, so an incident does not become the new normal. A low

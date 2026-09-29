@@ -156,9 +156,9 @@ pub struct NetwatchConfig {
     ///
     /// A missing key keeps its default. A value that cannot mean anything
     /// (σ multiple ≤ 0, a negative σ or delta floor, `consecutive_n` = 0, a
-    /// share outside 0–100, NaN) is logged and replaced by its default. Read at
-    /// startup: an episode records the thresholds it ran with, so they do not
-    /// change mid-run.
+    /// share outside 0–100, NaN, a close σ multiple not below the open one)
+    /// is logged and replaced by its default. Read at startup: an episode
+    /// records the thresholds it ran with, so they do not change mid-run.
     ///
     /// Saved only once it differs from the defaults. `--generate-config` and
     /// the Settings editor write the whole config, and a table of today's

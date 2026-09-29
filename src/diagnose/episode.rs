@@ -1808,7 +1808,8 @@ mod tests {
         // baseline snapshot on each frame.
         assert!(thresholds.remove("sigma_floor_ms").is_some());
         assert!(thresholds.remove("sigma_floor_pct").is_some());
-        // So did the delta floors.
+        // So did the delta floors and the close line.
+        assert!(thresholds.remove("sigma_close_k").is_some());
         assert!(thresholds.remove("gateway_delta_floor_ms").is_some());
         assert!(thresholds.remove("dns_delta_floor_ms").is_some());
         assert!(thresholds.remove("dns_delta_multiple").is_some());
