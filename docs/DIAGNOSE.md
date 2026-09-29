@@ -339,9 +339,10 @@ The replay test compares against those files rather than against a recording
 it just made, so a change that moves both sides still shows up.
 
 `manifest.toml` lists every episode, and the test checks each row by name. A
-`synthetic` row is built by a scenario in `src/diagnose/fixture.rs` and must
-also replay to its own recording; a `lab` row keeps the frames the health lab
-recorded, and only its decisions are derived again.
+`synthetic` row is built by a scenario in `src/diagnose/fixture.rs`; it must
+still be what that scenario records, and must also replay to its own
+recording. A `lab` row keeps the frames the health lab recorded, and only its
+decisions are derived again.
 
 ```sh
 netwatch diagnose corpus              # regenerate after an intended semantic change

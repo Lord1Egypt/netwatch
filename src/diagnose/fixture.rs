@@ -753,28 +753,54 @@ mod tests {
         );
     }
 
-    /// The pinned `fixture-scenario` is what [`Scenario::incident`] records:
+    /// `Err` unless the pinned corpus episode `id` is what `rebuilt` holds:
     /// the frames the corpus replays, the settings and the profile. Issue
     /// snapshots are left out; they are the engine's output, which the
     /// pinned decisions already cover.
-    #[test]
-    fn the_incident_episode_is_unchanged_by_the_refactor() {
+    fn is_pinned(id: &str, rebuilt: &Episode) -> Result<(), String> {
         use crate::diagnose::episode::{load, CORPUS_DIR};
-        let pinned = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(CORPUS_DIR)
-            .join("fixture-scenario.json.gz");
-        let mut pinned = load(&pinned).expect("pinned fixture-scenario");
+            .join(format!("{id}.json.gz"));
+        let mut pinned = load(&path).map_err(|e| format!("{id}: {}: {e}", path.display()))?;
         // Through JSON, as the pinned copy went, so floats parse alike.
         let mut rebuilt: Episode =
-            serde_json::from_str(&serde_json::to_string(&episode()).unwrap()).unwrap();
+            serde_json::from_str(&serde_json::to_string(rebuilt).unwrap()).unwrap();
         pinned.issues.clear();
         rebuilt.issues.clear();
-        assert!(
-            rebuilt == pinned,
-            "Scenario::incident() no longer records the pinned fixture-scenario; if that is \
-             intended, run `cargo run -- diagnose corpus --only fixture-scenario` and review \
-             the diff"
-        );
+        if rebuilt == pinned {
+            return Ok(());
+        }
+        Err(format!(
+            "{id}: its scenario no longer records the pinned episode; if that is intended, \
+             run `cargo run -- diagnose corpus --only {id}` and review the diff"
+        ))
+    }
+
+    /// The pinned `fixture-scenario` is what [`Scenario::incident`] records.
+    #[test]
+    fn the_incident_episode_is_unchanged_by_the_refactor() {
+        is_pinned("fixture-scenario", &episode()).unwrap();
+    }
+
+    /// The replay test holds a pinned episode only to itself, so a scenario
+    /// renamed, removed or edited without regenerating still passed it, and
+    /// the next `diagnose corpus` failed on that row or quietly rewrote it.
+    #[test]
+    fn every_synthetic_corpus_entry_is_what_its_scenario_records() {
+        use crate::diagnose::episode::{CorpusKind, Manifest, CORPUS_DIR};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_DIR);
+        let manifest = Manifest::load(&dir).expect("corpus manifest");
+        let failures: Vec<String> = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == CorpusKind::Synthetic)
+            .filter_map(|entry| match synthetic(&entry.id) {
+                Some(rebuilt) => is_pinned(&entry.id, &rebuilt).err(),
+                None => Some(format!("{}: no scenario in fixture.rs builds it", entry.id)),
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// What a new corpus scenario costs: a frame function and a `Scenario`.
