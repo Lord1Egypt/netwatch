@@ -1792,6 +1792,23 @@ mod tests {
     }
 
     #[test]
+    fn an_episode_recorded_before_new_threshold_fields_still_loads() {
+        // Every episode embeds the thresholds it ran with. One recorded
+        // before a threshold existed has no key for it, and has to load with
+        // the default: failing would orphan the corpus and every episode on
+        // disk each time a threshold is added.
+        let s = incident();
+        let ep = &s.finished[0];
+        let mut json = serde_json::to_value(ep).unwrap();
+        let thresholds = json["settings"]["thresholds"].as_object_mut().unwrap();
+        assert!(thresholds.remove("wifi_retry_pct").is_some());
+        assert!(thresholds.remove("dns_tc_pct").is_some());
+        let back: Episode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.settings, ep.settings);
+        assert!(replay(&back).matches());
+    }
+
+    #[test]
     fn snapshots_taken_on_one_tick_are_in_key_order() {
         // Three issues are still open when the fixture episode ends. A hashed
         // map wrote their final snapshots in a new order each run, so the

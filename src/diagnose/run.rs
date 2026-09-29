@@ -163,6 +163,11 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()
     };
+    // The engine replaces these with defaults and logs them, but a
+    // subcommand has no log file open, so say so where the caller looks.
+    for warning in config.diagnose_thresholds.validated().1 {
+        eprintln!("warning: {warning}");
+    }
     if let Some(name) = &opts.target {
         anyhow::ensure!(
             config.diagnose_targets.iter().any(|t| &t.name == name),
