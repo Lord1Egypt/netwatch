@@ -155,8 +155,8 @@ pub struct NetwatchConfig {
     /// ```
     ///
     /// A missing key keeps its default. A value that cannot mean anything
-    /// (σ multiple ≤ 0, a negative σ floor, `consecutive_n` = 0, a share
-    /// outside 0–100, NaN) is logged and replaced by its default. Read at
+    /// (σ multiple ≤ 0, a negative σ or delta floor, `consecutive_n` = 0, a
+    /// share outside 0–100, NaN) is logged and replaced by its default. Read at
     /// startup: an episode records the thresholds it ran with, so they do not
     /// change mid-run.
     ///

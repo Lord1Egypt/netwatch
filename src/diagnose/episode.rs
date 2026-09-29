@@ -1808,6 +1808,10 @@ mod tests {
         // baseline snapshot on each frame.
         assert!(thresholds.remove("sigma_floor_ms").is_some());
         assert!(thresholds.remove("sigma_floor_pct").is_some());
+        // So did the delta floors.
+        assert!(thresholds.remove("gateway_delta_floor_ms").is_some());
+        assert!(thresholds.remove("dns_delta_floor_ms").is_some());
+        assert!(thresholds.remove("dns_delta_multiple").is_some());
         for frame in json["frames"].as_array_mut().unwrap() {
             if let Some(snap) = frame["baselines"].as_object_mut() {
                 assert!(snap.remove("sigma_floor").is_some());

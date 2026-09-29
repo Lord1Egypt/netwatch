@@ -130,6 +130,9 @@ and a key left out keeps its default:
 sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
 sigma_floor_ms = 0.5       # smallest σ a baseline is judged against
 sigma_floor_pct = 5.0      # or this percentage of the baseline's mean, if larger
+gateway_delta_floor_ms = 10.0  # ms the gateway must be slower than its mean, too
+dns_delta_floor_ms = 5.0   # ms a resolver must be slower than its mean, too
+dns_delta_multiple = 2.0   # and the multiple of its mean it must reach
 consecutive_n = 3          # samples a condition must show before an issue opens
 verdict_hold_secs = 30     # how long a socket verdict must persist
 dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or not
@@ -145,9 +148,9 @@ wifi_retry_pct = 20.0
 ```
 
 A value that cannot mean anything (a σ multiple of 0 or less, a negative σ
-floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or `inf`) is
-replaced by its default and logged; `diagnose run` and `diagnose coverage` also
-print it to stderr. The
+or delta floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or
+`inf`) is replaced by its default and logged; `diagnose run` and `diagnose
+coverage` also print it to stderr. The
 table is read at startup, and coverage's **r** reload leaves it alone: each
 recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
@@ -162,6 +165,15 @@ Every σ is floored before it is used. A resolver that answers from cache in
 rather than 1.35 ms, and a 40 ms resolver is judged against at least 2 ms. The
 Dashboard's latency tiles show the floored σ too. Setting both floors to 0
 judges the raw σ.
+
+Many σ can still be a move nobody feels, so two rules also need an absolute
+rise. `gateway.rtt_spike` needs the gateway 10 ms slower than its mean: a wired
+gateway moving from 2 to 9 ms is 14σ over the floor. `dns.slow_resolver` needs
+the resolver's median 5 ms slower than its mean and at least twice it before
+its baseline opens an issue: a LAN resolver moving from 1.2 to 2.7 ms is 3σ,
+and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from 1 to
+4 ms is never reported, on purpose. The 100 ms ceiling does not wait for a
+baseline. Setting these three to 0 judges by σ alone.
 
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
 above normal is left out, so an incident does not become the new normal. A low

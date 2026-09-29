@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::baseline::{BaselineStore, SigmaFloor, DEFAULT_SIGMA_FLOOR_MS, DEFAULT_SIGMA_FLOOR_PCT};
+use super::baseline::{
+    Baseline, BaselineStore, SigmaFloor, DEFAULT_SIGMA_FLOOR_MS, DEFAULT_SIGMA_FLOOR_PCT,
+};
 use super::issue::{
     Action, Availability, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject,
     Verify,
@@ -35,6 +37,19 @@ pub struct Thresholds {
     pub sigma_floor_ms: f64,
     /// Smallest σ as a percentage of the baseline's mean.
     pub sigma_floor_pct: f64,
+    /// How far, in ms, the gateway's rtt must rise above its baseline mean
+    /// before `gateway.rtt_spike` opens, however many σ that is. The σ
+    /// floor makes a σ a move someone could notice; this makes it one worth
+    /// reporting: 2 to 9 ms on a wired gateway is 14σ and harms nothing.
+    pub gateway_delta_floor_ms: f64,
+    /// How far, in ms, a resolver's p50 must rise above its baseline mean
+    /// before `dns.slow_resolver` opens on the baseline. A LAN resolver
+    /// moving from 1.2 to 2.7 ms clears 3σ over the floor, and nobody waits
+    /// on it.
+    pub dns_delta_floor_ms: f64,
+    /// And the multiple of its baseline mean the p50 must reach, so a
+    /// resolver that normally takes 30 ms opens at 60, not at 35.
+    pub dns_delta_multiple: f64,
     /// Consecutive violating samples before an issue opens (hysteresis).
     pub consecutive_n: u32,
     /// A socket verdict must persist this long before it becomes an issue.
@@ -78,6 +93,9 @@ impl Default for Thresholds {
             sigma_k: 3.0,
             sigma_floor_ms: DEFAULT_SIGMA_FLOOR_MS,
             sigma_floor_pct: DEFAULT_SIGMA_FLOOR_PCT,
+            gateway_delta_floor_ms: 10.0,
+            dns_delta_floor_ms: 5.0,
+            dns_delta_multiple: 2.0,
             consecutive_n: 3,
             verdict_hold_secs: 30,
             dns_ceiling_ms: 100.0,
@@ -141,6 +159,21 @@ impl Thresholds {
         check("sigma_k", |t| &mut t.sigma_k, above_zero);
         check("sigma_floor_ms", |t| &mut t.sigma_floor_ms, at_least_zero);
         check("sigma_floor_pct", |t| &mut t.sigma_floor_pct, share);
+        check(
+            "gateway_delta_floor_ms",
+            |t| &mut t.gateway_delta_floor_ms,
+            at_least_zero,
+        );
+        check(
+            "dns_delta_floor_ms",
+            |t| &mut t.dns_delta_floor_ms,
+            at_least_zero,
+        );
+        check(
+            "dns_delta_multiple",
+            |t| &mut t.dns_delta_multiple,
+            at_least_zero,
+        );
         check("dns_ceiling_ms", |t| &mut t.dns_ceiling_ms, number);
         check("socket_rtt_ms", |t| &mut t.socket_rtt_ms, number);
         check(
@@ -1685,7 +1718,9 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
     let Some(sigma) = b.sigma_above(rtt, t.sigma_floor()) else {
         return vec![];
     };
-    if sigma < t.sigma_k {
+    // Both: many σ on a quiet wired gateway can still be a few ms nobody
+    // feels, and 10 ms on a noisy wireless one can still be ordinary.
+    if sigma < t.sigma_k || rtt - b.mean < t.gateway_delta_floor_ms {
         return vec![];
     }
 
@@ -1999,13 +2034,14 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
 
     let baseline = base.get(&dns.resolver, "dns.rtt_p50");
+    // The ceiling applies with a baseline too: 160 ms is slow whatever the
+    // resolver usually does.
     let over_ceiling = p50 > t.dns_ceiling_ms;
-    let over_sigma = baseline
-        .and_then(|b| b.sigma_above(p50, t.sigma_floor()))
-        .map(|s| s >= t.sigma_k)
-        .unwrap_or(false);
+    let over_baseline = baseline
+        .and_then(|b| dns_open_line(b, t))
+        .is_some_and(|line| p50 >= line);
 
-    if !over_ceiling && !over_sigma {
+    if !over_ceiling && !over_baseline {
         return out;
     }
 
@@ -2263,6 +2299,23 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
     out.push(d);
     out
+}
+
+/// The p50 at which a resolver with this baseline is slow: `sigma_k` floored
+/// σ above the mean, but at least `dns_delta_floor_ms` above it and
+/// `dns_delta_multiple` times it. The σ floor alone opens on a LAN resolver
+/// moving from 1.2 to 2.7 ms, and 5 ms over a 30 ms resolver is noise. `None`
+/// when the floored σ is zero and the baseline cannot be scored.
+///
+/// This is the line the issue opened on, so a close line derived from it
+/// sits below what opened the issue.
+fn dns_open_line(b: &Baseline, t: &Thresholds) -> Option<f64> {
+    let sigma = b.sigma_floored(t.sigma_floor());
+    (sigma > f64::EPSILON).then(|| {
+        (b.mean + t.sigma_k * sigma)
+            .max(b.mean + t.dns_delta_floor_ms)
+            .max(t.dns_delta_multiple * b.mean)
+    })
 }
 
 /// Steps for a failing or slow resolver. A switch is proposed only to an
@@ -3538,20 +3591,29 @@ mod tests {
         assert!(d.evidence[0].multiple_label().is_none());
     }
 
+    /// `dns.slow_resolver` for a LAN resolver that answers in 1.2ms, give or
+    /// take 0.05, once its p50 moves to `p50`.
+    fn lan_resolver_at(p50: f64, t: &Thresholds) -> Option<Detection> {
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.05, 2_000);
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(p50);
+        detect(&obs_with_dns(dns), &base, t)
+            .into_iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+    }
+
     #[test]
     fn a_flat_resolver_baseline_is_judged_against_the_floor() {
         // 1.2ms with σ 0.05: raw, 1.5ms is 6σ; against the 0.5ms floor it is
-        // 0.6σ, and 3ms is 3.6σ.
-        let mut base = store();
-        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.05, 2_000);
-        let slow = |p50: f64, t: &Thresholds| {
-            let mut dns = slow_dns();
-            dns.rtt_p50_ms = Some(p50);
-            detect(&obs_with_dns(dns), &base, t)
-                .into_iter()
-                .find(|d| d.rule == "dns.slow_resolver")
+        // 0.6σ, and 3ms is 3.6σ. The delta floors are off: they keep all of
+        // these quiet, and this is about the σ.
+        let slow = lan_resolver_at;
+        let t = Thresholds {
+            dns_delta_floor_ms: 0.0,
+            dns_delta_multiple: 0.0,
+            ..Thresholds::default()
         };
-        let t = Thresholds::default();
         assert!(slow(1.5, &t).is_none());
         let unfloored = Thresholds {
             sigma_floor_ms: 0.0,
@@ -3564,6 +3626,105 @@ mod tests {
         // The evidence carries the σ the resolver was judged against.
         assert_eq!(d.evidence[0].sigma, Some(0.5));
         assert!((d.evidence[0].sigma_above().unwrap() - 3.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_lan_resolver_moving_from_1_2_to_2_7ms_does_not_fire() {
+        // 2.7ms is 3σ over the 0.5ms floor and 2.25 times the mean, and
+        // the σ floor alone reported it. It is 1.5ms slower.
+        let t = Thresholds::default();
+        assert!(lan_resolver_at(2.7, &t).is_none());
+        let no_delta = Thresholds {
+            dns_delta_floor_ms: 0.0,
+            ..t
+        };
+        assert!(
+            lan_resolver_at(2.7, &no_delta).is_some(),
+            "only the 5ms floor holds it back"
+        );
+    }
+
+    #[test]
+    fn a_lan_resolver_moving_from_1_2_to_7ms_fires() {
+        let t = Thresholds::default();
+        let d = lan_resolver_at(7.0, &t).expect("5.8ms slower, 5.8 times the mean, 11.6σ");
+        assert_eq!(d.evidence[0].value, 7.0);
+        assert_eq!(d.evidence[0].baseline, Some(1.2));
+        // 4.9ms slower is still under the floor.
+        assert!(lan_resolver_at(6.1, &t).is_none());
+    }
+
+    #[test]
+    fn a_resolver_with_a_high_baseline_opens_at_twice_its_mean() {
+        // 30ms, give or take 1: the floor is 5% of the mean, so 3σ is
+        // 34.5ms, and 5ms slower is 35ms. A resolver that normally takes 30ms
+        // is not slow at 40.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 30.0, 1.0, 2_000);
+        let slow = |p50: f64| {
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            rules_of(&detect(&obs_with_dns(dns), &base, &Thresholds::default()))
+                .contains(&"dns.slow_resolver")
+        };
+        assert!(!slow(40.0));
+        assert!(!slow(59.0));
+        assert!(slow(60.0));
+    }
+
+    #[test]
+    fn the_dns_open_line_is_the_highest_of_its_three_tests() {
+        let t = Thresholds::default();
+        let line = |mean: f64, sigma: f64| {
+            let mut base = store();
+            base.seed("169.254.1.1", "dns.rtt_p50", mean, sigma, 2_000);
+            dns_open_line(base.get("169.254.1.1", "dns.rtt_p50").unwrap(), &t)
+        };
+        // Each of the three can be the one that sets it.
+        assert_eq!(line(1.2, 0.05), Some(6.2), "5ms above the mean");
+        assert_eq!(line(30.0, 1.0), Some(60.0), "twice the mean");
+        assert_eq!(line(10.0, 4.0), Some(22.0), "3σ above the mean");
+        // With both σ floors at 0 a baseline that never varied cannot be
+        // scored, as `sigma_above` cannot score it.
+        let unfloored = Thresholds {
+            sigma_floor_ms: 0.0,
+            sigma_floor_pct: 0.0,
+            ..t
+        };
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.0, 2_000);
+        let flat = base.get("169.254.1.1", "dns.rtt_p50").unwrap();
+        assert_eq!(dns_open_line(flat, &unfloored), None);
+    }
+
+    #[test]
+    fn a_gateway_moving_2_to_9ms_does_not_fire_but_2_to_15ms_does() {
+        // A wired gateway at 2ms, give or take 0.3: 9ms is 14σ over the
+        // floor but 7ms slower; 15ms is 13ms slower.
+        let mut base = store();
+        base.seed("192.168.8.1", "gateway.rtt", 2.0, 0.3, 2_000);
+        let spike = |rtt: f64, t: &Thresholds| {
+            let obs = Observations {
+                gateway: Some(GatewayObs {
+                    addr: Some("192.168.8.1".into()),
+                    rtt_ms: Some(rtt),
+                    loss_pct: 0.0,
+                    arp_ok: Some(true),
+                    icmp_ok: true,
+                    internet_reachable: Some(true),
+                }),
+                ..Default::default()
+            };
+            rules_of(&detect(&obs, &base, t)).contains(&"gateway.rtt_spike")
+        };
+        let t = Thresholds::default();
+        assert!(!spike(9.0, &t));
+        assert!(spike(15.0, &t));
+        let no_delta = Thresholds {
+            gateway_delta_floor_ms: 0.0,
+            ..t
+        };
+        assert!(spike(9.0, &no_delta), "only the 10ms floor holds it back");
     }
 
     #[test]
@@ -3595,6 +3756,7 @@ mod tests {
         let (t, warnings) = Thresholds {
             sigma_k: 0.0,
             sigma_floor_ms: -0.5,
+            gateway_delta_floor_ms: -10.0,
             consecutive_n: 0,
             saturation_pct: 150.0,
             dns_tc_pct: -1.0,
@@ -3606,6 +3768,8 @@ mod tests {
             // Valid values that are not the defaults are kept, the edges
             // of a share included.
             sigma_floor_pct: 0.0,
+            dns_delta_floor_ms: 0.0,
+            dns_delta_multiple: 0.0,
             dns_mismatch_pct: 100.0,
             wifi_retry_pct: 0.0,
             wifi_rssi_dbm: -80.0,
@@ -3617,6 +3781,8 @@ mod tests {
             t,
             Thresholds {
                 sigma_floor_pct: 0.0,
+                dns_delta_floor_ms: 0.0,
+                dns_delta_multiple: 0.0,
                 dns_mismatch_pct: 100.0,
                 wifi_retry_pct: 0.0,
                 wifi_rssi_dbm: -80.0,
@@ -3629,6 +3795,7 @@ mod tests {
             [
                 "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
                 "diagnose_thresholds.sigma_floor_ms = -0.5 must be a finite number of 0 or more, so the default 0.5 is used",
+                "diagnose_thresholds.gateway_delta_floor_ms = -10 must be a finite number of 0 or more, so the default 10 is used",
                 "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
                 "diagnose_thresholds.loaded_rtt_delta_ms = inf must be a finite number, so the default 100 is used",
                 "diagnose_thresholds.saturation_pct = 150 must be within 0..=100, so the default 90 is used",

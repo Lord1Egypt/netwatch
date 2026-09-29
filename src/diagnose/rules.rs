@@ -74,7 +74,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "slow dns resolver",
         category: "dns",
         severity: Severity::Medium,
-        trigger: "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
+        trigger: "resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples",
         suppresses: &[],
         status: RuleStatus::Active,
         evidence: &[],
@@ -184,7 +184,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "gateway slow to answer",
         category: "link",
         severity: Severity::Medium,
-        trigger: "gateway rtt > 3σ above baseline for 3 samples",
+        trigger: "gateway rtt > 3σ and at least 10ms above baseline for 3 samples",
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
         evidence: &[],
@@ -871,11 +871,6 @@ mod tests {
     /// whose text has already changed fails, so none outlives its reason.
     const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
         (
-            "dns.slow_resolver",
-            "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
-            "B10: the ceiling applies with a baseline too",
-        ),
-        (
             "dns.failing",
             "servfail/timeout rate > 5%, or the pipeline dns stage fails",
             "B15, then A14: servfail counts as a reply, and no pipeline branch exists",
@@ -986,7 +981,20 @@ mod tests {
         // both 3) need the number twice.
         const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
             ("dns.truncation_retry", &["dns_tc_pct"]),
-            ("gateway.rtt_spike", &["sigma_k", "consecutive_n"]),
+            (
+                "dns.slow_resolver",
+                &[
+                    "sigma_k",
+                    "dns_delta_floor_ms",
+                    "dns_delta_multiple",
+                    "dns_ceiling_ms",
+                    "consecutive_n",
+                ],
+            ),
+            (
+                "gateway.rtt_spike",
+                &["sigma_k", "gateway_delta_floor_ms", "consecutive_n"],
+            ),
             ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
             ("tcp.bufferbloat_local", &["loaded_rtt_delta_ms"]),
             ("target.resolve_failed", &["consecutive_n"]),

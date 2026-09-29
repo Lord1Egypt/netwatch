@@ -2718,8 +2718,12 @@ mod tests {
                 .find(|i| i.rule == "gateway.rtt_spike")
                 .map(|i| i.state.clone())
         };
-        e.observe(&gateway(5.0), &b);
-        assert_eq!(state(&e), Some(IssueState::Open), "8.2σ over the floor");
+        e.observe(&gateway(12.0), &b);
+        assert_eq!(
+            state(&e),
+            Some(IssueState::Open),
+            "22.2σ over the floor, and 11.1ms slower"
+        );
 
         for _ in 0..=24 {
             clock.advance_secs(5);
