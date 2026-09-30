@@ -489,7 +489,8 @@ review as the code that caused it.
 
 Every rule whose open condition or close line changed since 0.32 is listed in
 `TOUCHED_SINCE_0_32` in `src/diagnose/episode.rs`, and a test fails unless a
-corpus entry that lists the rule both opens and closes it. A rule that cannot
+corpus entry that lists the rule both opens it and closes it by its verify. For
+the socket rules an expiry once the socket closes counts too. A rule that cannot
 close yet has a `PENDING_CLOSE` row there saying why: `iface.errors`, whose
 close line a Wi-Fi driver's background drops never let it reach. Another test
 fails once such a rule closes, so its row goes in the same change.

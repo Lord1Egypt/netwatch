@@ -1657,33 +1657,41 @@ mod tests {
     }
 
     /// Every rule whose open condition or verify a 0.33 or 0.34 PR changed,
-    /// and the socket rules B25 made closable. REVIEW §2's exit clause 2
-    /// asks each for a pinned episode in which it opens and closes. A PR
-    /// that changes another rule's open condition or verify adds its row
-    /// here and its episode to the corpus. B25's expiry of a removed
-    /// target, resolver or interface holds for every rule with that subject
-    /// and is pinned by its engine tests, not by an episode per rule.
-    const TOUCHED_SINCE_0_32: &[&str] = &[
+    /// and the socket rules B25 made closable, each with the closes that
+    /// count for it. REVIEW §2's exit clause 2 asks each for a pinned
+    /// episode in which it opens and closes. A PR that changes another
+    /// rule's open condition or verify adds its row here and its episode to
+    /// the corpus. B25's expiry of a removed target, resolver or interface
+    /// holds for every rule with that subject and is pinned by its engine
+    /// tests, not by an episode per rule, so only the socket rules count it
+    /// as a close.
+    const TOUCHED_SINCE_0_32: &[(&str, &[&str])] = &[
         // B09's σ floor, B10's delta floors, B13's close line.
-        "dns.slow_resolver",
+        ("dns.slow_resolver", VERIFY),
         // B09, B10, and B11's 2σ close line.
-        "gateway.rtt_spike",
+        ("gateway.rtt_spike", VERIFY),
         // A05: opens only on a carrier read as down, closes only on one
         // read as up.
-        "link.down",
+        ("link.down", VERIFY),
         // A04's idle radio and A05's unknown one.
-        "wifi.weak_signal",
+        ("wifi.weak_signal", VERIFY),
         // A06: errors alone where drops are not counted.
-        "iface.errors",
+        ("iface.errors", VERIFY),
         // B09 and B11.
-        "path.rtt_spike",
-        "target.slow_stage",
+        ("path.rtt_spike", VERIFY),
+        ("target.slow_stage", VERIFY),
         // A03's socket with no rtt, and B25's expiry once the socket closes.
-        "tcp.bufferbloat_remote",
-        "tcp.retrans_burst",
+        ("tcp.bufferbloat_remote", VERIFY_OR_EXPIRY),
+        ("tcp.retrans_burst", VERIFY_OR_EXPIRY),
         // B25.
-        "tcp.zero_window",
+        ("tcp.zero_window", VERIFY_OR_EXPIRY),
     ];
+
+    /// A verify that held. A suppression, a mute or a user's resolve ends a
+    /// span without the rule closing.
+    const VERIFY: &[&str] = &["auto-closed"];
+    /// A verify that held, or the socket going away (B25).
+    const VERIFY_OR_EXPIRY: &[&str] = &["auto-closed", "expired"];
 
     /// Touched rules that no episode can close yet, each with the reason.
     /// The owner accepts each row in the PR that adds it, and
@@ -1694,11 +1702,6 @@ mod tests {
         "it closes only under 1/min errors and drops combined, which a Wi-Fi \
          driver's background drops never allow, until B19 retunes it",
     )];
-
-    /// The closes the engine makes itself: a verify that held, or a
-    /// subject that went away. A suppression, a mute or a user's resolve
-    /// ends a span without the rule closing.
-    const ENGINE_CLOSES: &[&str] = &["auto-closed", "expired"];
 
     /// Each corpus entry that lists `rule` among the rules it pins, with its
     /// pinned spans of that rule.
@@ -1725,10 +1728,11 @@ mod tests {
             .collect()
     }
 
-    fn engine_closed(span: &IssueSpan) -> bool {
+    /// Whether `span` ended in one of `closes`.
+    fn closed_by(span: &IssueSpan, closes: &[&str]) -> bool {
         span.close_reason
             .as_deref()
-            .is_some_and(|reason| ENGINE_CLOSES.contains(&reason))
+            .is_some_and(|reason| closes.contains(&reason))
     }
 
     /// REVIEW §2's exit clause 2, as a test: each touched rule opens in an
@@ -1738,7 +1742,7 @@ mod tests {
     fn every_touched_rule_has_an_open_close_episode() {
         let failures: Vec<String> = TOUCHED_SINCE_0_32
             .iter()
-            .filter_map(|&rule| {
+            .filter_map(|&(rule, counted)| {
                 if crate::diagnose::rules::lookup(rule).is_none() {
                     return Some(format!("{rule}: not in the catalogue"));
                 }
@@ -1750,7 +1754,7 @@ mod tests {
                     .collect();
                 let closes = episodes
                     .iter()
-                    .any(|(_, spans)| spans.iter().any(engine_closed));
+                    .any(|(_, spans)| spans.iter().any(|span| closed_by(span, counted)));
                 let pending = PENDING_CLOSE.iter().any(|(r, _)| *r == rule);
                 if opening.is_empty() {
                     Some(format!(
@@ -1759,7 +1763,7 @@ mod tests {
                     ))
                 } else if !closes && !pending {
                     Some(format!(
-                        "{rule}: opens in {opening:?} but never auto-closes or expires; \
+                        "{rule}: opens in {opening:?} but never closes by {counted:?}; \
                          pin an episode that closes it, or add a PENDING_CLOSE row saying \
                          why it cannot"
                     ))
@@ -1774,13 +1778,15 @@ mod tests {
     #[test]
     fn pending_close_entries_are_still_needed() {
         for (rule, why) in PENDING_CLOSE {
-            assert!(
-                TOUCHED_SINCE_0_32.contains(rule),
-                "{rule} is pending a close but is not in TOUCHED_SINCE_0_32"
-            );
+            let (_, counted) = TOUCHED_SINCE_0_32
+                .iter()
+                .find(|(r, _)| r == rule)
+                .unwrap_or_else(|| {
+                    panic!("{rule} is pending a close but is not in TOUCHED_SINCE_0_32")
+                });
             let closing: Vec<String> = pinned_spans_of(rule)
                 .into_iter()
-                .filter(|(_, spans)| spans.iter().any(engine_closed))
+                .filter(|(_, spans)| spans.iter().any(|span| closed_by(span, counted)))
                 .map(|(id, _)| id)
                 .collect();
             assert!(
