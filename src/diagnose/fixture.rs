@@ -201,8 +201,9 @@ pub fn observations_at(secs_from_start: u64) -> Observations {
 /// This is what closes the loop in the interactive demo: switching the session
 /// resolver is supposed to fix the DNS issue, so the scenario has to be able to
 /// show it doing that. The engine is not told anything — it simply sees the
-/// resolver answering in 1.2ms again, and its own verify condition
-/// (`dns.rtt_p50 < 5ms for 60s`) closes the issue on schedule.
+/// resolver answering in 1.4ms, and its own verify condition (`dns.rtt_p50`
+/// under 4.96ms, 0.8 of the 6.2ms line it opened on, for 60s) closes the
+/// issue on schedule.
 pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observations {
     // 06:44:00 + n. Onsets: path 06:44:02 (2s), dns 06:48:10 (250s),
     // socket 06:49:31 (331s).
@@ -680,7 +681,8 @@ mod tests {
         );
 
         // The operator switches resolver. dns.slow_resolver verifies on
-        // p50 < 5ms held for 60s, so it must survive a while and then close.
+        // p50 under 4.96ms held for 60s, so it must survive a while and then
+        // close.
         for t in 301..=340 {
             engine.observe(&observations_with(t, true), &base);
             clock.advance_secs(1);

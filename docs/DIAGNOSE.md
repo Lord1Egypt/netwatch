@@ -224,9 +224,22 @@ line for both, a gateway hovering at 3σ closed each time it dipped under for
 two minutes and reopened each time it rose. A noisy link now takes longer to
 close.
 
+`dns.slow_resolver` closes once the resolver's median has stayed under one
+line for 60 s, set when the issue opens: 0.8 of the line it opened on, or 2σ
+above the resolver's mean if that is higher. The line it opened on is the
+lower of the ceiling and the baseline's line. A router answering in 10.5 ms
+opens at 21 ms and closes under 16.8 ms; with no baseline the line is 80 ms,
+0.8 of the ceiling. The close line used to be a flat 5 ms, which a router
+answering in 10 ms never meets, so an issue opened on one stayed open until
+netwatch restarted. The line is in ms and does not follow the baseline, so an
+issue whose median settles between the two lines stays open until netwatch
+restarts or the resolver leaves the config, even after the baseline has
+learned the new median.
+
 `sigma_k` also sets what the baselines learn: a reading that many σ or more
 above normal is left out, so an incident does not become the new normal. A
-reading between `sigma_close_k` and `sigma_k` is learned, so an issue that
+reading between `sigma_close_k` and `sigma_k` is learned, so a
+`gateway.rtt_spike`, `path.rtt_spike` or `target.slow_stage` issue that
 settles there closes once its baseline has caught up with it. A low value
 leaves out ordinary peaks too, so the saved baselines settle lower and flag
 more, and they take time to relearn after the value is raised again.

@@ -777,9 +777,12 @@ pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
 ///
 /// The three σ rules close at the default `sigma_close_k`, 2σ. This cannot
 /// read `Thresholds`, so their detectors put the configured value in its place.
+/// `dns.slow_resolver` closes at 0.8 of the default 100 ms ceiling, its line
+/// with no baseline; its detector derives the line from the baseline and the
+/// configured ceiling.
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
-        "dns.slow_resolver" => Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60),
+        "dns.slow_resolver" => Verify::below("dns.rtt_p50", 80.0, "ms").holding_for(60),
         "dns.failing" => Verify::below("dns.failure_rate", 1.0, "%").holding_for(120),
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
