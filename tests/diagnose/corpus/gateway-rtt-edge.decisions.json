@@ -1,0 +1,13 @@
+{
+  "episode": "gateway-rtt-edge",
+  "frames": 931,
+  "issues": [
+    {
+      "key": "gateway.rtt_spike|host",
+      "opened": "2026-09-03 06:46:10",
+      "closed": "2026-09-03 06:58:30",
+      "top_cause": "gateway.rtt_spike/local_network_congested",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

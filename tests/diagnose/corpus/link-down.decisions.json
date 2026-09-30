@@ -1,0 +1,13 @@
+{
+  "episode": "link-down",
+  "frames": 391,
+  "issues": [
+    {
+      "key": "link.down|eth0",
+      "opened": "2026-09-03 06:46:02",
+      "closed": "2026-09-03 06:49:30",
+      "top_cause": "link.down/unplugged_or_port_down",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

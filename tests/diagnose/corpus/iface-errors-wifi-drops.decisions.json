@@ -1,0 +1,12 @@
+{
+  "episode": "iface-errors-wifi-drops",
+  "frames": 721,
+  "issues": [
+    {
+      "key": "iface.errors|wlan0",
+      "opened": "2026-09-03 06:44:02",
+      "closed": null,
+      "top_cause": "iface.errors/ring_buffer_small"
+    }
+  ]
+}

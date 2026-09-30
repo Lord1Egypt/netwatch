@@ -474,10 +474,11 @@ fn quiet_frame() -> Observations {
     }
 }
 
-/// Healthy until 120 s, faulty until the socket closes at 300 s, then gone.
-/// A socket verdict holds 30 s and three samples before it opens, so each
-/// socket episode opens at 152 s, and expires 60 s after the close.
-const SOCKET_STORY: [(u64, Phase); 3] = [
+/// Healthy until 120 s, faulty until 300 s, then clear. In a socket
+/// episode the socket closes at 300 s; a socket verdict holds 30 s and
+/// three samples before it opens, so each opens at 152 s, and expires 60 s
+/// after the close.
+const STORY: [(u64, Phase); 3] = [
     (0, Phase::Healthy),
     (120, Phase::Fault),
     (300, Phase::Clear),
@@ -525,7 +526,7 @@ fn retrans_socket_closes(t: u64) -> Observations {
         rx_bps: 4.2e4,
         verdict_age_secs: t,
     };
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(scp),
         Phase::Fault => obs.sockets.push(SocketObs {
             rtt_ms: Some(38.0),
@@ -546,7 +547,7 @@ fn retrans_socket_closes(t: u64) -> Observations {
 fn bufferbloat_remote_socket_closes(t: u64) -> Observations {
     let mut obs = quiet_frame();
     obs.sockets.push(neighbour_socket(t));
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(SocketObs {
             rtt_ms: Some(1.1),
             rttvar_ms: Some(0.3),
@@ -579,7 +580,7 @@ fn zero_window_socket_closes(t: u64) -> Observations {
         rx_bps: 2.2e5,
         verdict_age_secs: t,
     };
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(rsync),
         Phase::Fault => obs.sockets.push(SocketObs {
             rwnd: Some(0),
@@ -725,6 +726,252 @@ fn target_slow_stage(t: u64) -> Observations {
     obs
 }
 
+/// [`live_baselines`] on a network whose router is its resolver too,
+/// answering in 10.5 ms (σ 0.3), as the notes measured one.
+fn router_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(NetworkFingerprint::new(
+        IFACE,
+        Some(GATEWAY.to_string()),
+        vec![GATEWAY.to_string()],
+        Some("192.168.8.0/24".to_string()),
+    ));
+    b.seed(GATEWAY, "dns.rtt_p50", 10.5, 0.3, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 0.9, 0.2, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// The router's DNS forwarder. The p50 reads 10 ms, then 150 ms from
+/// 120 s, when the router's upstream slows, and 11 ms from 300 s. Live,
+/// the p50 is a median over ten minutes of probes, so these are the times
+/// the median moves, some minutes after the resolver does. The issue opens
+/// on the third slow probe. It closes once 11 ms has held 60 s under
+/// 16.8 ms, 0.8 of the 21 ms line it opened on, twice the baseline, though
+/// the 100 ms ceiling fired too. The flat 5 ms line this replaced never
+/// closed it.
+fn dns_slow_router(t: u64) -> Observations {
+    let (p50, p95) = match phase(t, &STORY) {
+        Phase::Healthy => (10.0, 12.0),
+        Phase::Fault => (150.0, 180.0),
+        Phase::Clear => (11.0, 13.0),
+    };
+    let mut obs = quiet_frame();
+    if let Some(config) = &mut obs.config {
+        config.resolvers = Some(vec![GATEWAY.into()]);
+    }
+    // As the live sampler fills it: ten minutes of probes to the one
+    // resolver, and no alternate, icmp or cached timing, which it never
+    // measures.
+    obs.dns = Some(DnsObs {
+        resolver: GATEWAY.into(),
+        rtt_p50_ms: Some(p50),
+        rtt_p95_ms: Some(p95),
+        failure_rate_pct: 0.0,
+        truncation_rate_pct: 0.0,
+        queries: 120,
+        failed: 0,
+        truncated: 0,
+        alt_resolver: None,
+        alt_rtt_ms: None,
+        icmp_rtt_ms: None,
+        cached_rtt_ms: None,
+        window_secs: 600,
+        cross: None,
+    });
+    obs
+}
+
+/// A healthy probe's rtt: `mean`, give or take `spread`, moving from one
+/// probe to the next in a fixed order, so a recording stays the same.
+fn wobble(probe: u64, mean: f64, spread: f64) -> f64 {
+    const STEPS: [f64; 6] = [0.0, 0.7, -0.3, 1.0, -1.0, 0.3];
+    mean + spread * STEPS[(probe % 6) as usize]
+}
+
+/// [`live_baselines`] with the router answering its own pings in 1.0 ms,
+/// σ 0.3.
+fn wired_gateway_baselines() -> BaselineStore {
+    let mut b = live_baselines();
+    b.seed(GATEWAY, "gateway.rtt", 1.0, 0.3, 2_400);
+    b
+}
+
+/// The router, answering its own pings in 1.0 ms, give or take 0.3. From
+/// 120 s its CPU is busy and it answers in 40 ms, though what it forwards
+/// is not held up; from 300 s it answers in 1.0 ms again. The issue opens
+/// on the third slow probe and closes once the rtt has held under 2σ,
+/// 2.0 ms against the 0.5 ms σ floor, for 120 s.
+fn gateway_rtt(t: u64) -> Observations {
+    let rtt = match phase(t, &STORY) {
+        Phase::Fault => 40.0,
+        _ => wobble(t / 5, 1.0, 0.3),
+    };
+    let mut obs = quiet_frame();
+    obs.gateway = Some(GatewayObs {
+        rtt_ms: Some(rtt),
+        // The sampler has no ARP probe.
+        arp_ok: None,
+        ..healthy_gateway()
+    });
+    obs
+}
+
+/// The laptop's Wi-Fi interface.
+const WLAN: &str = "wlan0";
+
+/// The demo network's live baselines over Wi-Fi, where the access point
+/// answers its own pings in 4 ms, σ 4.
+fn wifi_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(NetworkFingerprint::new(
+        WLAN,
+        Some(GATEWAY.to_string()),
+        vec![RESOLVER.to_string()],
+        Some("192.168.8.0/24".to_string()),
+    ));
+    b.seed(RESOLVER, "dns.rtt_p50", 1.2, 0.4, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 4.0, 4.0, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// [`quiet_frame`] on a laptop on Wi-Fi: wlan0 at −53 dBm with 7% of
+/// frames retried, what `iw station dump` showed on a healthy link, and
+/// the access point answering in 4 ms, give or take 3.
+fn wifi_frame(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.iface = Some(IfaceObs {
+        name: WLAN.into(),
+        counter_window_secs: Some(60.0),
+        wireless: Some(true),
+        // The sampler reads no link rate on a radio.
+        link_rate_bps: None,
+        signal_dbm: Some(-53),
+        tx_retry_pct: Some(7.0),
+        ..healthy_iface()
+    });
+    obs.gateway = Some(GatewayObs {
+        rtt_ms: Some(wobble(t / 5, 4.0, 3.0)),
+        arp_ok: None,
+        ..healthy_gateway()
+    });
+    if let Some(config) = &mut obs.config {
+        config.interfaces = Some(vec!["lo".into(), WLAN.into()]);
+    }
+    obs
+}
+
+/// The access point hovering at the open line. Against its 4 ms baseline
+/// (σ 4), 3σ is 16 ms, 12 ms over the mean and past the 10 ms delta
+/// floor. From 120 s its own replies slow: 30 s at 16.4 ms (3.1σ), then
+/// three minutes at 15.6 ms (2.9σ), three times over. Each dip is under
+/// the open line and over the 2σ close line, so the issue stays one
+/// issue; under a 3σ close line each dip outlasts the 120 s hold, and the
+/// issue closes and reopens. From 750 s it answers in 4 ms again, and the
+/// issue closes 120 s later.
+fn gateway_rtt_edge(t: u64) -> Observations {
+    let mut obs = wifi_frame(t);
+    if (120..750).contains(&t) {
+        let sigma = if (t - 120) % 210 < 30 { 3.1 } else { 2.9 };
+        if let Some(gw) = &mut obs.gateway {
+            gw.rtt_ms = Some(4.0 + sigma * 4.0);
+        }
+    }
+    obs
+}
+
+/// The demo's wired link, unplugged at 120 s and plugged back in at 300 s.
+/// NetworkManager takes the connection down with the carrier, and the
+/// default route and the DHCP resolver go with it, so the prober has
+/// nothing to probe and no trace completes: the frames carry no gateway,
+/// DNS or path observation until the link is back. The issue opens on the
+/// third sample with no carrier and closes once the carrier has held 30 s.
+fn link_down(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        let iface = obs
+            .iface
+            .as_mut()
+            .expect("the quiet frame has an interface");
+        iface.carrier = Some(false);
+        iface.link_rate_bps = None;
+        iface.rx_bps = 0.0;
+        iface.tx_bps = 0.0;
+        obs.gateway = None;
+        obs.dns = None;
+        obs.paths.clear();
+        if let Some(config) = &mut obs.config {
+            config.resolvers = None;
+        }
+    }
+    obs
+}
+
+/// The same link, never down: from 120 s to 300 s the platform's
+/// interface list comes back empty, as when the read fails, while the
+/// link's counters keep moving. The carrier is unknown, which is not
+/// down, so nothing opens.
+fn link_down_carrier_unknown(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        let iface = obs
+            .iface
+            .as_mut()
+            .expect("the quiet frame has an interface");
+        iface.carrier = None;
+        iface.wireless = None;
+        if let Some(config) = &mut obs.config {
+            config.interfaces = None;
+        }
+    }
+    obs
+}
+
+/// The laptop carried to the far end of the house at 120 s: −78 dBm, and
+/// 14% of frames retried, under the 20% line, so the signal alone opens
+/// the issue. From 300 s it sits at −60 dBm, over the −70 dBm line, and
+/// the issue closes once that has held 120 s.
+fn wifi_weak(t: u64) -> Observations {
+    let (signal, retries) = match phase(t, &STORY) {
+        Phase::Healthy => (-53, 7.0),
+        Phase::Fault => (-78, 14.0),
+        Phase::Clear => (-60, 9.0),
+    };
+    let mut obs = wifi_frame(t);
+    let iface = obs
+        .iface
+        .as_mut()
+        .expect("the Wi-Fi frame has an interface");
+    iface.signal_dbm = Some(signal);
+    iface.tx_retry_pct = Some(retries);
+    obs
+}
+
+/// The laptop's driver drops about 70 frames a minute it has no use for,
+/// multicast for groups nothing here joined, and counts them as interface
+/// drops. That is over the 60/min floor, so iface.errors opens on the
+/// drops alone two seconds in. From 120 s to 300 s interference costs the
+/// link 30 errors a minute as well. The issue never closes: it closes only
+/// under 1/min errors and drops combined, which the drops never allow,
+/// until B19 retunes the rule. On the errors alone it would close at 659 s.
+fn iface_errors_wifi_drops(t: u64) -> Observations {
+    // Both rates count the minute before the frame, as the sampler's do,
+    // so the errors ramp in and out over a minute. The seconds of
+    // `from..to` in that minute:
+    let in_last_minute =
+        |from: u64, to: u64| t.min(to).saturating_sub(t.saturating_sub(60).max(from));
+    let mut obs = wifi_frame(t);
+    let iface = obs
+        .iface
+        .as_mut()
+        .expect("the Wi-Fi frame has an interface");
+    iface.errors_per_min = 30 * in_last_minute(120, 300) / 60;
+    iface.drops_per_min = Some(70);
+    // And the lifetime counters behind them.
+    iface.rx_errors = 30 * t.min(300).saturating_sub(120) / 60;
+    iface.rx_dropped = 18_400 + 70 * t / 60;
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -758,6 +1005,29 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             baselines: target_baselines,
             ..Scenario::live("target-slow-stage", 720, target_slow_stage)
+        },
+        Scenario {
+            baselines: router_baselines,
+            ..Scenario::live("dns-slow-router", 420, dns_slow_router)
+        },
+        Scenario {
+            baselines: wired_gateway_baselines,
+            ..Scenario::live("gateway-rtt", 480, gateway_rtt)
+        },
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("gateway-rtt-edge", 930, gateway_rtt_edge)
+        },
+        Scenario::live("link-down", 390, link_down),
+        Scenario::live("link-down-carrier-unknown", 420, link_down_carrier_unknown),
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("wifi-weak", 480, wifi_weak)
+        },
+        // A minute past where it would close without the drops.
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("iface-errors-wifi-drops", 720, iface_errors_wifi_drops)
         },
     ]
 }
@@ -1199,6 +1469,183 @@ mod tests {
             vec![span(
                 "2026-09-03 06:49:00",
                 "2026-09-03 06:55:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// B13 closes a slow-resolver issue relative to the line it opened on.
+    /// The router's 150 ms p50 opens the issue on the third slow probe, at
+    /// 130 s, over the ceiling and over its baseline's 21 ms line, and 11 ms
+    /// from 300 s holds under 0.8 of the lower line for 60 s. The flat 5 ms
+    /// line B13 replaced never closed it.
+    #[test]
+    fn a_router_resolver_issue_closes_under_the_line_it_opened_on() {
+        assert_eq!(
+            pinned_spans("dns-slow-router"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:50:00",
+                "auto-closed"
+            )]
+        );
+        let ep = synthetic("dns-slow-router").unwrap();
+        let line = ep.issues[0].issue.verify.threshold;
+        assert!((line - 16.8).abs() < 1e-9, "{line}");
+    }
+
+    /// A router answering in 40 ms opens gateway.rtt_spike on the third slow
+    /// probe, at 130 s, and back at 1.0 ms from 300 s it closes once that
+    /// has held under 2σ for 120 s.
+    #[test]
+    fn a_gateway_rtt_spike_closes_once_the_router_answers_again() {
+        assert_eq!(
+            pinned_spans("gateway-rtt"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:51:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// B11's deadband, in the corpus. An access point hovering at the open
+    /// line is one issue from its first open, at 130 s, until 120 s after
+    /// the hover ends at 750 s. With the close line on the open line, the
+    /// same frames close it after each dip and reopen it on each rise.
+    #[test]
+    fn a_gateway_hovering_at_the_open_line_stays_one_issue() {
+        assert_eq!(
+            pinned_spans("gateway-rtt-edge"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:58:30",
+                "auto-closed"
+            )]
+        );
+        let edge = scenarios()
+            .into_iter()
+            .find(|s| s.id == "gateway-rtt-edge")
+            .unwrap();
+        let flapping = record(&Scenario {
+            thresholds: Thresholds {
+                sigma_close_k: 3.0,
+                ..Thresholds::default()
+            },
+            ..edge
+        });
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&flapping);
+        let closes: Vec<_> = decisions
+            .issues
+            .iter()
+            .map(|s| s.closed.as_deref())
+            .collect();
+        assert_eq!(
+            closes,
+            vec![
+                Some("2026-09-03 06:48:30"),
+                Some("2026-09-03 06:52:00"),
+                Some("2026-09-03 06:55:30"),
+            ]
+        );
+    }
+
+    /// A05 judges the link on what the platform reported. link.down opens
+    /// on a carrier read as down, at 122 s, and closes 30 s after one read
+    /// as up; wifi.weak_signal opens on −78 dBm and closes 120 s into
+    /// −60 dBm.
+    #[test]
+    fn a_link_issue_opens_and_closes_on_what_was_read() {
+        assert_eq!(
+            pinned_spans("link-down"),
+            vec![span(
+                "2026-09-03 06:46:02",
+                "2026-09-03 06:49:30",
+                "auto-closed"
+            )]
+        );
+        assert_eq!(
+            pinned_spans("wifi-weak"),
+            vec![span(
+                "2026-09-03 06:46:02",
+                "2026-09-03 06:51:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// Three minutes with no interface info open nothing, and link.down is
+    /// not measured on each of them rather than passed.
+    #[test]
+    fn an_unknown_carrier_opens_nothing_and_is_not_measured() {
+        assert_eq!(pinned_spans("link-down-carrier-unknown"), vec![]);
+        let ep = synthetic("link-down-carrier-unknown").unwrap();
+        let mut unknown = 0;
+        crate::diagnose::episode::drive(&ep, |step| {
+            let carrier = step.frame.obs.iface.as_ref().and_then(|i| i.carrier);
+            let link_down = step
+                .engine
+                .coverage()
+                .rules
+                .iter()
+                .find(|r| r.rule == "link.down")
+                .map(|r| r.status.clone());
+            match carrier {
+                None => {
+                    unknown += 1;
+                    assert_eq!(
+                        link_down,
+                        Some(Availability::NotMeasured),
+                        "{}",
+                        step.frame.ts
+                    );
+                }
+                Some(_) => assert_eq!(
+                    link_down,
+                    Some(Availability::Available),
+                    "{}",
+                    step.frame.ts
+                ),
+            }
+        });
+        assert_eq!(unknown, 180);
+    }
+
+    /// A Wi-Fi driver's background drops open iface.errors two seconds in
+    /// and hold it open to the end, because it closes only under 1/min
+    /// errors and drops combined; `PENDING_CLOSE` in episode.rs says so.
+    /// The drops are all that hold it: without them the errors open it at
+    /// 124 s and it closes at 659 s, 300 s after the last error leaves the
+    /// minute's count.
+    #[test]
+    fn background_wifi_drops_hold_iface_errors_open() {
+        assert_eq!(
+            pinned_spans("iface-errors-wifi-drops"),
+            vec![("2026-09-03 06:44:02".to_string(), None, None)]
+        );
+        let scenario = scenarios()
+            .into_iter()
+            .find(|s| s.id == "iface-errors-wifi-drops")
+            .unwrap();
+        let errors_alone = record(&Scenario {
+            obs: |t| {
+                let mut obs = iface_errors_wifi_drops(t);
+                obs.iface.as_mut().unwrap().drops_per_min = Some(0);
+                obs
+            },
+            ..scenario
+        });
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&errors_alone);
+        let spans: Vec<_> = decisions
+            .issues
+            .into_iter()
+            .map(|s| (s.opened, s.closed, s.close_reason))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![span(
+                "2026-09-03 06:46:04",
+                "2026-09-03 06:54:59",
                 "auto-closed"
             )]
         );
