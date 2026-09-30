@@ -325,9 +325,18 @@ impl Redactor {
         if let Some(token) = self.target_names.get(s) {
             return token.clone();
         }
-        if let Some((prefix, name)) = s.rsplit_once('|') {
-            if let Some(token) = self.target_names.get(name) {
-                return format!("{prefix}|{token}");
+        // An issue key: `rule|subject`, or `rule|name|revision` for a
+        // configured target. Rule ids never contain `|`.
+        if let Some((rule, subject)) = s.split_once('|') {
+            if let Some(token) = self.target_names.get(subject) {
+                return format!("{rule}|{token}");
+            }
+            if let Some((name, revision)) = subject.rsplit_once('|') {
+                if let (Some(name), Some(revision)) =
+                    (self.target_names.get(name), self.target_names.get(revision))
+                {
+                    return format!("{rule}|{name}|{revision}");
+                }
             }
         }
         if let Some((name, metric)) = s.split_once('\u{1f}') {
@@ -876,6 +885,14 @@ mod tests {
         assert!(safe.labels[0]
             .issue
             .starts_with("target.resolve_failed|target:"));
+        // A target's issue key carries its name and its revision; both map.
+        assert!(!text.contains("target.resolve_failed|dns"), "{text}");
+        let key = format!(
+            "target.resolve_failed|{}|{}",
+            probed.name,
+            probed.baseline_key.as_deref().unwrap()
+        );
+        assert!(text.contains(&key), "{key}");
         assert!(
             safe.frames[0].obs.dns.is_some(),
             "field name must survive target-name collision"

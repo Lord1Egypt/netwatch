@@ -308,8 +308,8 @@ pub struct ObservationTimes {
 /// Something done to an issue from outside the detection loop: a user action,
 /// or (later) a diagnostic test result. Logged so an episode can replay it.
 ///
-/// Events name issues by `rule|subject` rather than id, because a replayed
-/// engine numbers its issues independently.
+/// Events name issues by key ([`super::issue::finding_key`]) rather than
+/// id, because a replayed engine numbers its issues independently.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EngineEvent {
@@ -480,8 +480,8 @@ impl Engine {
         self.issues.iter().find(|i| i.id == id)
     }
 
-    /// The issue filed under `rule|subject`: the open one, or the last to
-    /// close. `None` once history pruning has dropped it.
+    /// The issue filed under a key ([`super::issue::finding_key`]): the open
+    /// one, or the last to close. `None` once history pruning has dropped it.
     pub fn get_by_key(&self, key: &str) -> Option<&Issue> {
         self.by_key.get(key).and_then(|id| self.get(id))
     }
@@ -740,6 +740,10 @@ impl Engine {
                     // Outside it, the old issue stays closed and we file new.
                     // An expired issue counts too: a resolver that left the
                     // config and came back still slow is the same problem.
+                    // A target's key carries its revision, so this never
+                    // crosses an edit. An entry put back to the revision
+                    // the issue was found under probes the same endpoint the
+                    // same way, and is this problem coming back.
                     let closed_at = match &issue.state {
                         IssueState::Resolved { at }
                         | IssueState::AutoClosed { at }
@@ -860,8 +864,7 @@ impl Engine {
                     self.periodic_paths.insert(issue.id.clone());
                 }
             }
-            let key = format!("{}|{}", issue.rule, issue.subject.label());
-            if seen.contains(&key) {
+            if seen.contains(&issue.key()) {
                 continue;
             }
 
@@ -1265,7 +1268,7 @@ impl Engine {
         let Some(issue) = self.issues.iter().find(|i| i.id == id) else {
             return;
         };
-        let key = format!("{}|{}", issue.rule, issue.subject.label());
+        let key = issue.key();
         if self.events.len() >= EVENT_LOG_CAP {
             self.events.remove(0);
         }
@@ -2599,6 +2602,263 @@ mod tests {
             }
             assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{case}");
         }
+    }
+
+    /// `api` refused under `revision`, the only entry the config lists.
+    fn refused_under(revision: &str) -> Observations {
+        Observations {
+            targets: vec![target_obs(revision, true)],
+            config: targets_config(&[revision]),
+            ..Default::default()
+        }
+    }
+
+    /// The issue that is not `old`, once there is one.
+    fn other_than(e: &Engine, old: &str) -> Option<Issue> {
+        e.issues().iter().find(|i| i.id != old).cloned()
+    }
+
+    /// Edited while it still fails the same way, a target's issue used to
+    /// take the new detection in: same rule, same name, same key. The merge
+    /// overwrote the revision it was found under, so the expiry check found
+    /// that revision in the config and the issue never expired, carrying its
+    /// history onto an endpoint nobody had diagnosed.
+    #[test]
+    fn an_edited_target_still_failing_expires_and_files_a_new_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        // It flaps once, so it has a count. Target steps have no hotkey for
+        // record_applied, so one is marked applied here as it would.
+        assert!(e.resolve(&old));
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        assert_eq!(e.get(&old).unwrap().recurrence, 1);
+        let issue = e.issues.iter_mut().find(|i| i.id == old).unwrap();
+        issue.remediation[0].applied = Some(crate::diagnose::issue::Applied::Yes {
+            at: "2026-09-03 06:48:15".into(),
+            before: String::new(),
+            after: String::new(),
+        });
+
+        // Edited at 06:48:16. The new revision confirms on its own samples.
+        let after = refused_under("target-config:bbbb");
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+            assert!(other_than(&e, &old).is_none(), "needs three samples");
+        }
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(new.state, IssueState::Open);
+        assert_eq!(new.since, "2026-09-03 06:48:16");
+        assert_eq!(new.recurrence, 0);
+        assert!(new.remediation.iter().all(|s| s.applied.is_none()));
+        assert_eq!(
+            new.scope.configuration.as_deref(),
+            Some("target-config:bbbb")
+        );
+
+        // The old revision is no longer probed: gone from 06:48:16.
+        let old_issue = e.get(&old).unwrap();
+        assert_eq!(
+            old_issue.scope.configuration.as_deref(),
+            Some("target-config:aaaa")
+        );
+        assert!(old_issue.remediation[0].applied.is_some());
+        while clock.now() < parse_ts("2026-09-03 06:49:15").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        assert_eq!(e.get(&old).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:16")
+        );
+        assert_eq!(e.get(&new.id).unwrap().state, IssueState::Open);
+        let primary: Vec<_> = e.primary().into_iter().map(|i| i.id.clone()).collect();
+        assert_eq!(primary, vec![new.id]);
+    }
+
+    #[test]
+    fn a_muted_target_edited_while_failing_expires_and_leaves_its_mute_behind() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        assert!(e.mute(&old, 60));
+        let muted = e.get(&old).unwrap().state.clone();
+
+        // Edited at 06:48:13; the new revision opens on its third sample.
+        let after = refused_under("target-config:bbbb");
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(
+            new.state,
+            IssueState::Open,
+            "the mute stays with the old issue"
+        );
+        assert_eq!(e.get(&old).unwrap().state, muted);
+
+        while clock.now() < parse_ts("2026-09-03 06:49:13").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:13")
+        );
+        assert_eq!(e.get(&new.id).unwrap().state, IssueState::Open);
+        assert_eq!(e.primary().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_target_does_not_inherit_the_old_verification() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        // Probed every 10 s; each tick reads the result just published.
+        let tick = |e: &mut Engine, o: &Observations, t: u64| {
+            let times = ObservationTimes {
+                targets: [("api".to_string(), at(t))].into_iter().collect(),
+                ..Default::default()
+            };
+            e.observe_live_at(o, &b, &times, at(t));
+        };
+        let failing = refused_under("target-config:aaaa");
+        let mut healthy = failing.clone();
+        healthy.targets[0] = target_obs("target-config:aaaa", false);
+        tick(&mut e, &failing, 0);
+        for t in [10, 20] {
+            clock.advance_secs(10);
+            tick(&mut e, &failing, t);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        assert!(e.mark_step_done(&old, 0));
+
+        // It recovers for two probes, so its hold is running.
+        for t in [30, 40] {
+            clock.advance_secs(10);
+            tick(&mut e, &healthy, t);
+        }
+        assert!(e.verifying_since.contains_key(&old));
+        assert!(e.verification_samples.contains_key(&old));
+
+        // Edited at 06:49:00 to an entry that fails.
+        let after = refused_under("target-config:bbbb");
+        for t in [50, 60, 70] {
+            clock.advance_secs(10);
+            tick(&mut e, &after, t);
+        }
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(new.verification, None, "the step was done on the old entry");
+        assert!(!e.verifying_since.contains_key(&new.id));
+        assert!(!e.verification_samples.contains_key(&new.id));
+        // The old entry is not measured any more, so its hold stops.
+        assert!(!e.verifying_since.contains_key(&old));
+        assert!(!e.verification_samples.contains_key(&old));
+
+        // The new entry recovers: its hold starts on its own first sample.
+        let mut recovered = after.clone();
+        recovered.targets[0] = target_obs("target-config:bbbb", false);
+        clock.advance_secs(10);
+        tick(&mut e, &recovered, 80);
+        assert_eq!(
+            e.verifying_since.get(&new.id).copied(),
+            parse_ts("2026-09-03 06:49:30")
+        );
+        assert_eq!(e.verification_samples.get(&new.id), Some(&(at(80), at(80))));
+
+        // Gone since 06:49:00, the old issue expires a minute later, and the
+        // step done on it was never measured.
+        for t in [90, 100, 110] {
+            clock.advance_secs(10);
+            tick(&mut e, &recovered, t);
+        }
+        let old = e.get(&old).unwrap();
+        assert_eq!(
+            old.state,
+            expired("target configuration changed", "2026-09-03 06:50:00")
+        );
+        assert_eq!(
+            old.verification.as_ref().and_then(|v| v.outcome),
+            Some(crate::diagnose::issue::VerifyOutcome::NotMeasured)
+        );
+        assert!(e.get(&new.id).unwrap().state.is_open(), "held 30 s of 120");
+    }
+
+    /// Put back to the revision it was found under within the recurrence
+    /// window, a target reopens its old issue. The revision is a digest of
+    /// every field of the entry, so the same revision probes the same
+    /// endpoint the same way: by merge()'s rule, the same problem coming back
+    /// after an expiry, like a resolver that left the config and returned
+    /// still slow. The revision in between is a different problem, and
+    /// expires in its turn.
+    #[test]
+    fn a_target_edited_back_within_the_window_reopens_its_old_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let first = refused_under("target-config:aaaa");
+        let second = refused_under("target-config:bbbb");
+        e.observe(&first, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+
+        // Edited at 06:48:13: the first issue expires at 06:49:13.
+        while clock.now() < parse_ts("2026-09-03 06:50:00").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&second, &b);
+        }
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:13")
+        );
+        let between = other_than(&e, &old)
+            .expect("the second revision's issue")
+            .id;
+
+        // Put back at 06:50:01, it confirms again and reopens the first.
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        let reopened = e.get(&old).unwrap();
+        assert_eq!(reopened.state, IssueState::Open);
+        assert_eq!(reopened.recurrence, 1);
+        assert_eq!(reopened.since, "2026-09-03 06:50:01");
+        assert_eq!(e.issues().len(), 2, "no third issue");
+        while clock.now() < parse_ts("2026-09-03 06:51:01").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        assert_eq!(
+            e.get(&between).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:51:01")
+        );
+        assert!(e.get(&old).unwrap().state.is_open());
     }
 
     #[test]

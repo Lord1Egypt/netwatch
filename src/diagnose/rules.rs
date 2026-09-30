@@ -657,6 +657,19 @@ fn depends_on(root: &Issue, child: &Issue) -> bool {
             return false;
         }
     }
+    // One target's name across an edit: the old entry's finding waits out
+    // its expiry about an endpoint no longer probed, and explains nothing
+    // the new entry finds.
+    if let (Subject::Target { .. }, Subject::Target { .. }, Some(a), Some(b)) = (
+        &root.subject,
+        &child.subject,
+        &root.scope.configuration,
+        &child.scope.configuration,
+    ) {
+        if a != b {
+            return false;
+        }
+    }
     match (&root.subject, &child.subject) {
         (Subject::Host, _) => true,
         (Subject::Iface { name }, Subject::Iface { name: other }) => name == other,
@@ -1169,6 +1182,27 @@ mod tests {
             issues[2].suppressed_by, None,
             "this target resolved through a different resolver"
         );
+    }
+
+    #[test]
+    fn a_targets_old_revision_does_not_explain_its_new_one() {
+        // Edited, a target's old finding stays tracked until it expires.
+        // It is about an entry that no longer exists, so it cannot hide
+        // what the entry that replaced it finds.
+        let target = || Subject::Target { name: "api".into() };
+        let mut old = issue("1", "target.connect_failed", target());
+        old.scope.configuration = Some("target-config:aaaa".into());
+        let mut edited = issue("2", "target.slow_stage", target());
+        edited.scope.configuration = Some("target-config:bbbb".into());
+        let mut same = issue("3", "target.http_error", target());
+        same.scope.configuration = Some("target-config:aaaa".into());
+        let unrevised = issue("4", "target.slow_stage", target());
+
+        let mut issues = vec![old, edited, same, unrevised];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by, None, "another revision");
+        assert_eq!(issues[2].suppressed_by.as_deref(), Some("1"));
+        assert_eq!(issues[3].suppressed_by.as_deref(), Some("1"), "no revision");
     }
 
     #[test]

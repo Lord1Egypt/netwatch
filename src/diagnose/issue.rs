@@ -1089,7 +1089,33 @@ pub struct Verification {
     pub decided_at: Option<String>,
 }
 
+/// The identity a finding is merged, confirmed, reopened and named under:
+/// `rule|subject`, and for a configured target `rule|name|revision`.
+///
+/// A target's revision digests every field of its `[[diagnose_targets]]`
+/// entry, so an edited entry probes a different endpoint, or the same one a
+/// different way. Keyed by name alone, its detections merged into the old
+/// entry's issue, which then never expired and lent the edited target its
+/// mute, applied steps and close condition. A target finding with no
+/// revision, as in recordings made before targets had one, keeps
+/// `rule|name`. Live probes always carry one.
+pub fn finding_key(rule: &str, subject: &Subject, configuration: Option<&str>) -> String {
+    match (subject, configuration) {
+        (Subject::Target { name }, Some(revision)) => format!("{rule}|{name}|{revision}"),
+        _ => format!("{rule}|{}", subject.label()),
+    }
+}
+
 impl Issue {
+    /// See [`finding_key`].
+    pub fn key(&self) -> String {
+        finding_key(
+            &self.rule,
+            &self.subject,
+            self.scope.configuration.as_deref(),
+        )
+    }
+
     /// Issue or Observation, from the severity the detector settled on. A
     /// detector that demotes a finding to Info at runtime makes it an
     /// Observation with no further code.

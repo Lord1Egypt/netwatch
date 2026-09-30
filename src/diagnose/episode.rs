@@ -213,7 +213,8 @@ pub struct RecordedReading {
 /// An open, primary issue as the engine left it after a tick.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OpenIssue {
-    /// `rule|subject`, the engine's own identity for a condition.
+    /// `rule|subject`, the engine's own identity for a condition; see
+    /// [`super::issue::finding_key`].
     pub key: String,
     pub top_cause: Option<String>,
 }
@@ -272,7 +273,8 @@ pub enum LabelSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Label {
-    /// Issue key (`rule|subject`) the label is about.
+    /// Issue key (`rule|subject`, see [`super::issue::finding_key`]) the
+    /// label is about.
     pub issue: String,
     /// `rule/cause_id`, or `not_network`, `unknown`.
     pub cause: String,
@@ -637,7 +639,7 @@ fn final_snapshots(active: &mut Active, engine: &Engine, ts: &str) {
 }
 
 pub fn issue_key(issue: &Issue) -> String {
-    format!("{}|{}", issue.rule, issue.subject.label())
+    issue.key()
 }
 
 fn open_issue(issue: &Issue) -> OpenIssue {

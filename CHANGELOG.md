@@ -165,6 +165,18 @@ closes, apart from `iface.errors` on Wi-Fi.
 - Recordings and `baselines.json` read their numbers back exactly. A replay
   used to start from a baseline up to one bit off the one the live engine
   judged against.
+- Editing a `[[diagnose_targets]]` entry while the target kept failing the
+  same way left the old issue open for good. The new result merged into it
+  and replaced the revision it was found under, so it never expired. It also
+  kept its mute, its applied steps and its close condition, now pointing at
+  an endpoint nobody had diagnosed. A target's issue now belongs to the
+  revision it was found under. The old issue expires 60 s after the edit.
+  The edited entry opens its own issue once its own probes confirm the
+  fault, unmuted and with no history. Changing the entry back within 30
+  minutes reopens the old issue with its count. Recordings now name a
+  target's issue by rule, name and revision. `diagnose replay` of a
+  recording made before this change therefore shows its target issues as
+  divergent, and skips actions taken on them.
 
 ### Known gaps
 - `iface.errors` can open on a Wi-Fi driver's background drops, 70 a minute

@@ -592,9 +592,15 @@ impl Detection {
         }
     }
 
-    /// Stable identity for merging across ticks: one issue per (rule, subject).
+    /// Stable identity for merging across ticks: one issue per (rule,
+    /// subject), and per revision for a configured target. See
+    /// [`super::issue::finding_key`].
     pub fn key(&self) -> String {
-        format!("{}|{}", self.rule, self.subject.label())
+        super::issue::finding_key(
+            self.rule,
+            &self.subject,
+            self.scope.configuration.as_deref(),
+        )
     }
 }
 
