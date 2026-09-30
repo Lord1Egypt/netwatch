@@ -15,3 +15,21 @@ id = "fixture-scenario"
 kind = "synthetic"
 rules = ["path.changed", "dns.slow_resolver", "tcp.bufferbloat_remote"]
 note = "The demo incident: a reroute adding 40 ms, a resolver at 33x its baseline and a bufferbloated LAN socket. Nothing closes."
+
+[[episode]]
+id = "retrans-socket-closes"
+kind = "synthetic"
+rules = ["tcp.retrans_burst"]
+note = "An scp upload retransmits 18 segments a minute at 38 ms from 120 s and ends at 300 s. A healthy browser socket stays listed, so the issue expires a minute after the upload's socket closes."
+
+[[episode]]
+id = "bufferbloat-remote-socket-closes"
+kind = "synthetic"
+rules = ["tcp.bufferbloat_remote"]
+note = "The demo's LAN socket goes from 1.1 ms to 184 ms at 120 s and closes at 300 s beside a healthy browser socket. It expires a minute after the close."
+
+[[episode]]
+id = "zero-window-socket-closes"
+kind = "synthetic"
+rules = ["tcp.zero_window"]
+note = "An rsync to a NAS sees a zero window from 120 s and gives up at 300 s. It was the host's only socket, so the sampler then lists none (no subjects), and the observation expires a minute later."

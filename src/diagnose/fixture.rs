@@ -29,8 +29,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
+use super::coverage::Availability;
 use super::detectors::{
-    DnsObs, GatewayObs, HopObs, IfaceObs, Observations, PathObs, SocketObs, Thresholds,
+    DnsObs, GatewayObs, HopObs, IfaceObs, Observations, ObservedConfig, PathObs, SocketObs,
+    Thresholds,
 };
 use super::engine::{format_ts, Clock, Engine, FixedClock, ObservationTimes, Settings};
 use super::episode::{EnvProfile, Episode, Recorder, Tick};
@@ -440,9 +442,198 @@ fn incident_frame(t: u64) -> Observations {
     obs
 }
 
+/// The demo network's baselines as the live sampler learns them. It learns
+/// a path baseline from the internet probe only, never one per trace target
+/// as [`baselines`] seeds for 1.1.1.1, so here a trace is judged against
+/// `internet`.
+fn live_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(baselines().fingerprint().clone());
+    b.seed(RESOLVER, "dns.rtt_p50", 1.2, 0.4, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 0.9, 0.2, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// The demo network before anything goes wrong, with the configuration a
+/// live frame records: its resolver and interfaces, a trace to 1.1.1.1
+/// every 30 s, and no targets. Without a configuration nothing can expire.
+fn quiet_frame() -> Observations {
+    Observations {
+        config: Some(ObservedConfig {
+            resolvers: Some(vec![RESOLVER.into()]),
+            targets: vec![],
+            trace_target: "1.1.1.1".into(),
+            trace_refresh_secs: Some(30),
+            interfaces: Some(vec!["lo".into(), IFACE.into()]),
+        }),
+        ..observations_at(0)
+    }
+}
+
+/// Healthy until 120 s, faulty until the socket closes at 300 s, then gone.
+/// A socket verdict holds 30 s and three samples before it opens, so each
+/// socket episode opens at 152 s, and expires 60 s after the close.
+const SOCKET_STORY: [(u64, Phase); 3] = [
+    (0, Phase::Healthy),
+    (120, Phase::Fault),
+    (300, Phase::Clear),
+];
+
+/// A browser connection that stays healthy throughout. With it listed the
+/// socket rules stay available after the faulty socket closes, which is
+/// what lets the closed socket count as gone.
+fn neighbour_socket(t: u64) -> SocketObs {
+    SocketObs {
+        local: "10.88.0.2:41822".into(),
+        remote: "93.184.215.14:443".into(),
+        process: Some("firefox".into()),
+        rtt_ms: Some(24.0),
+        rttvar_ms: Some(3.0),
+        retrans: Some(0),
+        cwnd: Some(10),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(131_072),
+        mss: Some(1448),
+        tx_bps: 1.2e4,
+        rx_bps: 8.6e5,
+        verdict_age_secs: t,
+    }
+}
+
+/// An upload over a lossy path: 18 retransmits a minute at 38 ms, under
+/// the queueing line, so the path is losing segments rather than queueing
+/// them. The upload ends at 300 s.
+fn retrans_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.sockets.push(neighbour_socket(t));
+    let scp = SocketObs {
+        local: "10.88.0.2:48210".into(),
+        remote: "203.0.113.20:22".into(),
+        process: Some("scp".into()),
+        rtt_ms: Some(31.0),
+        rttvar_ms: Some(4.0),
+        retrans: Some(0),
+        cwnd: Some(42),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(1_048_576),
+        mss: Some(1448),
+        tx_bps: 3.8e6,
+        rx_bps: 4.2e4,
+        verdict_age_secs: t,
+    };
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(scp),
+        Phase::Fault => obs.sockets.push(SocketObs {
+            rtt_ms: Some(38.0),
+            retrans: Some(18),
+            cwnd: Some(12),
+            ssthresh: Some(21),
+            tx_bps: 6.1e5,
+            verdict_age_secs: t - 120,
+            ..scp
+        }),
+        Phase::Clear => {}
+    }
+    obs
+}
+
+/// The demo's bufferbloated LAN socket, fast until 120 s. The loaded-rtt
+/// test in the quiet frame places the queue on the receiver.
+fn bufferbloat_remote_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.sockets.push(neighbour_socket(t));
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(SocketObs {
+            rtt_ms: Some(1.1),
+            rttvar_ms: Some(0.3),
+            retrans: Some(0),
+            ..bloated_socket(t)
+        }),
+        Phase::Fault => obs.sockets.push(bloated_socket(t - 120)),
+        Phase::Clear => {}
+    }
+    obs
+}
+
+/// A backup to a NAS whose daemon stops reading at 120 s; rsync gives up
+/// at 300 s. It is the host's only socket, so once it closes the sampler
+/// lists none and says so, as it does live.
+fn zero_window_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    let rsync = SocketObs {
+        local: "10.88.0.2:40522".into(),
+        remote: "10.88.0.7:873".into(),
+        process: Some("rsync".into()),
+        rtt_ms: Some(0.8),
+        rttvar_ms: Some(0.2),
+        retrans: Some(0),
+        cwnd: Some(40),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(524_288),
+        mss: Some(1448),
+        tx_bps: 9.1e7,
+        rx_bps: 2.2e5,
+        verdict_age_secs: t,
+    };
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(rsync),
+        Phase::Fault => obs.sockets.push(SocketObs {
+            rwnd: Some(0),
+            tx_bps: 0.0,
+            rx_bps: 0.0,
+            verdict_age_secs: t - 120,
+            ..rsync
+        }),
+        Phase::Clear => {
+            for rule in [
+                "tcp.bufferbloat_remote",
+                "tcp.retrans_burst",
+                "tcp.zero_window",
+            ] {
+                obs.coverage_hints.insert(
+                    rule.into(),
+                    (
+                        Availability::NoSubjects,
+                        "successful TCP dump contained no established sockets in this \
+                         network namespace"
+                            .into(),
+                    ),
+                );
+            }
+        }
+    }
+    obs
+}
+
+impl Scenario {
+    /// An episode on the demo network as the app sees it: the live cadence,
+    /// the baselines live learns and the default thresholds.
+    fn live(id: &'static str, secs: u64, obs: fn(u64) -> Observations) -> Self {
+        Self {
+            id,
+            start: WINDOW_START,
+            secs,
+            baselines: live_baselines,
+            obs,
+            cadence: Cadence::live(),
+            thresholds: Thresholds::default(),
+        }
+    }
+}
+
 /// Every scenario the corpus can pin, by id.
 pub fn scenarios() -> Vec<Scenario> {
-    vec![Scenario::incident()]
+    vec![
+        Scenario::incident(),
+        // Each runs a minute past its expiry.
+        Scenario::live("retrans-socket-closes", 420, retrans_socket_closes),
+        Scenario::live(
+            "bufferbloat-remote-socket-closes",
+            420,
+            bufferbloat_remote_socket_closes,
+        ),
+        Scenario::live("zero-window-socket-closes", 420, zero_window_socket_closes),
+    ]
 }
 
 /// The profile every synthetic episode carries. Detected, it held this
@@ -806,6 +997,48 @@ mod tests {
             })
             .collect();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The decisions the corpus pins for `id`, which the replay test holds
+    /// the engine to.
+    fn pinned_spans(id: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        use crate::diagnose::episode::{CanonicalDecisions, CORPUS_DIR};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(CORPUS_DIR)
+            .join(format!("{id}.decisions.json"));
+        let text = std::fs::read_to_string(&path).expect("pinned decisions");
+        let decisions: CanonicalDecisions = serde_json::from_str(&text).unwrap();
+        decisions
+            .issues
+            .into_iter()
+            .map(|s| (s.opened, s.closed, s.close_reason))
+            .collect()
+    }
+
+    fn span(opened: &str, closed: &str, reason: &str) -> (String, Option<String>, Option<String>) {
+        (opened.into(), Some(closed.into()), Some(reason.into()))
+    }
+
+    /// B25 closes a socket issue when its socket goes: each opens once on
+    /// the fault, at 152 s, and ends Expired 60 s after the close at 300 s,
+    /// whether a healthy socket is still listed or none is.
+    #[test]
+    fn a_socket_issue_expires_a_minute_after_its_socket_closes() {
+        for id in [
+            "retrans-socket-closes",
+            "bufferbloat-remote-socket-closes",
+            "zero-window-socket-closes",
+        ] {
+            assert_eq!(
+                pinned_spans(id),
+                vec![span(
+                    "2026-09-03 06:46:32",
+                    "2026-09-03 06:50:00",
+                    "expired"
+                )],
+                "{id}"
+            );
+        }
     }
 
     /// What a new corpus scenario costs: a frame function and a `Scenario`.
