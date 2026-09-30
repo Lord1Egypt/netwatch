@@ -2705,6 +2705,36 @@ mod tests {
         assert_eq!(primary, vec![new.id]);
     }
 
+    /// Edited before its issue opens, a target starts counting again. Two
+    /// samples of the old entry and one of the new are not three of either,
+    /// and the issue the new entry opens starts at its own first sample.
+    #[test]
+    fn an_edited_target_confirms_on_its_own_samples() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        clock.advance_secs(1);
+        e.observe(&before, &b);
+
+        // Edited at 06:48:12.
+        let after = refused_under("target-config:bbbb");
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        assert!(e.issues().is_empty(), "{:#?}", e.issues());
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        let issue = find(&e, "target.connect_failed");
+        assert_eq!(e.issues().len(), 1);
+        assert_eq!(issue.since, "2026-09-03 06:48:12");
+        assert_eq!(
+            issue.scope.configuration.as_deref(),
+            Some("target-config:bbbb")
+        );
+    }
+
     #[test]
     fn a_muted_target_edited_while_failing_expires_and_leaves_its_mute_behind() {
         let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
