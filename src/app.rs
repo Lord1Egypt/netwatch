@@ -4487,6 +4487,46 @@ mod key_conflict_tests {
 }
 
 #[cfg(test)]
+mod settings_key_tests {
+    use super::*;
+    use crate::ui::settings::fixture;
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(
+            app,
+            crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+        );
+    }
+
+    /// Down the open settings overlay, Enter on each row loads that row's own
+    /// value, and Enter again with nothing typed leaves the config as it was.
+    /// Enter on GeoIP DB Path used to load the ASN path, and accepting it
+    /// saved that path as `geoip_db`.
+    #[test]
+    fn enter_twice_on_every_row_leaves_the_config_alone() {
+        let mut app = App::prepare_with_config(fixture::config());
+        let before = format!("{:?}", app.user_config);
+        app.ui.show_settings = true;
+        assert_eq!(fixture::EDIT_VALUES.len(), ui::settings::SETTINGS_COUNT);
+        for &(at, want) in fixture::EDIT_VALUES {
+            assert_eq!(app.ui.settings_cursor, at);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.ui.settings_editing);
+            assert_eq!(app.ui.settings_edit_buf, want, "row {at}");
+            press(&mut app, KeyCode::Enter);
+            assert!(!app.ui.settings_editing);
+            assert_eq!(
+                app.ui.settings_status.as_deref(),
+                Some("✓ Applied"),
+                "row {at}"
+            );
+            assert_eq!(format!("{:?}", app.user_config), before, "row {at}");
+            press(&mut app, KeyCode::Down);
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn sort_connections(conns: &mut [Connection], column: usize) {
     crate::ui::connections::sort(conns, column, true);
 }

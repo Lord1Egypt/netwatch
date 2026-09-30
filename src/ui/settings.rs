@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Clear, Paragraph},
 };
 
-pub const SETTINGS_COUNT: usize = 20;
+pub const SETTINGS_COUNT: usize = ROWS.len();
 
 pub const TAB_NAMES: &[&str] = &[
     "dashboard",
@@ -21,6 +21,8 @@ pub const TAB_NAMES: &[&str] = &[
 
 /// Named cursor positions for each settings row.
 /// Use these instead of magic integers when navigating or jumping to a setting.
+/// Each one is a row's index in [`ROWS`], and the build fails if one names
+/// the wrong row.
 pub mod cursor {
     pub const THEME: usize = 0;
     pub const VIEW: usize = 1;
@@ -44,138 +46,337 @@ pub mod cursor {
     pub const GROUPS_COLLAPSED: usize = 19;
 }
 
-struct SettingRow {
+/// One row of the settings overlay.
+struct Setting {
+    /// The `cursor::*` constant that names this row. It must equal the row's
+    /// index in [`ROWS`]; the check after the table fails the build if not.
+    at: usize,
     label: &'static str,
-    value: String,
+    /// The raw value: what Enter puts in the edit box, and what `apply`
+    /// takes back unchanged.
+    raw: fn(&NetwatchConfig) -> String,
+    /// What the row shows, where that differs from `raw`.
+    show: Option<fn(&NetwatchConfig) -> String>,
+    apply: fn(&mut NetwatchConfig, &str) -> Result<(), String>,
+    /// Cycles through a small enum on `←` / `→` rather than being edited as
+    /// free text. Rendered with `◀ value ▶` chevrons, and the footer hint
+    /// reads "Cycle" instead of "Edit".
+    cycles: bool,
+}
+
+impl Setting {
+    fn shown(&self, cfg: &NetwatchConfig) -> String {
+        self.show.unwrap_or(self.raw)(cfg)
+    }
+}
+
+/// Every settings row, in the order the overlay draws them.
+///
+/// This is the only place the order is written down. The overlay draws these
+/// rows, and Enter loads and applies an edit through them, all by the same
+/// index. `get_edit_value` used to keep its own numbering, which the View row
+/// shifted by one: Enter on GeoIP DB Path loaded the ASN path, and accepting
+/// it saved that path as `geoip_db`.
+const ROWS: &[Setting] = &[
+    Setting {
+        at: cursor::THEME,
+        label: "Theme",
+        raw: |c| c.theme.clone(),
+        show: None,
+        apply: |c, v| {
+            let valid = crate::theme::THEME_NAMES;
+            let v = v.to_lowercase();
+            if !valid.contains(&v.as_str()) {
+                return Err(format!("Invalid theme. Use: {}", valid.join(", ")));
+            }
+            c.theme = v;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::VIEW,
+        label: "View",
+        raw: |c| c.view.clone(),
+        show: None,
+        apply: |c, v| {
+            let valid = crate::app::VIEW_MODE_NAMES;
+            let v = v.to_lowercase();
+            if !valid.contains(&v.as_str()) {
+                return Err(format!("Invalid view. Use: {}", valid.join(", ")));
+            }
+            c.view = v;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::DEFAULT_TAB,
+        label: "Default Tab",
+        raw: |c| c.default_tab.clone(),
+        show: None,
+        apply: |c, v| {
+            let v = v.to_lowercase();
+            if !TAB_NAMES.contains(&v.as_str()) {
+                return Err(format!("Invalid tab. Use: {}", TAB_NAMES.join(", ")));
+            }
+            c.default_tab = v;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::REFRESH_RATE,
+        label: "Refresh Rate (ms)",
+        raw: |c| c.refresh_rate_ms.to_string(),
+        show: None,
+        apply: |c, v| {
+            let ms: u64 = v.parse().map_err(|_| "Must be a number")?;
+            if !(100..=5000).contains(&ms) {
+                return Err("Must be 100–5000".into());
+            }
+            c.refresh_rate_ms = ms;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::CAPTURE_INTERFACE,
+        label: "Capture Interface",
+        raw: |c| c.capture_interface.clone(),
+        show: Some(|c| or_placeholder(&c.capture_interface, "(auto)")),
+        apply: |c, v| {
+            c.capture_interface = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::SHOW_GEO,
+        label: "Show GeoIP",
+        raw: |c| on_off(c.show_geo),
+        show: None,
+        apply: |c, v| {
+            c.show_geo = parse_on_off(v).ok_or("Use on/off")?;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::TIMELINE_WINDOW,
+        label: "Timeline Window",
+        raw: |c| c.timeline_window.clone(),
+        show: None,
+        apply: |c, v| {
+            let valid = ["1m", "5m", "15m", "30m", "1h"];
+            if !valid.contains(&v) {
+                return Err(format!("Use: {}", valid.join(", ")));
+            }
+            c.timeline_window = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::PACKET_FOLLOW,
+        label: "Packet Follow",
+        raw: |c| on_off(c.packet_follow),
+        show: None,
+        apply: |c, v| {
+            c.packet_follow = parse_on_off(v).ok_or("Use on/off")?;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::BPF_FILTER,
+        label: "BPF Filter",
+        raw: |c| c.bpf_filter.clone(),
+        show: Some(|c| or_placeholder(&c.bpf_filter, "(none)")),
+        apply: |c, v| {
+            c.bpf_filter = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::GEOIP_DB,
+        label: "GeoIP DB Path",
+        raw: |c| c.geoip_db.clone(),
+        // With `geoip_online` on, lookups go to ip-api.com, which has no
+        // HTTPS on its free tier, whenever no database answers: none is
+        // set, or the one set fails to open. Say so where geo is set, and
+        // before the path, so a long path cannot push it out of view.
+        show: Some(|c| match (c.geoip_db.is_empty(), c.geoip_online) {
+            (true, true) => "ip-api.com (cleartext)".into(),
+            (true, false) => "(none)".into(),
+            (false, true) => format!("ip-api.com (cleartext) if unreadable: {}", c.geoip_db),
+            (false, false) => c.geoip_db.clone(),
+        }),
+        apply: |c, v| {
+            c.geoip_db = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::GEOIP_ASN_DB,
+        label: "GeoIP ASN DB Path",
+        raw: |c| c.geoip_asn_db.clone(),
+        show: Some(|c| or_placeholder(&c.geoip_asn_db, "(none)")),
+        apply: |c, v| {
+            c.geoip_asn_db = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::BANDWIDTH_THRESHOLD,
+        label: "Bandwidth Threshold",
+        raw: |c| c.alerts.bandwidth_threshold.to_string(),
+        show: Some(|c| format_bandwidth(c.alerts.bandwidth_threshold)),
+        apply: |c, v| {
+            c.alerts.bandwidth_threshold = v.parse().map_err(|_| "Must be a number (bytes/sec)")?;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::PORT_SCAN_THRESHOLD,
+        label: "Port Scan Threshold",
+        raw: |c| c.alerts.port_scan_threshold.to_string(),
+        show: None,
+        apply: |c, v| {
+            c.alerts.port_scan_threshold = v.parse().map_err(|_| "Must be a number")?;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::AI_INSIGHTS,
+        label: "AI Insights",
+        raw: |c| on_off(c.insights_enabled),
+        show: None,
+        apply: |c, v| {
+            c.insights_enabled = parse_on_off(v).ok_or("Use on/off")?;
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::AI_MODEL,
+        label: "AI Model",
+        raw: |c| c.insights_model.clone(),
+        show: None,
+        apply: |c, v| {
+            if v.is_empty() {
+                return Err("Model name cannot be empty".into());
+            }
+            c.insights_model = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::AI_ENDPOINT,
+        label: "AI Endpoint",
+        raw: |c| c.insights_endpoint.clone(),
+        show: None,
+        apply: |c, v| {
+            c.insights_endpoint = v.to_string();
+            Ok(())
+        },
+        cycles: false,
+    },
+    Setting {
+        at: cursor::GRAPH_STYLE,
+        label: "Graph Style",
+        raw: |c| c.graph_style.clone(),
+        show: None,
+        apply: |c, v| {
+            let valid = crate::graph::GRAPH_STYLE_NAMES;
+            let v = v.to_lowercase();
+            if !valid.contains(&v.as_str()) {
+                return Err(format!("Invalid graph style. Use: {}", valid.join(", ")));
+            }
+            c.graph_style = v;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::GRAPH_FADE,
+        label: "Graph Fade (btop)",
+        raw: |c| on_off(c.graph_fade),
+        show: None,
+        apply: |c, v| {
+            c.graph_fade = parse_on_off(v).ok_or("Use on / off")?;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::SANDBOX,
+        label: "Sandbox",
+        raw: |c| c.sandbox.clone(),
+        show: None,
+        apply: |c, v| {
+            let v = v.trim().to_ascii_lowercase();
+            if !matches!(v.as_str(), "on" | "strict" | "off") {
+                return Err("Use on / strict / off".into());
+            }
+            c.sandbox = v;
+            Ok(())
+        },
+        cycles: true,
+    },
+    Setting {
+        at: cursor::GROUPS_COLLAPSED,
+        label: "Groups Start Folded",
+        raw: |c| on_off(c.groups_start_collapsed),
+        show: None,
+        apply: |c, v| {
+            c.groups_start_collapsed = parse_on_off(v).ok_or("Use on / off")?;
+            Ok(())
+        },
+        cycles: true,
+    },
+];
+
+// The key handler names rows by `cursor::*` while the overlay draws them by
+// position, so a constant that disagrees with its row fails the build.
+const _: () = {
+    let mut i = 0;
+    while i < ROWS.len() {
+        assert!(ROWS[i].at == i, "a cursor:: constant names the wrong row");
+        i += 1;
+    }
+};
+
+fn on_off(on: bool) -> String {
+    if on { "on" } else { "off" }.into()
+}
+
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value.to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn or_placeholder(value: &str, placeholder: &str) -> String {
+    if value.is_empty() {
+        placeholder.into()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Rows whose value cycles through a small enum on `←` / `→` rather than
-/// being edited as free text. Rendered with `◀ value ▶` chevrons and the
-/// footer hint reads "Cycle" instead of "Edit".
+/// being edited as free text.
 fn is_cycle_through(cursor: usize) -> bool {
-    matches!(
-        cursor,
-        cursor::THEME
-            | cursor::VIEW
-            | cursor::DEFAULT_TAB
-            | cursor::GRAPH_STYLE
-            | cursor::GRAPH_FADE
-            | cursor::SANDBOX
-            | cursor::GROUPS_COLLAPSED
-    )
-}
-
-fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
-    vec![
-        SettingRow {
-            label: "Theme",
-            value: cfg.theme.clone(),
-        },
-        SettingRow {
-            label: "View",
-            value: cfg.view.clone(),
-        },
-        SettingRow {
-            label: "Default Tab",
-            value: cfg.default_tab.clone(),
-        },
-        SettingRow {
-            label: "Refresh Rate (ms)",
-            value: cfg.refresh_rate_ms.to_string(),
-        },
-        SettingRow {
-            label: "Capture Interface",
-            value: if cfg.capture_interface.is_empty() {
-                "(auto)".into()
-            } else {
-                cfg.capture_interface.clone()
-            },
-        },
-        SettingRow {
-            label: "Show GeoIP",
-            value: if cfg.show_geo { "on" } else { "off" }.into(),
-        },
-        SettingRow {
-            label: "Timeline Window",
-            value: cfg.timeline_window.clone(),
-        },
-        SettingRow {
-            label: "Packet Follow",
-            value: if cfg.packet_follow { "on" } else { "off" }.into(),
-        },
-        SettingRow {
-            label: "BPF Filter",
-            value: if cfg.bpf_filter.is_empty() {
-                "(none)".into()
-            } else {
-                cfg.bpf_filter.clone()
-            },
-        },
-        SettingRow {
-            label: "GeoIP DB Path",
-            // With `geoip_online` on, lookups go to ip-api.com, which has no
-            // HTTPS on its free tier, whenever no database answers: none is
-            // set, or the one set fails to open. Say so where geo is set, and
-            // before the path, so a long path cannot push it out of view.
-            value: match (cfg.geoip_db.is_empty(), cfg.geoip_online) {
-                (true, true) => "ip-api.com (cleartext)".into(),
-                (true, false) => "(none)".into(),
-                (false, true) => {
-                    format!("ip-api.com (cleartext) if unreadable: {}", cfg.geoip_db)
-                }
-                (false, false) => cfg.geoip_db.clone(),
-            },
-        },
-        SettingRow {
-            label: "GeoIP ASN DB Path",
-            value: if cfg.geoip_asn_db.is_empty() {
-                "(none)".into()
-            } else {
-                cfg.geoip_asn_db.clone()
-            },
-        },
-        SettingRow {
-            label: "Bandwidth Threshold",
-            value: format_bandwidth(cfg.alerts.bandwidth_threshold),
-        },
-        SettingRow {
-            label: "Port Scan Threshold",
-            value: cfg.alerts.port_scan_threshold.to_string(),
-        },
-        SettingRow {
-            label: "AI Insights",
-            value: if cfg.insights_enabled { "on" } else { "off" }.into(),
-        },
-        SettingRow {
-            label: "AI Model",
-            value: cfg.insights_model.clone(),
-        },
-        SettingRow {
-            label: "AI Endpoint",
-            value: cfg.insights_endpoint.clone(),
-        },
-        SettingRow {
-            label: "Graph Style",
-            value: cfg.graph_style.clone(),
-        },
-        SettingRow {
-            label: "Graph Fade (btop)",
-            value: if cfg.graph_fade { "on" } else { "off" }.into(),
-        },
-        SettingRow {
-            label: "Sandbox",
-            value: cfg.sandbox.clone(),
-        },
-        SettingRow {
-            label: "Groups Start Folded",
-            value: if cfg.groups_start_collapsed {
-                "on"
-            } else {
-                "off"
-            }
-            .into(),
-        },
-    ]
+    ROWS.get(cursor).is_some_and(|row| row.cycles)
 }
 
 fn format_bandwidth(bytes: u64) -> String {
@@ -218,12 +419,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let rows = build_rows(&app.user_config);
+    let cfg = &app.user_config;
     let label_width = 22;
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in ROWS.iter().enumerate() {
         let is_selected = i == app.ui.settings_cursor;
         let is_editing = is_selected && app.ui.settings_editing;
 
@@ -236,10 +437,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
         let value_display = if is_editing {
             format!("{}▏", app.ui.settings_edit_buf)
-        } else if is_selected && is_cycle_through(i) {
-            format!("◀ {} ▶", row.value)
+        } else if is_selected && row.cycles {
+            format!("◀ {} ▶", row.shown(cfg))
         } else {
-            row.value.clone()
+            row.shown(cfg)
         };
 
         let value_style = if is_editing {
@@ -372,192 +573,84 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 /// Returns the raw config value for the setting at `cursor` position,
 /// suitable for pre-filling the edit buffer.
 pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
-    match cursor {
-        0 => cfg.theme.clone(),
-        1 => cfg.default_tab.clone(),
-        2 => cfg.refresh_rate_ms.to_string(),
-        3 => cfg.capture_interface.clone(),
-        4 => if cfg.show_geo { "on" } else { "off" }.into(),
-        5 => cfg.timeline_window.clone(),
-        6 => if cfg.packet_follow { "on" } else { "off" }.into(),
-        7 => cfg.bpf_filter.clone(),
-        8 => cfg.geoip_db.clone(),
-        9 => cfg.geoip_asn_db.clone(),
-        10 => cfg.alerts.bandwidth_threshold.to_string(),
-        11 => cfg.alerts.port_scan_threshold.to_string(),
-        12 => if cfg.insights_enabled { "on" } else { "off" }.into(),
-        13 => cfg.insights_model.clone(),
-        14 => cfg.insights_endpoint.clone(),
-        15 => cfg.graph_style.clone(),
-        16 => if cfg.graph_fade { "on" } else { "off" }.into(),
-        17 => cfg.sandbox.clone(),
-        18 => if cfg.groups_start_collapsed {
-            "on"
-        } else {
-            "off"
-        }
-        .into(),
-        _ => String::new(),
-    }
+    ROWS.get(cursor)
+        .map(|row| (row.raw)(cfg))
+        .unwrap_or_default()
 }
 
-/// Apply the edited value back to the config. Returns an error message if invalid.
-/// Apply an edited value to the setting at `cursor`.
-///
-/// The arms match on `cursor::*` constants, never on bare integers: this
-/// function is keyed by row position, so a literal here silently re-points
-/// every editor below it the moment a row is inserted.
+/// Apply an edited value to the setting at `cursor`. Returns an error
+/// message if the value is invalid.
 pub fn apply_edit(cfg: &mut NetwatchConfig, cursor: usize, value: &str) -> Result<(), String> {
-    match cursor {
-        cursor::THEME => {
-            let valid = crate::theme::THEME_NAMES;
-            let v = value.to_lowercase();
-            if valid.contains(&v.as_str()) {
-                cfg.theme = v;
-                Ok(())
-            } else {
-                Err(format!("Invalid theme. Use: {}", valid.join(", ")))
-            }
+    let row = ROWS.get(cursor).ok_or("Unknown setting")?;
+    (row.apply)(cfg, value)
+}
+
+/// A config for testing that Enter reaches the right field, shared with the
+/// key-handler test in `app.rs`.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::cursor;
+    use crate::config::{AlertConfig, NetwatchConfig};
+
+    /// A config in which no settings row holds the value of the row either
+    /// side of it, so a row that reads or writes its neighbour's field shows.
+    /// Every row but AI Insights is off its default. That one stays off,
+    /// because turning it on through the key handler starts the insights
+    /// worker.
+    pub(crate) fn config() -> NetwatchConfig {
+        NetwatchConfig {
+            theme: "nord".into(),
+            view: "dense".into(),
+            default_tab: "packets".into(),
+            refresh_rate_ms: 250,
+            capture_interface: "wlan7".into(),
+            show_geo: false,
+            timeline_window: "15m".into(),
+            packet_follow: false,
+            bpf_filter: "udp port 53".into(),
+            geoip_db: "/geo/city.mmdb".into(),
+            geoip_asn_db: "/geo/asn.mmdb".into(),
+            alerts: AlertConfig {
+                bandwidth_threshold: 42_000_000,
+                port_scan_threshold: 37,
+                ..Default::default()
+            },
+            insights_enabled: false,
+            insights_model: "qwen-test".into(),
+            insights_endpoint: "http://127.0.0.1:1".into(),
+            graph_style: "bars".into(),
+            graph_fade: false,
+            sandbox: "strict".into(),
+            groups_start_collapsed: false,
+            ..Default::default()
         }
-        cursor::VIEW => {
-            let v = value.to_lowercase();
-            if crate::app::VIEW_MODE_NAMES.contains(&v.as_str()) {
-                cfg.view = v;
-                Ok(())
-            } else {
-                Err(format!(
-                    "Invalid view. Use: {}",
-                    crate::app::VIEW_MODE_NAMES.join(", ")
-                ))
-            }
-        }
-        cursor::DEFAULT_TAB => {
-            let v = value.to_lowercase();
-            if TAB_NAMES.contains(&v.as_str()) {
-                cfg.default_tab = v;
-                Ok(())
-            } else {
-                Err(format!("Invalid tab. Use: {}", TAB_NAMES.join(", ")))
-            }
-        }
-        cursor::REFRESH_RATE => {
-            let ms: u64 = value.parse().map_err(|_| "Must be a number".to_string())?;
-            if !(100..=5000).contains(&ms) {
-                return Err("Must be 100–5000".into());
-            }
-            cfg.refresh_rate_ms = ms;
-            Ok(())
-        }
-        cursor::CAPTURE_INTERFACE => {
-            cfg.capture_interface = value.to_string();
-            Ok(())
-        }
-        cursor::SHOW_GEO => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => cfg.show_geo = true,
-                "off" | "false" | "no" | "0" => cfg.show_geo = false,
-                _ => return Err("Use on/off".into()),
-            }
-            Ok(())
-        }
-        cursor::TIMELINE_WINDOW => {
-            let valid = ["1m", "5m", "15m", "30m", "1h"];
-            if valid.contains(&value) {
-                cfg.timeline_window = value.to_string();
-                Ok(())
-            } else {
-                Err(format!("Use: {}", valid.join(", ")))
-            }
-        }
-        cursor::PACKET_FOLLOW => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => cfg.packet_follow = true,
-                "off" | "false" | "no" | "0" => cfg.packet_follow = false,
-                _ => return Err("Use on/off".into()),
-            }
-            Ok(())
-        }
-        cursor::BPF_FILTER => {
-            cfg.bpf_filter = value.to_string();
-            Ok(())
-        }
-        cursor::GEOIP_DB => {
-            cfg.geoip_db = value.to_string();
-            Ok(())
-        }
-        cursor::GEOIP_ASN_DB => {
-            cfg.geoip_asn_db = value.to_string();
-            Ok(())
-        }
-        cursor::BANDWIDTH_THRESHOLD => {
-            let v: u64 = value
-                .parse()
-                .map_err(|_| "Must be a number (bytes/sec)".to_string())?;
-            cfg.alerts.bandwidth_threshold = v;
-            Ok(())
-        }
-        cursor::PORT_SCAN_THRESHOLD => {
-            let v: usize = value.parse().map_err(|_| "Must be a number".to_string())?;
-            cfg.alerts.port_scan_threshold = v;
-            Ok(())
-        }
-        cursor::AI_INSIGHTS => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => cfg.insights_enabled = true,
-                "off" | "false" | "no" | "0" => cfg.insights_enabled = false,
-                _ => return Err("Use on/off".into()),
-            }
-            Ok(())
-        }
-        cursor::AI_MODEL => {
-            if value.is_empty() {
-                return Err("Model name cannot be empty".into());
-            }
-            cfg.insights_model = value.to_string();
-            Ok(())
-        }
-        cursor::AI_ENDPOINT => {
-            cfg.insights_endpoint = value.to_string();
-            Ok(())
-        }
-        cursor::GRAPH_STYLE => {
-            let valid = crate::graph::GRAPH_STYLE_NAMES;
-            let v = value.to_lowercase();
-            if valid.contains(&v.as_str()) {
-                cfg.graph_style = v;
-                Ok(())
-            } else {
-                Err(format!("Invalid graph style. Use: {}", valid.join(", ")))
-            }
-        }
-        cursor::GRAPH_FADE => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => cfg.graph_fade = true,
-                "off" | "false" | "no" | "0" => cfg.graph_fade = false,
-                _ => return Err("Use on / off".into()),
-            }
-            Ok(())
-        }
-        cursor::SANDBOX => {
-            let v = value.trim().to_ascii_lowercase();
-            match v.as_str() {
-                "on" | "strict" | "off" => {
-                    cfg.sandbox = v;
-                    Ok(())
-                }
-                _ => Err("Use on / strict / off".into()),
-            }
-        }
-        cursor::GROUPS_COLLAPSED => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => cfg.groups_start_collapsed = true,
-                "off" | "false" | "no" | "0" => cfg.groups_start_collapsed = false,
-                _ => return Err("Use on / off".into()),
-            }
-            Ok(())
-        }
-        _ => Err("Unknown setting".into()),
     }
+
+    /// What Enter must load on each row of [`config`], in row order. Written
+    /// out by hand rather than read from `ROWS`, so a wrong table cannot
+    /// agree with itself.
+    pub(crate) const EDIT_VALUES: &[(usize, &str)] = &[
+        (cursor::THEME, "nord"),
+        (cursor::VIEW, "dense"),
+        (cursor::DEFAULT_TAB, "packets"),
+        (cursor::REFRESH_RATE, "250"),
+        (cursor::CAPTURE_INTERFACE, "wlan7"),
+        (cursor::SHOW_GEO, "off"),
+        (cursor::TIMELINE_WINDOW, "15m"),
+        (cursor::PACKET_FOLLOW, "off"),
+        (cursor::BPF_FILTER, "udp port 53"),
+        (cursor::GEOIP_DB, "/geo/city.mmdb"),
+        (cursor::GEOIP_ASN_DB, "/geo/asn.mmdb"),
+        (cursor::BANDWIDTH_THRESHOLD, "42000000"),
+        (cursor::PORT_SCAN_THRESHOLD, "37"),
+        (cursor::AI_INSIGHTS, "off"),
+        (cursor::AI_MODEL, "qwen-test"),
+        (cursor::AI_ENDPOINT, "http://127.0.0.1:1"),
+        (cursor::GRAPH_STYLE, "bars"),
+        (cursor::GRAPH_FADE, "off"),
+        (cursor::SANDBOX, "strict"),
+        (cursor::GROUPS_COLLAPSED, "off"),
+    ];
 }
 
 #[cfg(test)]
@@ -565,40 +658,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_rows_count() {
-        let cfg = NetwatchConfig::default();
-        let rows = build_rows(&cfg);
-        assert_eq!(rows.len(), SETTINGS_COUNT);
-    }
-
-    #[test]
     fn geoip_db_row_says_when_lookups_go_out_in_cleartext() {
+        let row = &ROWS[cursor::GEOIP_DB];
         let mut cfg = NetwatchConfig::default();
-        assert_eq!(build_rows(&cfg)[cursor::GEOIP_DB].value, "(none)");
+        assert_eq!(row.shown(&cfg), "(none)");
         cfg.geoip_online = true;
-        assert_eq!(
-            build_rows(&cfg)[cursor::GEOIP_DB].value,
-            "ip-api.com (cleartext)"
-        );
+        assert_eq!(row.shown(&cfg), "ip-api.com (cleartext)");
         // A database that fails to open sends every lookup to ip-api.com too,
         // so a set path is no reason to drop the label.
         cfg.geoip_db = "/usr/share/GeoIP/GeoLite2-City.mmdb".into();
         assert_eq!(
-            build_rows(&cfg)[cursor::GEOIP_DB].value,
+            row.shown(&cfg),
             "ip-api.com (cleartext) if unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb"
         );
         cfg.geoip_online = false;
-        assert_eq!(build_rows(&cfg)[cursor::GEOIP_DB].value, cfg.geoip_db);
+        assert_eq!(row.shown(&cfg), cfg.geoip_db);
     }
 
+    /// `get_edit_value` numbered rows without the View row, so Enter on
+    /// GeoIP DB Path loaded the ASN database path, and so on down the list.
     #[test]
-    fn get_edit_value_roundtrip() {
-        let cfg = NetwatchConfig::default();
-        assert_eq!(get_edit_value(&cfg, 0), "dark");
-        assert_eq!(get_edit_value(&cfg, 1), "dashboard");
-        assert_eq!(get_edit_value(&cfg, 2), "1000");
-        assert_eq!(get_edit_value(&cfg, 4), "on");
-        assert_eq!(get_edit_value(&cfg, 6), "on");
+    fn enter_loads_each_rows_own_value() {
+        let rows: Vec<usize> = fixture::EDIT_VALUES.iter().map(|&(at, _)| at).collect();
+        assert_eq!(rows, (0..SETTINGS_COUNT).collect::<Vec<_>>());
+        let cfg = fixture::config();
+        for &(at, want) in fixture::EDIT_VALUES {
+            assert_eq!(get_edit_value(&cfg, at), want, "{}", ROWS[at].label);
+        }
+    }
+
+    /// Accepting what Enter loaded, unchanged, must leave the config as it
+    /// was. With the old numbering, accepting GeoIP DB Path saved the ASN
+    /// path into `geoip_db`.
+    #[test]
+    fn accepting_the_loaded_value_changes_nothing() {
+        let on = NetwatchConfig {
+            insights_enabled: true,
+            ..fixture::config()
+        };
+        for cfg in [NetwatchConfig::default(), fixture::config(), on] {
+            for (at, row) in ROWS.iter().enumerate() {
+                let loaded = get_edit_value(&cfg, at);
+                let mut after = cfg.clone();
+                assert_eq!(
+                    apply_edit(&mut after, at, &loaded),
+                    Ok(()),
+                    "{} refused {loaded:?}",
+                    row.label
+                );
+                assert_eq!(format!("{after:?}"), format!("{cfg:?}"), "{}", row.label);
+            }
+        }
     }
 
     #[test]

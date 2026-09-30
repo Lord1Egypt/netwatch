@@ -2,6 +2,13 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Enter in Settings loads the row you are on again. Since 0.29 added the
+  View row, the edit box filled with the next row's value, so accepting GeoIP
+  DB Path unchanged saved the ASN database path as `geoip_db`.
+
 ## [0.33.0] - 2026-09-29
 
 Diagnose stops reading what it did not measure as evidence. A check that
