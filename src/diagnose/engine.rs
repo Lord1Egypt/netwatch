@@ -240,6 +240,19 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Local>> {
         .and_then(|n| Local.from_local_datetime(&n).single())
 }
 
+/// Whether a mute that ends at `until`, a stamp like [`parse_ts`] reads, is
+/// over at `now`. The stamp carries no offset, so in the hour a clock goes
+/// back it names two instants, and [`parse_ts`] returns neither. This takes
+/// the later: at worst the mute lasts an hour longer, where returning neither
+/// ended it on the next tick. A stamp that does not parse has ended: a mute
+/// that never ends would hide the issue for good.
+fn mute_over<Tz: TimeZone>(until: &str, now: &DateTime<Tz>) -> bool {
+    chrono::NaiveDateTime::parse_from_str(until, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|n| now.timezone().from_local_datetime(&n).latest())
+        .is_none_or(|u| u <= *now)
+}
+
 /// How long after closing a recurrence reopens the same issue instead of
 /// filing a new one. Flapping should read as one problem with a count.
 const RECURRENCE_WINDOW_MINS: i64 = 30;
@@ -652,14 +665,13 @@ impl Engine {
 
     /// Return every issue whose mute has run out to Open. Read from the clock,
     /// not a timer, so a replayed episode ends each mute on the frame the live
-    /// engine did. A mute whose end does not parse has ended: one that never
-    /// ends would hide the issue for good.
+    /// engine did.
     fn end_mutes(&mut self, now: DateTime<Local>) {
         for issue in &mut self.issues {
             let ended = issue
                 .state
                 .muted_until()
-                .is_some_and(|until| parse_ts(until).is_none_or(|u| u <= now));
+                .is_some_and(|until| mute_over(until, &now));
             if ended {
                 issue.state = IssueState::Open;
             }
@@ -3546,6 +3558,80 @@ mod tests {
         clock.advance_secs(60);
         e.observe(&Observations::default(), &b);
         assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+    }
+
+    /// A zone whose clocks go back at 01:00 UTC on 25 October 2026, as
+    /// London's do, so wall time 01:00 to 02:00 happens twice that night.
+    #[derive(Clone, Copy, Debug)]
+    struct ClocksGoBack;
+
+    impl ClocksGoBack {
+        const SUMMER: i32 = 3_600;
+        fn change() -> chrono::NaiveDateTime {
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+                .and_then(|d| d.and_hms_opt(1, 0, 0))
+                .unwrap()
+        }
+        fn offset(secs: i32) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(secs).unwrap()
+        }
+    }
+
+    impl TimeZone for ClocksGoBack {
+        type Offset = chrono::FixedOffset;
+        fn from_offset(_: &chrono::FixedOffset) -> Self {
+            ClocksGoBack
+        }
+        fn offset_from_local_date(
+            &self,
+            _: &chrono::NaiveDate,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            unreachable!("mute_over reads date-times")
+        }
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            let (summer, winter) = (Self::offset(Self::SUMMER), Self::offset(0));
+            if *local < Self::change() {
+                chrono::LocalResult::Single(summer)
+            } else if *local < Self::change() + Duration::hours(1) {
+                chrono::LocalResult::Ambiguous(summer, winter)
+            } else {
+                chrono::LocalResult::Single(winter)
+            }
+        }
+        fn offset_from_utc_date(&self, _: &chrono::NaiveDate) -> chrono::FixedOffset {
+            unreachable!("mute_over reads date-times")
+        }
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
+            Self::offset(if *utc < Self::change() {
+                Self::SUMMER
+            } else {
+                0
+            })
+        }
+    }
+
+    /// A mute set at 01:10 summer time ends at 01:10 winter time, a stamp
+    /// that names two instants. Read as neither, it ended on the next tick.
+    #[test]
+    fn a_mute_into_the_hour_the_clocks_go_back_lasts_its_hour() {
+        let muted_at = ClocksGoBack
+            .from_local_datetime(&ClocksGoBack::change())
+            .earliest()
+            .unwrap()
+            + Duration::minutes(10);
+        let until = (muted_at + Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(until, "2026-10-25 01:10:00");
+
+        assert!(!mute_over(&until, &muted_at));
+        assert!(!mute_over(&until, &(muted_at + Duration::minutes(59))));
+        assert!(mute_over(&until, &(muted_at + Duration::hours(1))));
+        // A stamp that does not parse still ends the mute.
+        assert!(mute_over("07:48", &muted_at));
     }
 
     #[test]
