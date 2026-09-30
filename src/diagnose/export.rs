@@ -87,6 +87,15 @@ impl Redactor {
                 self.learn_target(name, Some(revision));
             }
         }
+        // An issue can outlive its revision in the frames. An episode split
+        // during the expiry grace after an edit starts on one frame of the
+        // new revision, while the old one's issue is still open under a key
+        // and a snapshot that name the old revision.
+        for snap in &ep.issues {
+            if let super::issue::Subject::Target { name } = &snap.issue.subject {
+                self.learn_target(name, snap.issue.scope.configuration.as_deref());
+            }
+        }
         for label in &mut ep.labels {
             if label.note.take().is_some() {
                 *self.counts.entry("free-text").or_default() += 1;
@@ -331,10 +340,15 @@ impl Redactor {
             if let Some(token) = self.target_names.get(subject) {
                 return format!("{rule}|{token}");
             }
+            // A revision nothing in the episode names, as in an event about
+            // an issue the recording holds no snapshot of, still must not
+            // let the name through.
             if let Some((name, revision)) = subject.rsplit_once('|') {
-                if let (Some(name), Some(revision)) =
-                    (self.target_names.get(name), self.target_names.get(revision))
-                {
+                if let Some(name) = self.target_names.get(name) {
+                    let revision = self
+                        .target_names
+                        .get(revision)
+                        .map_or("target-config:[redacted]", String::as_str);
                     return format!("{rule}|{name}|{revision}");
                 }
             }
@@ -786,11 +800,11 @@ mod tests {
         assert!(text.contains(r#""state":"not_run""#), "{text}");
     }
 
-    #[test]
-    fn target_identities_and_unknown_free_text_are_redacted_without_changing_schema() {
+    /// A target whose resolve fails, named and configured with things only
+    /// this user would know.
+    fn private_target() -> super::super::targets::TargetObs {
         use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
-        let mut ep = fixture_episode();
-        let target = TargetObs {
+        TargetObs {
             stale_after_secs: None,
             attempts: vec![],
             effective_endpoint: None,
@@ -803,7 +817,8 @@ mod tests {
             tls: true,
             http: true,
             expect_status: None,
-            probed_at: ep.started.clone(),
+            // Each frame stamps its own.
+            probed_at: String::new(),
             resolve: Stage {
                 ms: Some(3.0),
                 error: Some(StageError::Other {
@@ -822,8 +837,12 @@ mod tests {
                 link_domains: vec![("wg0".into(), vec!["~finance.internal".into()])],
                 ..Default::default()
             },
-        };
-        ep = fixture_episode_with_target(Some(target));
+        }
+    }
+
+    #[test]
+    fn target_identities_and_unknown_free_text_are_redacted_without_changing_schema() {
+        let mut ep = fixture_episode_with_target(Some(private_target()));
         for frame in &mut ep.frames {
             frame.obs.coverage_hints.insert(
                 "target.connect_failed".into(),
@@ -907,6 +926,49 @@ mod tests {
             .any(|s| s.issue.rule.starts_with("target.")));
         let replay = episode::replay(&safe);
         assert!(replay.matches(), "{:#?}", replay.divergences.first());
+    }
+
+    /// An episode split at MAX_EPISODE_SECS in the minute after an edit
+    /// starts on one frame, which probes the new revision. The old revision's
+    /// issue is still open, so only its key and its snapshot name the old
+    /// revision.
+    #[test]
+    fn a_revision_only_an_issue_names_is_redacted_with_its_target() {
+        use crate::diagnose::engine::EngineEvent;
+        use crate::diagnose::issue::Subject;
+        let mut target = private_target();
+        target.name = "payroll-api".into();
+        let mut ep = fixture_episode_with_target(Some(target));
+        let old = "target.resolve_failed|payroll-api|target-config:private-test-revision";
+        assert!(ep.issue_keys().contains(&old.to_string()));
+        for t in ep.frames.iter_mut().flat_map(|f| &mut f.obs.targets) {
+            t.baseline_key = Some("target-config:edited-revision".into());
+        }
+        // And an event about a revision nothing else in the episode names.
+        ep.frames[1].events.push(EngineEvent::Acked {
+            issue: "target.resolve_failed|payroll-api|target-config:unrecorded".into(),
+        });
+
+        let safe = Redactor::new(b"install").episode(&ep);
+        let text = serde_json::to_string(&safe).unwrap();
+        for secret in ["payroll-api", "private-test-revision", "unrecorded"] {
+            assert!(!text.contains(secret), "{secret} escaped redaction");
+        }
+        // The key maps the way the snapshot's name and revision do.
+        let snap = safe
+            .issues
+            .iter()
+            .find(|s| s.issue.rule == "target.resolve_failed")
+            .unwrap();
+        assert!(safe.issue_keys().contains(&snap.issue.key()));
+        let Subject::Target { name } = &snap.issue.subject else {
+            panic!("{:?}", snap.issue.subject);
+        };
+        assert!(matches!(
+            safe.frames[1].events.as_slice(),
+            [EngineEvent::Acked { issue }]
+                if *issue == format!("target.resolve_failed|{name}|target-config:[redacted]")
+        ));
     }
 
     #[test]
