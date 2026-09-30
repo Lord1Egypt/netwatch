@@ -21,7 +21,7 @@ pub const TAB_NAMES: &[&str] = &[
 
 /// Named cursor positions for each settings row.
 /// Use these instead of magic integers when navigating or jumping to a setting.
-/// Each one is a row's index in [`ROWS`], and the build fails if one names
+/// Each one is a row's index in `ROWS`, and the build fails if one names
 /// the wrong row.
 pub mod cursor {
     pub const THEME: usize = 0;
