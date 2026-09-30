@@ -22,6 +22,7 @@
 pub mod active;
 pub mod baseline;
 pub mod causes;
+pub mod controller;
 pub mod coverage;
 pub mod demo;
 pub mod detectors;

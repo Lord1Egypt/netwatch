@@ -1,0 +1,13 @@
+{
+  "episode": "zero-window-socket-closes",
+  "frames": 421,
+  "issues": [
+    {
+      "key": "tcp.zero_window|10.88.0.2:40522 → 10.88.0.7:873",
+      "opened": "2026-09-03 06:46:32",
+      "closed": "2026-09-03 06:50:00",
+      "top_cause": "tcp.zero_window/peer_not_reading",
+      "close_reason": "expired"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 //! Runtime input coverage for the diagnostic catalogue. Counts describe
 //! available rule inputs, not proof that all traffic or subjects were observed.
 use super::{
-    baseline::BaselineStore,
+    baseline::{BaselineStore, SigmaFloor},
     detectors::Observations,
     rules::{self, RuleStatus},
 };
@@ -148,7 +148,9 @@ impl Coverage {
         }
     }
 
-    pub fn from_observations(obs: &Observations, base: &BaselineStore) -> Self {
+    /// `floor` is the detectors' σ floor: a baseline that has never varied
+    /// is judged against it, so it is usable.
+    pub fn from_observations(obs: &Observations, base: &BaselineStore, floor: SigmaFloor) -> Self {
         use Availability::*;
         let present = |yes, reason| {
             if yes {
@@ -162,7 +164,7 @@ impl Coverage {
                 return (NotMeasured, "RTT not measured");
             }
             match subject.and_then(|s| base.get(s, metric)) {
-                Some(b) if b.sigma() > f64::EPSILON => {
+                Some(b) if b.sigma_floored(floor) > f64::EPSILON => {
                     (Available, "RTT and usable baseline present")
                 }
                 _ => (
@@ -300,6 +302,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()
     };
+    super::run::print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(rule) = &test {
         config
             .diagnose_probes
@@ -428,7 +431,7 @@ mod tests {
             targets: vec![target],
             ..Default::default()
         };
-        let coverage = Coverage::from_observations(&obs, &fixture::baselines());
+        let coverage = Coverage::from_observations(&obs, &fixture::baselines(), Default::default());
         for row in coverage.rules.iter().filter(|r| {
             [
                 "target.connect_failed",
@@ -472,7 +475,11 @@ mod tests {
 
     #[test]
     fn every_catalogued_rule_has_explicit_runtime_coverage() {
-        let c = Coverage::from_observations(&Observations::default(), &fixture::baselines());
+        let c = Coverage::from_observations(
+            &Observations::default(),
+            &fixture::baselines(),
+            Default::default(),
+        );
         assert_eq!(c.rules.len(), rules::CATALOGUE.len());
         assert!(c.rules.iter().all(|r| r.status != Availability::Available));
         assert_eq!(
@@ -495,7 +502,7 @@ mod tests {
     fn dns_absolute_threshold_remains_available_while_gateway_baseline_learns() {
         let base = BaselineStore::new(NetworkFingerprint::new("test", None, vec![], None));
         let obs = fixture::observations_at(300);
-        let c = Coverage::from_observations(&obs, &base);
+        let c = Coverage::from_observations(&obs, &base, Default::default());
         assert_eq!(
             c.rules
                 .iter()
@@ -515,11 +522,32 @@ mod tests {
     }
 
     #[test]
+    fn a_baseline_that_never_varied_is_usable_against_the_floor() {
+        let mut base = BaselineStore::new(NetworkFingerprint::new("test", None, vec![], None));
+        base.seed(fixture::GATEWAY, "gateway.rtt", 0.9, 0.0, 2_400);
+        let obs = fixture::observations_at(300);
+        let gateway = |floor| {
+            Coverage::from_observations(&obs, &base, floor)
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "gateway.rtt_spike")
+                .unwrap()
+                .status
+        };
+        assert_eq!(gateway(SigmaFloor::default()), Availability::Available);
+        // Only with both floors set to zero is there nothing to score by.
+        assert_eq!(
+            gateway(SigmaFloor { ms: 0.0, pct: 0.0 }),
+            Availability::Learning
+        );
+    }
+
+    #[test]
     fn unknown_wireless_is_not_measured_not_not_applicable() {
         let weak_signal = |wireless| {
             let mut obs = fixture::observations_at(300);
             obs.iface.as_mut().unwrap().wireless = wireless;
-            Coverage::from_observations(&obs, &fixture::baselines())
+            Coverage::from_observations(&obs, &fixture::baselines(), Default::default())
                 .rules
                 .into_iter()
                 .find(|r| r.rule == "wifi.weak_signal")
@@ -537,7 +565,7 @@ mod tests {
         for s in &mut obs.sockets {
             s.rwnd = None;
         }
-        let c = Coverage::from_observations(&obs, &fixture::baselines());
+        let c = Coverage::from_observations(&obs, &fixture::baselines(), Default::default());
         for rule in ["tcp.bufferbloat_local", "tcp.zero_window"] {
             assert_eq!(
                 c.rules.iter().find(|r| r.rule == rule).unwrap().status,

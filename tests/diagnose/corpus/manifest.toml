@@ -1,0 +1,89 @@
+# The pinned replay corpus. Each [[episode]] names <id>.json.gz and
+# <id>.decisions.json in this directory, and
+# every_corpus_entry_replays_to_its_pinned_decisions checks each one.
+#
+#   kind = "synthetic"  built by a scenario in src/diagnose/fixture.rs;
+#                       `netwatch diagnose corpus` rebuilds its frames
+#   kind = "lab"        recorded by tests/diagnose/health_lab.py; its frames
+#                       are kept and only its decisions are re-derived
+#
+# Regenerate after an intended change in what the engine concludes:
+#   cargo run -- diagnose corpus [--only ID]
+
+[[episode]]
+id = "fixture-scenario"
+kind = "synthetic"
+rules = ["path.changed", "dns.slow_resolver", "tcp.bufferbloat_remote"]
+note = "The demo incident: a reroute adding 40 ms, a resolver at 33x its baseline and a bufferbloated LAN socket. Nothing closes."
+
+[[episode]]
+id = "retrans-socket-closes"
+kind = "synthetic"
+rules = ["tcp.retrans_burst"]
+note = "An scp upload retransmits 18 segments a minute at 38 ms from 120 s and ends at 300 s. A healthy browser socket stays listed, so the issue expires a minute after the upload's socket closes."
+
+[[episode]]
+id = "bufferbloat-remote-socket-closes"
+kind = "synthetic"
+rules = ["tcp.bufferbloat_remote"]
+note = "The demo's LAN socket goes from 1.1 ms to 184 ms at 120 s and closes at 300 s beside a healthy browser socket. It expires a minute after the close."
+
+[[episode]]
+id = "zero-window-socket-closes"
+kind = "synthetic"
+rules = ["tcp.zero_window"]
+note = "An rsync to a NAS sees a zero window from 120 s and gives up at 300 s. It was the host's only socket, so the sampler then lists none (no subjects), and the observation expires a minute later."
+
+[[episode]]
+id = "path-rtt-spike"
+kind = "synthetic"
+rules = ["path.rtt_spike"]
+note = "Traces to 1.1.1.1 every 30 s against the internet baseline (12 ms, σ 1.8): 13.4 ms, then 80 ms from 120 s, 16.5 ms (2.5σ, between the close and open lines) from 300 s, and 13.4 ms from 420 s. Opens on the third slow trace and closes after 120 s under the 2σ line."
+
+[[episode]]
+id = "target-slow-stage"
+kind = "synthetic"
+rules = ["target.slow_stage"]
+note = "The api target, probed once a minute against a 40 ms first-byte baseline (σ 4): 41 ms, then 400 ms from 180 s, 50 ms (2.5σ, between the close and open lines) from 360 s, and 41 ms from 480 s. Opens on the third slow probe and closes after 180 s under the 2σ line."
+
+[[episode]]
+id = "dns-slow-router"
+kind = "synthetic"
+rules = ["dns.slow_resolver"]
+note = "A router resolver, 10.5 ms (σ 0.3): a p50 of 10 ms, then 150 ms from 120 s, over the ceiling, and 11 ms from 300 s. Opens on the third slow probe and closes after 60 s under 16.8 ms, 0.8 of the 21 ms baseline line it opened on."
+
+[[episode]]
+id = "gateway-rtt"
+kind = "synthetic"
+rules = ["gateway.rtt_spike"]
+note = "A wired router answering its own pings in 1.0 ms (σ 0.3), then 40 ms from 120 s while its CPU is busy, and 1.0 ms from 300 s. Opens on the third slow probe and closes after 120 s under the 2σ line, 2.0 ms with the σ floor."
+
+[[episode]]
+id = "gateway-rtt-edge"
+kind = "synthetic"
+rules = ["gateway.rtt_spike"]
+note = "A Wi-Fi access point at 4 ms (σ 4) hovering at the open line from 120 s: 30 s at 3.1σ, then three minutes at 2.9σ, three times, then 4 ms from 750 s. One issue from the first open to the close; a 3σ close line would close it after each dip and reopen it on the next swing to 3.1σ."
+
+[[episode]]
+id = "link-down"
+kind = "synthetic"
+rules = ["link.down"]
+note = "The wired link loses its carrier at 120 s and gets it back at 300 s. The connection goes down with it, so no gateway, DNS or path is observed meanwhile. Opens on the third sample without a carrier and closes after the carrier has held 30 s."
+
+[[episode]]
+id = "link-down-carrier-unknown"
+kind = "synthetic"
+rules = ["link.down"]
+note = "The same link, never down: from 120 s to 300 s the platform gives no interface info, so the carrier is unknown while traffic flows. Unknown is not down, and nothing opens."
+
+[[episode]]
+id = "wifi-weak"
+kind = "synthetic"
+rules = ["wifi.weak_signal"]
+note = "A laptop on Wi-Fi at -53 dBm moves away at 120 s: -78 dBm, with 14% of frames retried, under the 20% line. From 300 s it reads -60 dBm. Opens on the third weak sample and closes after 120 s over -70 dBm."
+
+[[episode]]
+id = "iface-errors-wifi-drops"
+kind = "synthetic"
+rules = ["iface.errors"]
+note = "A Wi-Fi driver drops 70 unwanted frames a minute throughout, and the link takes 30 errors a minute from 120 s to 300 s. The drops alone open iface.errors at 2 s, and it never closes: it closes only under 1/min errors and drops combined. Pinned open until B19."

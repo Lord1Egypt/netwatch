@@ -47,12 +47,38 @@ impl Severity {
             Severity::Critical => "critical",
         }
     }
+
+    /// Info is an Observation; Medium and up are Issues.
+    pub fn kind(self) -> Kind {
+        match self {
+            Severity::Info => Kind::Observation,
+            Severity::Medium | Severity::High | Severity::Critical => Kind::Issue,
+        }
+    }
 }
 
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.long_label())
     }
+}
+
+/// Whether a finding says something is wrong or only something worth knowing.
+///
+/// An Issue is a fault: the verdict line counts it, and it can hide the
+/// findings it explains. An Observation, such as a symmetric NAT or a route
+/// change that added 20 ms or less, or whose added latency was not measured,
+/// is listed with the findings, but the verdict line does not count it and it
+/// never hides an Issue.
+///
+/// Derived from [`Severity`], never stored, so the two cannot disagree and a
+/// recording that says "info" loads as an Observation. `diagnose run` writes
+/// it beside each finding it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Observation,
+    Issue,
 }
 
 /// What the issue is about. Drives drill-through (`t` trace, `p` packets) and
@@ -285,7 +311,7 @@ impl Availability {
 }
 
 /// What became of one check: `passed` as a word, which the JSON carries as
-/// `state`. Schema 1 still writes `passed` beside it.
+/// `state` in its place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckState {
@@ -326,15 +352,15 @@ pub struct CheckResult {
     pub weight: f64,
 }
 
-/// A check as it is written and read. Schema 1 writes `state` next to
-/// `passed`; reading takes either, so records made before `state` and
-/// `why_not` existed still load.
+/// A check as it is written and read. It is written with `state` and no
+/// `passed`, as `diagnose run`'s schema 2 has it; reading takes either, so
+/// records made before `state` and `why_not` existed still load.
 #[derive(Serialize, Deserialize)]
 struct CheckWire {
     #[serde(default)]
     id: String,
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     passed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<CheckState>,
@@ -850,14 +876,41 @@ pub enum IssueState {
     Resolved {
         at: String,
     },
+    /// The verify condition held for its window: netwatch watched it clear.
     AutoClosed {
         at: String,
+    },
+    /// Closed because what the issue is about went away, such as a socket
+    /// that closed, not because anything measured it recover. An expiry is
+    /// never a recovery and never credits a step.
+    ///
+    /// `reason` is an authored phrase ("socket closed"), never a host,
+    /// address or target name: redacted exports keep a state verbatim.
+    Expired {
+        at: String,
+        reason: String,
     },
 }
 
 impl IssueState {
     pub fn is_open(&self) -> bool {
         matches!(self, IssueState::Open | IssueState::Acked)
+    }
+
+    /// Open, acknowledged or muted: the engine still watches it. A muted
+    /// issue is only quiet. Its condition merges into it, its verify can close
+    /// it and its subject can expire it, so it is not closed, and nothing may
+    /// file the same condition as a second issue while it lasts.
+    pub fn is_tracked(&self) -> bool {
+        self.is_open() || matches!(self, IssueState::Muted { .. })
+    }
+
+    /// When a mute ends, for a muted issue.
+    pub fn muted_until(&self) -> Option<&str> {
+        match self {
+            IssueState::Muted { until } => Some(until),
+            _ => None,
+        }
     }
 
     pub fn label(&self) -> &'static str {
@@ -867,6 +920,7 @@ impl IssueState {
             IssueState::Muted { .. } => "muted",
             IssueState::Resolved { .. } => "resolved",
             IssueState::AutoClosed { .. } => "auto-closed",
+            IssueState::Expired { .. } => "expired",
         }
     }
 }
@@ -948,12 +1002,22 @@ pub struct Issue {
     /// Local timestamp of the first sample that violated the rule.
     pub since: String,
     pub last_seen: String,
+    /// Local timestamp from which this open issue's evidence stopped arriving:
+    /// its rule's input went unavailable or its verify metric went missing.
+    /// Set once, and cleared when the condition is detected again or the
+    /// metric returns. An issue nothing can measure stays open rather than
+    /// expiring, and this says since when. It is also set while a subject
+    /// that has gone waits out `expire_after_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<String>,
     pub state: IssueState,
     pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub scope: Scope,
     pub causes: Vec<Cause>,
     pub remediation: Vec<Step>,
+    /// Fixed when the issue opens or reopens; later detections of the same
+    /// condition do not move it.
     pub verify: Verify,
     #[serde(default)]
     pub artifacts: Vec<String>,
@@ -992,6 +1056,9 @@ pub enum VerifyOutcome {
     /// An operator closed the issue by hand. Nothing was measured, so this is
     /// not evidence that the step worked — or that the fault is gone.
     ClosedByOperator,
+    /// The issue expired: what it was about went away before its verify
+    /// condition held, so nothing measured whether the step worked.
+    NotMeasured,
 }
 
 impl VerifyOutcome {
@@ -1002,6 +1069,7 @@ impl VerifyOutcome {
             VerifyOutcome::NotRecovered => "not recovered",
             VerifyOutcome::RecoveredBeforeAction => "was already recovering",
             VerifyOutcome::ClosedByOperator => "closed by hand, not measured",
+            VerifyOutcome::NotMeasured => "closed without a measurement",
         }
     }
 }
@@ -1021,7 +1089,40 @@ pub struct Verification {
     pub decided_at: Option<String>,
 }
 
+/// The identity a finding is merged, confirmed, reopened and named under:
+/// `rule|subject`, and for a configured target `rule|name|revision`.
+///
+/// A target's revision digests every field of its `[[diagnose_targets]]`
+/// entry, so an edited entry probes a different endpoint, or the same one a
+/// different way. Keyed by name alone, its detections merged into the old
+/// entry's issue, which then never expired and lent the edited target its
+/// mute, applied steps and close condition. A target finding with no
+/// revision, as in recordings made before targets had one, keeps
+/// `rule|name`. Live probes always carry one.
+pub fn finding_key(rule: &str, subject: &Subject, configuration: Option<&str>) -> String {
+    match (subject, configuration) {
+        (Subject::Target { name }, Some(revision)) => format!("{rule}|{name}|{revision}"),
+        _ => format!("{rule}|{}", subject.label()),
+    }
+}
+
 impl Issue {
+    /// See [`finding_key`].
+    pub fn key(&self) -> String {
+        finding_key(
+            &self.rule,
+            &self.subject,
+            self.scope.configuration.as_deref(),
+        )
+    }
+
+    /// Issue or Observation, from the severity the detector settled on. A
+    /// detector that demotes a finding to Info at runtime makes it an
+    /// Observation with no further code.
+    pub fn kind(&self) -> Kind {
+        self.severity.kind()
+    }
+
     /// The evidence entry a rule considers primary — by convention the first.
     /// Titles and one-line summaries quote this one.
     pub fn headline(&self) -> Option<&Evidence> {
@@ -1096,6 +1197,12 @@ pub fn short_time(ts: &str) -> &str {
     ts.split(' ').next_back().unwrap_or(ts)
 }
 
+/// `"2026-09-03 06:48:10"` → `"06:48"`, for a column or a status line with no
+/// room for seconds.
+pub fn hh_mm(ts: &str) -> String {
+    short_time(ts).chars().take(5).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_check_writes_its_state_beside_passed() {
+    fn a_check_writes_its_state_not_passed() {
         let json = |c: &CheckResult| serde_json::to_value(c).unwrap();
         let not_run = json(&CheckResult::not_run(
             "alt_resolver_is_fast",
@@ -1160,12 +1267,12 @@ mod tests {
             Availability::NotMeasured,
             "no alternate resolver probed",
         ));
-        assert_eq!(not_run["passed"], serde_json::Value::Null);
+        assert!(not_run.get("passed").is_none(), "{not_run}");
         assert_eq!(not_run["state"], "not_run");
         assert_eq!(not_run["why_not"], "not_measured");
-        // Schema 1 only gains fields: a check that ran carries no `why_not`.
+        // A check that ran carries no `why_not`.
         let passed = json(&CheckResult::pass("a", "a", "fine"));
-        assert_eq!(passed["passed"], true);
+        assert!(passed.get("passed").is_none(), "{passed}");
         assert_eq!(passed["state"], "passed");
         assert!(passed.get("why_not").is_none(), "{passed}");
         assert_eq!(json(&CheckResult::fail("a", "a", ""))["state"], "failed");
@@ -1189,7 +1296,7 @@ mod tests {
         assert_eq!(ran.state(), CheckState::Failed);
         assert_eq!(ran.why_not, None);
         assert_eq!(ran.weight, 1.0);
-        // A record that carries `state` alone, as schema 2 will, loads too.
+        // A record that carries `state` alone, as schema 2 writes it, loads too.
         let new = load(r#"{"id":"a","name":"a","state":"passed","detail":""}"#);
         assert_eq!(new.passed, Some(true));
         let new = load(
@@ -1425,6 +1532,7 @@ mod tests {
             },
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
+            stale_since: None,
             state: IssueState::Open,
             evidence: vec![dns_evidence()],
             scope: Scope::default(),
@@ -1446,5 +1554,23 @@ mod tests {
         let json = serde_json::to_string(&issue).unwrap();
         let back: Issue = serde_json::from_str(&json).unwrap();
         assert_eq!(issue, back, "report.json must reload into the same object");
+    }
+
+    #[test]
+    fn info_is_an_observation_and_everything_else_an_issue() {
+        assert_eq!(Severity::Info.kind(), Kind::Observation);
+        for sev in [Severity::Medium, Severity::High, Severity::Critical] {
+            assert_eq!(sev.kind(), Kind::Issue, "{sev}");
+        }
+
+        // The kind is not stored: a finding recorded as "info" loads as an
+        // Observation, and one that says "high" as an Issue.
+        let issue = test_issue();
+        assert_eq!(issue.kind(), Kind::Issue);
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(!json.contains("\"kind\":\"issue\""), "{json}");
+        let info = json.replace("\"severity\":\"high\"", "\"severity\":\"info\"");
+        let back: Issue = serde_json::from_str(&info).unwrap();
+        assert_eq!(back.kind(), Kind::Observation);
     }
 }

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::issue::{Applied, Issue, IssueState, Severity, StepKind};
+use super::issue::{Applied, Issue, IssueState, Kind, Severity, StepKind};
 use super::rules;
 
 /// Host and session facts that belong in every report's environment section.
@@ -57,19 +57,41 @@ pub struct Report {
 impl Report {
     /// Issues that are findings in their own right, worst first.
     pub fn primary(&self) -> Vec<&Issue> {
-        rules::primary_issues(&self.issues)
+        rules::primary_findings(&self.issues)
     }
 
     fn find(&self, id: &str) -> Option<&Issue> {
         self.issues.iter().find(|i| i.id == id)
     }
 
-    /// The one-line verdict. Same shape as the toast and the verdict line.
+    /// Findings muted by hand. Not open, since they left the verdict, and not
+    /// closed either: netwatch still watches each one.
+    fn muted(&self) -> Vec<&Issue> {
+        self.issues
+            .iter()
+            .filter(|i| i.state.muted_until().is_some())
+            .collect()
+    }
+
+    /// Findings that have closed: neither open nor muted.
+    fn closed(&self) -> Vec<&Issue> {
+        self.issues
+            .iter()
+            .filter(|i| !i.state.is_tracked())
+            .collect()
+    }
+
+    /// The one-line verdict. Same shape as the toast and the verdict line,
+    /// which also says how many findings it leaves out because they are muted.
     pub fn summary_line(&self) -> String {
+        let muted = match self.muted().len() {
+            0 => String::new(),
+            n => format!(" · {n} muted"),
+        };
         let primary = self.primary();
         if primary.is_empty() {
-            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
-            let mut line = format!("no open findings · {}", self.coverage.label());
+            let closed = self.closed().len();
+            let mut line = format!("no open findings · {}{muted}", self.coverage.label());
             if closed > 0 {
                 line.push_str(&format!(
                     " · {closed} retained closed finding{}",
@@ -78,19 +100,29 @@ impl Report {
             }
             return line;
         }
-        let worst = primary
-            .iter()
-            .map(|i| i.severity)
-            .max()
-            .unwrap_or(Severity::Info);
+        // Observations are counted apart and never set the state: a host
+        // whose only finding is a symmetric NAT is not "impaired", and it is
+        // not "nominal" either, because nothing here measured that.
+        let (issues, observations): (Vec<&Issue>, Vec<&Issue>) =
+            primary.into_iter().partition(|i| i.kind() == Kind::Issue);
+        let notes = match observations.len() {
+            0 => String::new(),
+            n => format!(" · {}", plural(n, "observation")),
+        };
+        let Some(worst) = issues.iter().map(|i| i.severity).max() else {
+            return format!("no open issues{notes}{muted}");
+        };
         let state = match worst {
             Severity::Critical => "down",
             Severity::High => "degraded",
-            Severity::Medium => "impaired",
-            Severity::Info => "nominal with notes",
+            // Info is an Observation, so it is never the worst Issue.
+            Severity::Medium | Severity::Info => "impaired",
         };
-        let counts = severity_counts(&primary);
-        format!("{state} — {} ({counts})", plural(primary.len(), "issue"))
+        let counts = severity_counts(&issues);
+        format!(
+            "{state} — {} ({counts}){notes}{muted}",
+            plural(issues.len(), "issue")
+        )
     }
 
     pub fn to_json(&self) -> serde_json::Result<String> {
@@ -99,7 +131,8 @@ impl Report {
 
     /// The markdown report. Sections in the order the spec sets out: summary,
     /// one section per open issue in severity order, suppressed consequences
-    /// under their root cause, timeline, environment, evidence index.
+    /// under their root cause, muted findings, timeline, environment, evidence
+    /// index.
     pub fn to_markdown(&self) -> String {
         let mut m = String::new();
         let env = &self.environment;
@@ -151,7 +184,14 @@ impl Report {
                 m.push_str(&format!(" All {total} checks had their inputs."));
             }
             m.push_str("\n\n");
-            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
+            let muted = self.muted().len();
+            if muted > 0 {
+                m.push_str(&format!(
+                    "{} muted and still watched; see Muted findings.\n\n",
+                    plural(muted, "finding")
+                ));
+            }
+            let closed = self.closed().len();
             if closed > 0 {
                 m.push_str(&format!(
                     "{} closed during this session; see Retained closed findings.\n\n",
@@ -185,6 +225,33 @@ impl Report {
             m.push_str(&self.issue_section(n + 1, issue));
         }
 
+        // A muted finding is still a fault, so it comes before the history.
+        // A muted root keeps its consequences suppressed, and they are listed
+        // with it; nowhere else would name them.
+        let row = |i: &Issue, muted: String| {
+            vec![
+                format!("`{}`", i.id),
+                i.title.clone(),
+                i.severity.long_label().to_string(),
+                muted,
+            ]
+        };
+        let mut muted: Vec<Vec<String>> = Vec::new();
+        for issue in self.muted() {
+            let until = issue.state.muted_until().unwrap_or_default();
+            muted.push(row(issue, format!("until {}", time_of(until))));
+            for c in issue.consequences.iter().filter_map(|cid| self.find(cid)) {
+                muted.push(row(c, format!("with `{}`", issue.id)));
+            }
+        }
+        if !muted.is_empty() {
+            m.push_str("## Muted findings\n\n");
+            m.push_str(
+                "Muted, not closed: netwatch still watches each one, and it is open again when its mute ends.\n\n",
+            );
+            m.push_str(&md_table(&["ID", "Issue", "Severity", "Muted"], &muted));
+        }
+
         if !self.timeline.is_empty() {
             m.push_str("## Timeline\n\n");
             let rows: Vec<Vec<String>> = self
@@ -196,15 +263,18 @@ impl Report {
         }
 
         let closed: Vec<Vec<String>> = self
-            .issues
-            .iter()
-            .filter(|i| !i.state.is_open())
+            .closed()
+            .into_iter()
             .map(|i| {
-                vec![
-                    format!("`{}`", i.id),
-                    i.title.clone(),
-                    i.state.label().to_string(),
-                ]
+                // An expiry says what went away, so it cannot pass for one
+                // more close that netwatch watched clear.
+                let state = match &i.state {
+                    IssueState::Expired { reason, .. } => {
+                        format!("expired, evidence gone: {reason}")
+                    }
+                    s => s.label().to_string(),
+                };
+                vec![format!("`{}`", i.id), i.title.clone(), state]
             })
             .collect();
         if !closed.is_empty() {
@@ -439,11 +509,20 @@ impl Report {
             IssueState::Resolved { at } => {
                 m.push_str(&format!(" · marked resolved {}", time_of(at)))
             }
+            IssueState::Expired { at, reason } => m.push_str(&format!(
+                " · expired {}, evidence gone: {reason}",
+                time_of(at)
+            )),
             IssueState::Acked => m.push_str(" · acknowledged, still open"),
             IssueState::Muted { until } => {
                 m.push_str(&format!(" · muted until {}", time_of(until)))
             }
             IssueState::Open => m.push_str(" · not yet met"),
+        }
+        // An open issue nothing has measured lately cannot meet its verify,
+        // and says since when.
+        if let Some(stale) = issue.stale_since.as_ref().filter(|_| issue.state.is_open()) {
+            m.push_str(&format!(" · stale since {}", time_of(stale)));
         }
         m.push_str("\n\n");
 
@@ -522,12 +601,7 @@ fn md_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 
 fn severity_counts(issues: &[&Issue]) -> String {
     let mut parts = Vec::new();
-    for sev in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Info,
-    ] {
+    for sev in [Severity::Critical, Severity::High, Severity::Medium] {
         let n = issues.iter().filter(|i| i.severity == sev).count();
         if n > 0 {
             parts.push(format!("{n} {}", sev.long_label()));
@@ -614,6 +688,130 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_finding_says_since_when() {
+        let mut report = report();
+        let id = report.issues[0].id.clone();
+        report.issues[0].stale_since = Some("2026-09-03 06:50:02".into());
+        let json = report.to_json().unwrap();
+        assert!(
+            json.contains(r#""stale_since": "2026-09-03 06:50:02""#),
+            "{json}"
+        );
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
+
+        let md = restored.to_markdown();
+        let section = md
+            .split("## ")
+            .find(|s| s.contains(&format!("`{id}`")) && s.contains("**Verify:**"))
+            .unwrap();
+        assert!(
+            section.contains("· not yet met · stale since 06:50:02"),
+            "{section}"
+        );
+        // Only the one issue, and nothing about the others.
+        assert_eq!(md.matches("stale since").count(), 1, "{md}");
+        // A finding that was never stale writes nothing for it.
+        assert!(!serde_json::to_string(&report.issues[1])
+            .unwrap()
+            .contains("stale_since"));
+    }
+
+    #[test]
+    fn an_expired_finding_says_its_evidence_went() {
+        let mut report = report();
+        report.issues[0].state = IssueState::Expired {
+            at: "2026-09-03 07:00:00".into(),
+            reason: "socket closed".into(),
+        };
+        let json = report.to_json().unwrap();
+        assert!(
+            json.contains(r#""state": "expired""#) && json.contains(r#""reason": "socket closed""#),
+            "{json}"
+        );
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
+
+        let md = restored.to_markdown();
+        let closed = md
+            .split("## Retained closed findings")
+            .nth(1)
+            .expect("an expired finding is retained");
+        let row = closed
+            .lines()
+            .find(|l| l.contains(&report.issues[0].id))
+            .unwrap();
+        assert!(
+            row.contains("expired, evidence gone: socket closed"),
+            "{row}"
+        );
+        assert!(!row.contains("auto-closed"), "{row}");
+    }
+
+    /// A muted fault still running was filed under Retained closed findings,
+    /// and with nothing else open the summary said so too. It is listed as
+    /// muted, with the consequences it keeps suppressed.
+    #[test]
+    fn a_muted_issue_is_not_reported_closed() {
+        let (mut engine, _) = fixture::run();
+        let id = |e: &crate::diagnose::engine::Engine, rule: &str| {
+            e.issues()
+                .iter()
+                .find(|i| i.rule == rule)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let resolver = id(&engine, "dns.slow_resolver");
+        let path = id(&engine, "path.changed");
+        let spike = id(&engine, "path.rtt_spike");
+        assert!(engine.mute(&resolver, 60));
+        assert!(engine.mute(&path, 60));
+        let mut r = report();
+        r.issues = engine.issues().to_vec();
+
+        let line = r.summary_line();
+        assert!(line.ends_with(" · 2 muted"), "{line}");
+        let md = r.to_markdown();
+        assert!(!md.contains("## Retained closed findings"), "{md}");
+        let muted = md
+            .split("## Muted findings")
+            .nth(1)
+            .expect("a muted finding is listed");
+        let row = |id: &str| {
+            muted
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{id}`")))
+                .unwrap_or_else(|| panic!("no row for {id}: {muted}"))
+                .to_string()
+        };
+        // The fixture's clock stops at 06:51:20.
+        assert!(row(&resolver).contains("until 07:51:20"), "{muted}");
+        assert!(row(&path).contains("until 07:51:20"), "{muted}");
+        // path.rtt_spike is path.changed's consequence, quiet with it.
+        assert!(row(&spike).contains(&format!("with `{path}`")), "{muted}");
+
+        // Everything muted: nothing is open, and nothing has closed either.
+        let open: Vec<String> = engine
+            .issues()
+            .iter()
+            .filter(|i| i.state.is_open())
+            .map(|i| i.id.clone())
+            .collect();
+        for id in &open {
+            assert!(engine.mute(id, 60));
+        }
+        r.issues = engine.issues().to_vec();
+        let line = r.summary_line();
+        assert!(line.starts_with("no open findings"), "{line}");
+        assert!(line.ends_with(" · 4 muted"), "{line}");
+        let md = r.to_markdown();
+        assert!(md.contains("4 findings muted and still watched"), "{md}");
+        assert!(!md.contains("closed during this session"), "{md}");
+        assert!(!md.contains("## Retained closed findings"), "{md}");
+    }
+
+    #[test]
     fn tables_are_well_formed_and_coverage_uses_readable_labels() {
         let mut r = report();
         let base = crate::diagnose::baseline::BaselineStore::new(
@@ -622,6 +820,7 @@ mod tests {
         r.coverage = crate::diagnose::coverage::Coverage::from_observations(
             &crate::diagnose::detectors::Observations::default(),
             &base,
+            Default::default(),
         );
         let md = r.to_markdown();
         assert!(md.contains("| Area "), "{md}");
@@ -780,6 +979,29 @@ mod tests {
             r.summary_line().starts_with("no open findings"),
             "{}",
             r.summary_line()
+        );
+    }
+
+    /// Info findings used to count as issues and, alone, made the summary
+    /// "nominal with notes": a health claim nothing had measured.
+    #[test]
+    fn observations_are_counted_apart_from_issues() {
+        let mut r = report();
+        let ids: Vec<String> = r.primary().iter().map(|i| i.id.clone()).collect();
+        assert!(ids.len() >= 2, "the fixture opens several findings");
+        let last = r.issues.iter_mut().find(|i| i.id == ids[ids.len() - 1]);
+        last.unwrap().severity = Severity::Info;
+        let line = r.summary_line();
+        assert!(line.contains(&plural(ids.len() - 1, "issue")), "{line}");
+        assert!(line.ends_with(" · 1 observation"), "{line}");
+        assert!(!line.contains("info"), "{line}");
+
+        for i in &mut r.issues {
+            i.severity = Severity::Info;
+        }
+        assert_eq!(
+            r.summary_line(),
+            format!("no open issues · {}", plural(ids.len(), "observation"))
         );
     }
 

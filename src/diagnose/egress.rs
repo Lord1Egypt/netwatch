@@ -576,7 +576,8 @@ mod tests {
         let obs: Observations = serde_json::from_str("{}").unwrap();
         assert!(obs.egress.is_none());
         assert!(detect(obs.egress.as_ref()).is_empty());
-        let coverage = super::super::coverage::Coverage::from_observations(&obs, &base());
+        let coverage =
+            super::super::coverage::Coverage::from_observations(&obs, &base(), Default::default());
         assert!(coverage
             .rules
             .iter()

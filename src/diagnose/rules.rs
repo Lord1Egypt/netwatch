@@ -9,7 +9,7 @@
 //! issue. That distinction is the point: a diagnostic tool that lists 24 rules
 //! and silently evaluates nine is lying about its coverage.
 
-use super::issue::{Issue, IssueId, RuleId, Severity, Subject, Verify};
+use super::issue::{Issue, IssueId, Kind, RuleId, Severity, Subject, Verify};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,8 @@ pub struct Rule {
     /// Plain-English trigger, shown in the "how issues are found" panel.
     pub trigger: &'static str,
     /// Rules whose issues become consequences of this one when both are open
-    /// and they share a subject scope. Explicit — never inferred.
+    /// and they share a subject scope. Explicit — never inferred. An
+    /// Observation of this rule still never hides an Issue.
     pub suppresses: &'static [RuleId],
     pub status: RuleStatus,
     /// What must be measured before this rule may fire. Empty means the rule
@@ -73,7 +74,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "slow dns resolver",
         category: "dns",
         severity: Severity::Medium,
-        trigger: "resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline",
+        trigger: "resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples",
         suppresses: &[],
         status: RuleStatus::Active,
         evidence: &[],
@@ -133,7 +134,9 @@ pub const CATALOGUE: &[Rule] = &[
         category: "link",
         severity: Severity::Critical,
         // The root cause of nearly everything else, so it suppresses widely.
-        trigger: "arp or icmp to the default gateway fails",
+        // A quiet router alone is not enough: a failed internet probe has to
+        // corroborate it, and no ARP probe exists to consult.
+        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed",
         suppresses: &[
             "dns.slow_resolver",
             "dns.failing",
@@ -165,7 +168,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "link down",
         category: "link",
         severity: Severity::Critical,
-        trigger: "interface carrier lost",
+        // Each OS reports "up" differently, and macOS reports the admin flag
+        // rather than carrier. A09 moves macOS to the `status:` line and
+        // rewrites that clause.
+        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says \"Media disconnected\"",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
         evidence: &[],
@@ -178,7 +184,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "gateway slow to answer",
         category: "link",
         severity: Severity::Medium,
-        trigger: "gateway rtt > 3σ above baseline for 3 samples",
+        trigger: "gateway rtt > 3σ and at least 10ms above baseline for 3 samples",
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
         evidence: &[],
@@ -651,6 +657,19 @@ fn depends_on(root: &Issue, child: &Issue) -> bool {
             return false;
         }
     }
+    // One target's name across an edit: the old entry's finding waits out
+    // its expiry about an endpoint no longer probed, and explains nothing
+    // the new entry finds.
+    if let (Subject::Target { .. }, Subject::Target { .. }, Some(a), Some(b)) = (
+        &root.subject,
+        &child.subject,
+        &root.scope.configuration,
+        &child.scope.configuration,
+    ) {
+        if a != b {
+            return false;
+        }
+    }
     match (&root.subject, &child.subject) {
         (Subject::Host, _) => true,
         (Subject::Iface { name }, Subject::Iface { name: other }) => name == other,
@@ -695,7 +714,10 @@ pub fn apply_suppression(issues: &mut [Issue]) {
         }
         let mut best: Option<(usize, Severity)> = None;
         for (ri, root) in issues.iter().enumerate() {
-            if ri == ci || !root.state.is_open() {
+            // A muted root still explains its symptoms. Releasing them would
+            // put a consequence at the head of the verdict for the hour the
+            // user asked the cause to be quiet.
+            if ri == ci || !root.state.is_tracked() {
                 continue;
             }
             let Some(rule) = lookup(&root.rule) else {
@@ -705,6 +727,15 @@ pub fn apply_suppression(issues: &mut [Issue]) {
                 continue;
             }
             if !depends_on(root, child) {
+                continue;
+            }
+            // An Observation never hides an Issue. The edge stays in the
+            // catalogue because a detector can raise the same rule to an
+            // Issue: path.changed is Medium once the new hop adds more than
+            // 20 ms, and then it does explain the path's rtt spike. At Info
+            // it is a route that changed, which explains nothing a user
+            // would fix.
+            if root.kind() == Kind::Observation && child.kind() == Kind::Issue {
                 continue;
             }
             // Most severe root wins, so a link failure beats a gateway failure.
@@ -745,9 +776,10 @@ pub fn apply_suppression(issues: &mut [Issue]) {
     }
 }
 
-/// The issues a user should be shown as findings: open, and not a consequence
-/// of another open issue.
-pub fn primary_issues(issues: &[Issue]) -> Vec<&Issue> {
+/// The findings a user should be shown: open, and not a consequence of
+/// another open finding. Issues and Observations alike; [`Kind`] tells them
+/// apart.
+pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
     issues
         .iter()
         .filter(|i| i.state.is_open() && i.suppressed_by.is_none())
@@ -758,21 +790,27 @@ pub fn primary_issues(issues: &[Issue]) -> Vec<&Issue> {
 /// more specific one. Every active rule must have one — enforced by a test,
 /// because §4's rule is that a remediation without a testable success
 /// condition is an instruction, not something netwatch can claim to have fixed.
+///
+/// The three σ rules close at the default `sigma_close_k`, 2σ. This cannot
+/// read `Thresholds`, so their detectors put the configured value in its place.
+/// `dns.slow_resolver` closes at 0.8 of the default 100 ms ceiling, its line
+/// with no baseline; its detector derives the line from the baseline and the
+/// configured ceiling.
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
-        "dns.slow_resolver" => Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60),
+        "dns.slow_resolver" => Verify::below("dns.rtt_p50", 80.0, "ms").holding_for(60),
         "dns.failing" => Verify::below("dns.failure_rate", 1.0, "%").holding_for(120),
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
-        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 3.0, "σ").holding_for(120),
+        "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 2.0, "σ").holding_for(120),
         "link.down" => Verify::above("iface.carrier", 0.0, "").holding_for(30),
         "iface.errors" => Verify::below("iface.error_rate", 1.0, "/min").holding_for(300),
         "iface.saturated" => Verify::below("iface.utilisation", 90.0, "%").holding_for(60),
         "wifi.weak_signal" => Verify::above("wifi.rssi", -70.0, "dBm").holding_for(120),
         "path.changed" => Verify::below("path.hop_changes", 1.0, "").holding_for(300),
         "path.high_loss" => Verify::below("path.hop_loss", 1.0, "%").holding_for(120),
-        "path.rtt_spike" => Verify::below("path.rtt_sigma", 3.0, "σ").holding_for(120),
+        "path.rtt_spike" => Verify::below("path.rtt_sigma", 2.0, "σ").holding_for(120),
         "tcp.bufferbloat_local" => {
             Verify::below("tcp.loaded_rtt_delta", 100.0, "ms").holding_for(60)
         }
@@ -791,7 +829,7 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "target.connect_failed" => Verify::above("target.connect_ok", 0.5, "").holding_for(120),
         "target.tls_failed" => Verify::above("target.tls_ok", 0.5, "").holding_for(120),
         "target.http_error" => Verify::above("target.http_ok", 0.5, "").holding_for(120),
-        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 3.0, "σ").holding_for(180),
+        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 2.0, "σ").holding_for(180),
         "egress.drift" => Verify::below("egress.new_destinations", 1.0, "").holding_for(300),
         "egress.policy_violation" => {
             Verify::below("egress.denied_flows", 1.0, "observed destinations").holding_for(300)
@@ -815,6 +853,7 @@ mod tests {
             subject,
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
+            stale_since: None,
             state: IssueState::Open,
             evidence: vec![],
             scope: Scope::default(),
@@ -846,6 +885,209 @@ mod tests {
             normalise(&coverage_markdown()),
             "run: cargo run -- diagnose coverage --doc"
         );
+    }
+
+    /// Triggers that still misdescribe their detector, each waiting on the
+    /// plan item that changes that detector: the rule, its text as it
+    /// stands, and the item with what the text gets wrong. The guard below
+    /// skips them. The item rewrites the text and removes its row; a row
+    /// whose text has already changed fails, so none outlives its reason.
+    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
+        (
+            "dns.failing",
+            "servfail/timeout rate > 5%, or the pipeline dns stage fails",
+            "B15, then A14: servfail counts as a reply, and no pipeline branch exists",
+        ),
+        (
+            "iface.errors",
+            "rx/tx error, drop, overrun or fifo counters increment",
+            "B19: fires on the per-minute error and drop floors, not on any increment",
+        ),
+        (
+            "iface.saturated",
+            "throughput above 90% of link rate for 30s",
+            "B33: held for consecutive_n interface samples, not for 30 s",
+        ),
+        (
+            "path.high_loss",
+            "a hop loses packets and the loss propagates to later hops",
+            "B33: loss before a silent tail also opens, unattributed",
+        ),
+        (
+            "path.rtt_spike",
+            "end-to-end rtt > 3σ above baseline",
+            "B31: the baseline falls back to the internet probe's",
+        ),
+        (
+            "tcp.bufferbloat_remote",
+            "one socket's rtt rises with its own tx while the link-level test passes",
+            "B23: opens with no link test, and after a failed one",
+        ),
+    ];
+
+    /// The quantities a trigger quotes. Digits glued to a word name
+    /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
+    /// number (100ms, 30s, 3σ) is part of one. Any other suffix panics
+    /// rather than being skipped, so a new one (2x, 10min) must be listed
+    /// here as a unit or a name before the guard can pass.
+    fn quoted_numbers(text: &str) -> Vec<f64> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if !chars[i].is_ascii_digit() || (i > 0 && chars[i - 1].is_alphanumeric()) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            let unit: String = chars[i..]
+                .iter()
+                .take_while(|c| c.is_alphabetic())
+                .collect();
+            match unit.as_str() {
+                "" | "ms" | "s" | "σ" => {}
+                "xx" => continue,
+                _ => panic!("{text:?}: is {digits}{unit} a quantity or a name? list {unit:?} in quoted_numbers"),
+            }
+            let value: f64 = digits
+                .trim_end_matches('.')
+                .parse()
+                .unwrap_or_else(|_| panic!("{text:?}: {digits:?} is not a number"));
+            let negative = start > 0
+                && matches!(chars[start - 1], '-' | '−')
+                && (start < 2 || !chars[start - 2].is_alphanumeric());
+            out.push(if negative { -value } else { value });
+        }
+        out
+    }
+
+    #[test]
+    fn quoted_numbers_reads_quantities_not_names() {
+        assert_eq!(
+            quoted_numbers("p50 > 3σ for 3 samples, or > 100ms"),
+            [3.0, 3.0, 100.0]
+        );
+        assert_eq!(
+            quoted_numbers("at or below −70 dBm, or 20% for 30s."),
+            [-70.0, 20.0, 30.0]
+        );
+        assert!(quoted_numbers("a v6 route while v4 works answers 5xx").is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "\"p50 ≥ 2x mean\": is 2x a quantity or a name?")]
+    fn quoted_numbers_refuses_a_suffix_it_does_not_know() {
+        // Skipping it would let "2x" or "10min" leave the guard unchecked.
+        quoted_numbers("p50 ≥ 2x mean");
+    }
+
+    #[test]
+    #[should_panic(expected = "\"answers 1.1.1.1\": \"1.1.1.1\" is not a number")]
+    fn quoted_numbers_names_the_text_it_cannot_read() {
+        quoted_numbers("answers 1.1.1.1");
+    }
+
+    /// The drift test above only proves the document matches the catalogue.
+    /// This one ties the numbers a trigger quotes to the values the detector
+    /// judges with, so a retuned default cannot leave the text behind.
+    #[test]
+    fn catalogue_triggers_quote_the_default_thresholds() {
+        use crate::diagnose::detectors::Thresholds;
+
+        // The `Thresholds` fields each trigger quotes. A rule listed in
+        // neither table quotes no number. Every field needs its own quote,
+        // so two fields that share a value (sigma_k and consecutive_n are
+        // both 3) need the number twice.
+        const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
+            ("dns.truncation_retry", &["dns_tc_pct"]),
+            (
+                "dns.slow_resolver",
+                &[
+                    "sigma_k",
+                    "dns_delta_floor_ms",
+                    "dns_delta_multiple",
+                    "dns_ceiling_ms",
+                    "consecutive_n",
+                ],
+            ),
+            (
+                "gateway.rtt_spike",
+                &["sigma_k", "gateway_delta_floor_ms", "consecutive_n"],
+            ),
+            ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
+            ("tcp.bufferbloat_local", &["loaded_rtt_delta_ms"]),
+            ("target.resolve_failed", &["consecutive_n"]),
+            ("target.connect_failed", &["consecutive_n"]),
+            ("target.tls_failed", &["consecutive_n"]),
+            ("target.http_error", &["consecutive_n"]),
+            ("target.slow_stage", &["sigma_k", "consecutive_n"]),
+        ];
+        // Numbers `Thresholds` does not carry: three literals in the
+        // detectors, pinned by their own firing tests, and a protocol
+        // constant.
+        const QUOTED_LITERALS: &[(&str, f64)] = &[
+            // retrans_burst_fires_at_five_a_minute
+            ("tcp.retrans_burst", 5.0),
+            // kernel::tests::matched_positive_negative_and_unknown
+            ("tcp.connect_failures", 5.0),
+            ("tcp.timewait_exhaustion", 60.0),
+            // The status the portal probe expects.
+            ("captive.portal", 204.0),
+        ];
+
+        let defaults = serde_json::to_value(Thresholds::default()).expect("thresholds serialise");
+        let default_of = |field: &str| {
+            defaults
+                .get(field)
+                .and_then(|v| v.as_f64())
+                .unwrap_or_else(|| panic!("Thresholds has no numeric field {field}"))
+        };
+        let sorted = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v
+        };
+
+        for (id, text, why) in PENDING_TRIGGER_TEXTS {
+            let rule = lookup(id).unwrap_or_else(|| panic!("{id} is not in the catalogue"));
+            assert_eq!(
+                rule.trigger, *text,
+                "{id}'s trigger changed; if its item has landed ({why}), remove its row"
+            );
+        }
+        for (id, _) in QUOTED_THRESHOLDS {
+            assert!(lookup(id).is_some(), "{id} is not in the catalogue");
+        }
+        for (id, _) in QUOTED_LITERALS {
+            assert!(lookup(id).is_some(), "{id} is not in the catalogue");
+        }
+
+        for rule in CATALOGUE {
+            if PENDING_TRIGGER_TEXTS.iter().any(|(id, ..)| *id == rule.id) {
+                continue;
+            }
+            let expected = QUOTED_THRESHOLDS
+                .iter()
+                .filter(|(id, _)| *id == rule.id)
+                .flat_map(|(_, fields)| fields.iter().map(|f| default_of(f)))
+                .chain(
+                    QUOTED_LITERALS
+                        .iter()
+                        .filter(|(id, _)| *id == rule.id)
+                        .map(|(_, value)| *value),
+                )
+                .collect();
+            assert_eq!(
+                sorted(quoted_numbers(rule.trigger)),
+                sorted(expected),
+                "{}: \"{}\" does not quote the defaults its detector judges with",
+                rule.id,
+                rule.trigger
+            );
+        }
     }
 
     #[test]
@@ -943,6 +1185,27 @@ mod tests {
     }
 
     #[test]
+    fn a_targets_old_revision_does_not_explain_its_new_one() {
+        // Edited, a target's old finding stays tracked until it expires.
+        // It is about an entry that no longer exists, so it cannot hide
+        // what the entry that replaced it finds.
+        let target = || Subject::Target { name: "api".into() };
+        let mut old = issue("1", "target.connect_failed", target());
+        old.scope.configuration = Some("target-config:aaaa".into());
+        let mut edited = issue("2", "target.slow_stage", target());
+        edited.scope.configuration = Some("target-config:bbbb".into());
+        let mut same = issue("3", "target.http_error", target());
+        same.scope.configuration = Some("target-config:aaaa".into());
+        let unrevised = issue("4", "target.slow_stage", target());
+
+        let mut issues = vec![old, edited, same, unrevised];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by, None, "another revision");
+        assert_eq!(issues[2].suppressed_by.as_deref(), Some("1"));
+        assert_eq!(issues[3].suppressed_by.as_deref(), Some("1"), "no revision");
+    }
+
+    #[test]
     fn catalogue_ids_are_unique() {
         let mut seen = HashSet::new();
         for r in CATALOGUE {
@@ -1001,7 +1264,7 @@ mod tests {
 
         assert_eq!(issues[0].suppressed_by.as_deref(), Some("B"));
         assert_eq!(issues[1].consequences, vec!["A".to_string()]);
-        let primary = primary_issues(&issues);
+        let primary = primary_findings(&issues);
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].id, "B");
     }
@@ -1037,7 +1300,7 @@ mod tests {
             issues[2].consequences,
             vec!["A".to_string(), "B".to_string()]
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1087,7 +1350,7 @@ mod tests {
             issues[0].suppressed_by.is_none(),
             "dns must resurface as a finding once the gateway recovers"
         );
-        assert_eq!(primary_issues(&issues).len(), 1);
+        assert_eq!(primary_findings(&issues).len(), 1);
     }
 
     #[test]
@@ -1117,6 +1380,71 @@ mod tests {
             ),
         ];
         apply_suppression(&mut issues);
-        assert_eq!(primary_issues(&issues).len(), 3);
+        assert_eq!(primary_findings(&issues).len(), 3);
+    }
+
+    /// An Info `path.changed` used to hide a Medium `path.rtt_spike` on the
+    /// same path: a note that the route moved took the fault off the screen.
+    #[test]
+    fn an_observation_never_hides_an_issue() {
+        let path = || Subject::Path {
+            target: "1.1.1.1".into(),
+        };
+        let mut issues = vec![
+            issue("A", "path.changed", path()),
+            issue("B", "path.rtt_spike", path()),
+        ];
+        assert_eq!(issues[0].kind(), Kind::Observation);
+        apply_suppression(&mut issues);
+        assert!(issues[1].suppressed_by.is_none());
+        assert!(issues[0].consequences.is_empty());
+        let primary: Vec<&str> = primary_findings(&issues)
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(primary, ["A", "B"]);
+
+        // Once the new hop adds enough latency to make the route change an
+        // Issue, it explains the spike again.
+        issues[0].severity = Severity::Medium;
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by.as_deref(), Some("A"));
+
+        // An Issue still hides an Observation it explains.
+        let flow = || Subject::Egress {
+            process: "curl".into(),
+            destination: "203.0.113.7".into(),
+            port: 443,
+        };
+        let mut issues = vec![
+            issue("C", "egress.drift", flow()),
+            issue("D", "egress.policy_violation", flow()),
+        ];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[0].suppressed_by.as_deref(), Some("D"));
+    }
+
+    #[test]
+    fn the_six_info_rules_are_observations() {
+        let observations: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|r| r.severity.kind() == Kind::Observation)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            observations,
+            [
+                "dns.truncation_retry",
+                "path.changed",
+                "tcp.zero_window",
+                "tcp.timewait_exhaustion",
+                "nat.symmetric",
+                "egress.drift",
+            ]
+        );
+        for id in observations {
+            let found = issue("A", id, Subject::Host);
+            assert_eq!(found.kind(), Kind::Observation, "{id}");
+        }
     }
 }

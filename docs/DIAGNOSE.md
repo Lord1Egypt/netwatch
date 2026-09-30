@@ -48,6 +48,30 @@ clock-skew evidence. See the [chrony tracking documentation](https://chrony-proj
 4. When the issue closes, the optional cause prompt records what actually
    happened. You can skip it or change the answer from the issue/history.
 
+An issue closes on its own in one of two ways. It auto-closes when its verify
+condition holds for its window, which means netwatch watched it recover. It
+expires when what it is about has been gone for 60 seconds: the socket closed,
+the target was removed from the config or its entry changed, the resolver left
+the system config, the periodic trace moved to another target, or the platform
+no longer lists the interface. The report then says "expired, evidence gone",
+and an expiry never counts as a recovery.
+
+An issue whose evidence has only stopped arriving stays open and shows
+"stale since" and the time it stopped. A gateway that cannot be probed because
+ICMP is blocked is the usual case. From this host it looks the same as a
+gateway that is down. The socket collector refreshes only in the Dense view
+and under `netwatch diagnose run`, so in the Full and Lite views a socket issue
+goes stale instead of expiring.
+
+Muting an issue (`m`) quiets it for an hour and does not close it. It leaves
+the issue list and the verdict, which says how many it left out ("1 muted"),
+and the chronology shows it as `◌ muted until` and the time. The report lists
+it under Muted findings, not as closed. Netwatch keeps watching it: the same
+condition does not open a second issue, and the muted issue still auto-closes
+or expires as above. A muted root cause keeps its consequences under it, so a
+symptom does not take its place in the verdict. When the hour is up, an issue
+that has not closed is open again.
+
 ## History and sharing
 
 **Incident history** lists the latest 100 saved incidents, including their
@@ -102,8 +126,8 @@ part of the interface:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | completed, no finding — the rules that could be evaluated did not fire |
-| 1 | completed, at least one open finding |
+| 0 | completed, no issue — the rules that could be evaluated did not fire |
+| 1 | completed, at least one open issue |
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
 
@@ -115,10 +139,119 @@ could send nothing, because ICMP is blocked and the gateway answers no TCP port,
 does not. With `--target`, only that target's own probes count: another target
 completing says nothing about this one.
 
+Only an issue sets exit 1. An observation, such as a symmetric NAT or a route
+change that added 20 ms or less, is reported but says nothing is wrong, so a
+host whose only finding is an observation exits 0. Text output lists
+observations under their own heading, after the issues.
+
+With `--target`, the run reports the findings about that target, the findings
+that explain one of them, such as a gateway failure that hides the target's
+own, and the host, interface and resolver issues that could lie on the
+target's route. An issue that names an interface or resolver the target's
+lookup did not use is left out, and so is a resolver issue when the target is
+an address. A target on a loopback address keeps only an issue that hides one
+of its own findings. Nothing lies on a target's route until a probe of it
+arrives, so a target that is disabled, or not probed inside the budget, exits
+with status 2 whatever else is open. A failure of the service itself, such as
+a refused port, an HTTP 503 or a name that does not exist, is reported as a
+medium issue and exits 1. The Diagnose tab lists it as an info observation
+marked "service, not network", because the network is not at fault; the run
+was asked whether the target works.
+
 Budgets accept `30s`, `2m` or a bare number of seconds, between 5s and 10m.
 JSON output carries the ruleset size, the sampling window, the coverage object
-and the issues, so a support engineer can see what was evaluated rather than
-inferring it from an empty list.
+and the findings, so a support engineer can see what was evaluated rather than
+inferring it from an empty list. It is `"schema": 2`: `issues` holds issues
+only, `observations` holds the rest, and each finding carries a `kind` of
+`issue` or `observation`. Each check carries a `state` of `passed`, `failed`
+or `not_run`, and a `why_not` when it did not run. Schema 1 listed
+observations under `issues` and wrote `passed` (`true`, `false` or `null`) on
+each check; recordings that carry `passed` still load.
+
+## Thresholds
+
+The engine's thresholds live in a `config.toml` table. These are the defaults,
+and a key left out keeps its default:
+
+```toml
+[diagnose_thresholds]
+sigma_k = 3.0              # σ multiple of the baseline that counts as a deviation
+sigma_close_k = 2.0        # σ multiple an issue must fall below to close
+sigma_floor_ms = 0.5       # smallest σ a baseline is judged against
+sigma_floor_pct = 5.0      # or this percentage of the baseline's mean, if larger
+gateway_delta_floor_ms = 10.0  # ms the gateway must be slower than its mean, too
+dns_delta_floor_ms = 5.0   # ms a resolver must be slower than its mean, too
+dns_delta_multiple = 2.0   # and the multiple of its mean it must reach
+consecutive_n = 3          # samples a condition must show before an issue opens
+verdict_hold_secs = 30     # how long a socket verdict must persist
+dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or not
+socket_rtt_ms = 100.0
+loaded_rtt_delta_ms = 100.0
+saturation_pct = 90.0
+iface_error_floor = 1.0    # interface errors per minute
+iface_drop_floor = 60.0    # interface drops per minute
+dns_tc_pct = 10.0
+dns_mismatch_pct = 50.0
+wifi_rssi_dbm = -70.0
+wifi_retry_pct = 20.0
+```
+
+A value that cannot mean anything (a σ multiple of 0 or less, a negative σ
+or delta floor, `consecutive_n = 0`, a percentage outside 0–100, `nan` or
+`inf`) is replaced by its default and logged; `diagnose run` and `diagnose
+coverage` also print it to stderr. So is a `sigma_close_k` at or above
+`sigma_k`: it becomes 2, or two thirds of a `sigma_k` of 2 or less. The
+table is read at startup, and coverage's **r** reload leaves it alone: each
+recorded episode keeps the thresholds it ran with, so a replay judges it by the
+same numbers. An episode recorded before a threshold existed replays with that
+threshold's default: one from before 0.34 is judged against the σ and delta
+floors and the 2σ close line it ran without.
+`--generate-config` and the Settings editor's save write the table only once it
+differs from the defaults. Then they write every key, and a key in the file
+keeps its value when a later release retunes that default.
+
+Every σ is floored before it is used. A resolver that answers from cache in
+1.2 ms, give or take 0.05 ms, is judged as if σ were 0.5 ms, so 3σ is 2.7 ms
+rather than 1.35 ms, and a 40 ms resolver is judged against at least 2 ms. The
+Dashboard's latency tiles show the floored σ too. Setting both floors to 0
+judges the raw σ.
+
+Many σ can still be a move nobody feels, so two rules also need an absolute
+rise. `gateway.rtt_spike` needs the gateway 10 ms slower than its mean: a wired
+gateway moving from 2 to 9 ms is 14σ over the floor. `dns.slow_resolver` needs
+the resolver's median 5 ms slower than its mean and at least twice it before
+its baseline opens an issue: a LAN resolver moving from 1.2 to 2.7 ms is 3σ,
+and a 30 ms resolver at 35 ms is more than 3σ. So a LAN resolver slowing from
+1 to 4 ms is never reported, on purpose. The 100 ms ceiling does not wait for
+a baseline. Setting these three to 0 judges by σ alone. The Dashboard's tiles
+do not apply them, so a move under these floors can turn one red with no issue
+raised.
+
+`gateway.rtt_spike`, `path.rtt_spike` and `target.slow_stage` open at 3σ and
+close only once the metric has stayed under 2σ for the verify hold. With one
+line for both, a gateway hovering at 3σ closed each time it dipped under for
+two minutes and reopened each time it rose. A noisy link now takes longer to
+close.
+
+`dns.slow_resolver` closes once the resolver's median has stayed under one
+line for 60 s, set when the issue opens: 0.8 of the line it opened on, or 2σ
+above the resolver's mean if that is higher. The line it opened on is the
+lower of the ceiling and the baseline's line. A router answering in 10.5 ms
+opens at 21 ms and closes under 16.8 ms; with no baseline the line is 80 ms,
+0.8 of the ceiling. The close line used to be a flat 5 ms, which a router
+answering in 10 ms never meets, so an issue opened on one stayed open until
+netwatch restarted. The line is in ms and does not follow the baseline, so an
+issue whose median settles between the two lines stays open until netwatch
+restarts or the resolver leaves the config, even after the baseline has
+learned the new median.
+
+`sigma_k` also sets what the baselines learn: a reading that many σ or more
+above normal is left out, so an incident does not become the new normal. A
+reading between `sigma_close_k` and `sigma_k` is learned, so a
+`gateway.rtt_spike`, `path.rtt_spike` or `target.slow_stage` issue that
+settles there closes once its baseline has caught up with it. A low value
+leaves out ordinary peaks too, so the saved baselines settle lower and flag
+more, and they take time to relearn after the value is raised again.
 
 ## Diagnose coverage in terminal Netwatch
 
@@ -332,17 +465,35 @@ document cannot drift from the rules again.
 
 ## Pinned replay corpus
 
-`tests/diagnose/corpus/` holds a recorded episode and the decisions it must
-keep producing — which issues open, when, and what each is blamed on. The
-replay test compares against that file rather than against the recording it
-just made, so a change that moves both sides still shows up.
+`tests/diagnose/corpus/` holds recorded episodes and the decisions each must
+keep producing: which issues open, when, what each is blamed on, and why each
+left the list (`close_reason`: auto-closed, expired, resolved, muted,
+suppressed, or pruned when the history limit dropped it on the tick it
+closed).
+The replay test compares against those files rather than against a recording
+it just made, so a change that moves both sides still shows up.
+
+`manifest.toml` lists every episode, and the test checks each row by name. A
+`synthetic` row is built by a scenario in `src/diagnose/fixture.rs`; it must
+still be what that scenario records, and must also replay to its own
+recording. A `lab` row keeps the frames the health lab recorded, and only its
+decisions are derived again.
 
 ```sh
-netwatch diagnose corpus      # regenerate after an intended semantic change
+netwatch diagnose corpus              # regenerate after an intended semantic change
+netwatch diagnose corpus --only ID    # one manifest row
 ```
 
 A diff there is a change in what netwatch concludes, and belongs in the same
 review as the code that caused it.
+
+Every rule whose open condition or close line changed since 0.32 is listed in
+`TOUCHED_SINCE_0_32` in `src/diagnose/episode.rs`, and a test fails unless a
+corpus entry that lists the rule both opens it and closes it by its verify. For
+the socket rules an expiry once the socket closes counts too. A rule that cannot
+close yet has a `PENDING_CLOSE` row there saying why: `iface.errors`, whose
+close line a Wi-Fi driver's background drops never let it reach. Another test
+fails once such a rule closes, so its row goes in the same change.
 
 ## Reproducible verification
 

@@ -1,0 +1,13 @@
+{
+  "episode": "wifi-weak",
+  "frames": 481,
+  "issues": [
+    {
+      "key": "wifi.weak_signal|wlan0",
+      "opened": "2026-09-03 06:46:02",
+      "closed": "2026-09-03 06:51:00",
+      "top_cause": "wifi.weak_signal/weak_signal",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

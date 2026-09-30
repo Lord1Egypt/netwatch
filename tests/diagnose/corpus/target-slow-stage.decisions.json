@@ -1,0 +1,13 @@
+{
+  "episode": "target-slow-stage",
+  "frames": 721,
+  "issues": [
+    {
+      "key": "target.slow_stage|api|target-config:synthetic-api",
+      "opened": "2026-09-03 06:49:00",
+      "closed": "2026-09-03 06:55:00",
+      "top_cause": "target.slow_stage/server_stage_slow",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

@@ -21,9 +21,10 @@
 //!    journal is not involved.
 //! 3. **It does not cheat the engine.** Applying the fix does not mark the
 //!    issue resolved — it changes what the resolver *observes*, and the same
-//!    verify condition that governs a live issue (`dns.rtt_p50 < 5ms` held for
-//!    60s) is what closes it. The demo can show the loop closing because the
-//!    loop actually closes.
+//!    verify condition that governs a live issue (`dns.rtt_p50` under 0.8 of
+//!    the line it opened on, which reads `< 5ms` here, held for 60s) is what
+//!    closes it. The demo can show the loop closing because the loop actually
+//!    closes.
 
 use std::sync::Arc;
 

@@ -229,8 +229,8 @@ impl Probes {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IssueRow {
-    /// `rule|subject`, the key episodes and engine events use. Issue ids are
-    /// numbered per session and mean nothing across runs.
+    /// The key episodes and engine events use ([`super::issue::finding_key`]).
+    /// Issue ids are numbered per session and mean nothing across runs.
     pub key: String,
     pub rule: String,
     pub state: &'static str,
@@ -251,6 +251,7 @@ fn state_name(state: &IssueState) -> &'static str {
         IssueState::Muted { .. } => "muted",
         IssueState::Resolved { .. } => "resolved",
         IssueState::AutoClosed { .. } => "auto_closed",
+        IssueState::Expired { .. } => "expired",
     }
 }
 

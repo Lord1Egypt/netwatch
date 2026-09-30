@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::baseline::BaselineStore;
+use super::baseline::{
+    Baseline, BaselineStore, SigmaFloor, DEFAULT_SIGMA_FLOOR_MS, DEFAULT_SIGMA_FLOOR_PCT,
+};
 use super::issue::{
     Action, Availability, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject,
     Verify,
@@ -20,10 +22,39 @@ use super::issue::{
 use super::rules;
 
 /// Tunables. Defaults are the spec's: k=3σ, N=3 consecutive samples.
+///
+/// Read from `[diagnose_thresholds]` in config.toml, and embedded in every
+/// recorded episode. A field missing from either takes its default, so a
+/// field added later neither breaks a config written before it nor stops
+/// an older episode from loading.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Thresholds {
     /// σ multiple that counts as a deviation.
     pub sigma_k: f64,
+    /// σ multiple an issue opened on σ must fall below before it closes.
+    /// Below `sigma_k`, so a metric hovering at the open line does not open
+    /// and close in turn. `dns.slow_resolver` never closes on a line lower
+    /// than this many σ above the resolver's mean.
+    pub sigma_close_k: f64,
+    /// Smallest σ, in ms, a baseline is judged against, so a baseline that
+    /// has barely varied does not score an unnoticeable move as many σ.
+    pub sigma_floor_ms: f64,
+    /// Smallest σ as a percentage of the baseline's mean.
+    pub sigma_floor_pct: f64,
+    /// How far, in ms, the gateway's rtt must rise above its baseline mean
+    /// before `gateway.rtt_spike` opens, however many σ that is. The σ
+    /// floor makes a σ a move someone could notice; this makes it one worth
+    /// reporting: 2 to 9 ms on a wired gateway is 14σ and harms nothing.
+    pub gateway_delta_floor_ms: f64,
+    /// How far, in ms, a resolver's p50 must rise above its baseline mean
+    /// before `dns.slow_resolver` opens on the baseline. A LAN resolver
+    /// moving from 1.2 to 2.7 ms clears 3σ over the floor, and nobody waits
+    /// on it.
+    pub dns_delta_floor_ms: f64,
+    /// And the multiple of its baseline mean the p50 must reach, so a
+    /// resolver that normally takes 30 ms opens at 60, not at 35.
+    pub dns_delta_multiple: f64,
     /// Consecutive violating samples before an issue opens (hysteresis).
     pub consecutive_n: u32,
     /// A socket verdict must persist this long before it becomes an issue.
@@ -34,6 +65,7 @@ pub struct Thresholds {
     /// inside the normal range of ISP and mobile resolvers, so every first
     /// run on such a network opened a finding with no baseline behind it.
     /// Anything the baseline can catch, the 3σ test catches once it is ready.
+    /// With no baseline, an issue it opened closes under 0.8 of it.
     pub dns_ceiling_ms: f64,
     /// Socket rtt above this, with retransmits, reads as receiver-side queue.
     pub socket_rtt_ms: f64,
@@ -65,6 +97,12 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             sigma_k: 3.0,
+            sigma_close_k: 2.0,
+            sigma_floor_ms: DEFAULT_SIGMA_FLOOR_MS,
+            sigma_floor_pct: DEFAULT_SIGMA_FLOOR_PCT,
+            gateway_delta_floor_ms: 10.0,
+            dns_delta_floor_ms: 5.0,
+            dns_delta_multiple: 2.0,
             consecutive_n: 3,
             verdict_hold_secs: 30,
             dns_ceiling_ms: 100.0,
@@ -78,6 +116,114 @@ impl Default for Thresholds {
             wifi_rssi_dbm: -70.0,
             wifi_retry_pct: 20.0,
         }
+    }
+}
+
+impl Thresholds {
+    /// The floor under every baseline's σ, for scoring and for learning.
+    pub fn sigma_floor(&self) -> SigmaFloor {
+        SigmaFloor {
+            ms: self.sigma_floor_ms,
+            pct: self.sigma_floor_pct,
+        }
+    }
+
+    /// These thresholds with every value that cannot mean anything put back
+    /// to its default, and one warning per value put back.
+    ///
+    /// They come from a hand-edited file, and a typo there should cost one
+    /// setting, not the tab: a σ multiple of 0 calls every sample a
+    /// deviation, and a share above 100% can never be reached. NaN and
+    /// infinity are refused everywhere: every comparison with NaN is false,
+    /// so the rule it feeds would never fire, and every episode embeds these
+    /// values, where JSON writes either as `null` and the episode no longer
+    /// loads.
+    pub fn validated(self) -> (Self, Vec<String>) {
+        type Rule = (fn(f64) -> bool, &'static str);
+        let above_zero: Rule = (
+            |v| v > 0.0 && v.is_finite(),
+            "must be a finite number above 0",
+        );
+        let at_least_zero: Rule = (
+            |v| v >= 0.0 && v.is_finite(),
+            "must be a finite number of 0 or more",
+        );
+        let share: Rule = (|v| (0.0..=100.0).contains(&v), "must be within 0..=100");
+        let number: Rule = (|v| v.is_finite(), "must be a finite number");
+
+        let mut t = self;
+        let mut warnings = Vec::new();
+        let mut check = |name: &str, field: fn(&mut Self) -> &mut f64, (ok, needs): Rule| {
+            let value = field(&mut t);
+            if !ok(*value) {
+                let default = *field(&mut Self::default());
+                warnings.push(format!(
+                    "diagnose_thresholds.{name} = {value} {needs}, so the default {default} is used"
+                ));
+                *value = default;
+            }
+        };
+        check("sigma_k", |t| &mut t.sigma_k, above_zero);
+        check("sigma_close_k", |t| &mut t.sigma_close_k, above_zero);
+        check("sigma_floor_ms", |t| &mut t.sigma_floor_ms, at_least_zero);
+        check("sigma_floor_pct", |t| &mut t.sigma_floor_pct, share);
+        check(
+            "gateway_delta_floor_ms",
+            |t| &mut t.gateway_delta_floor_ms,
+            at_least_zero,
+        );
+        check(
+            "dns_delta_floor_ms",
+            |t| &mut t.dns_delta_floor_ms,
+            at_least_zero,
+        );
+        check(
+            "dns_delta_multiple",
+            |t| &mut t.dns_delta_multiple,
+            at_least_zero,
+        );
+        check("dns_ceiling_ms", |t| &mut t.dns_ceiling_ms, number);
+        check("socket_rtt_ms", |t| &mut t.socket_rtt_ms, number);
+        check(
+            "loaded_rtt_delta_ms",
+            |t| &mut t.loaded_rtt_delta_ms,
+            number,
+        );
+        check("saturation_pct", |t| &mut t.saturation_pct, share);
+        check("iface_error_floor", |t| &mut t.iface_error_floor, number);
+        check("iface_drop_floor", |t| &mut t.iface_drop_floor, number);
+        check("dns_tc_pct", |t| &mut t.dns_tc_pct, share);
+        check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
+        check("wifi_rssi_dbm", |t| &mut t.wifi_rssi_dbm, number);
+        check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
+        // A close line at or above the open line is no deadband. When the
+        // default is not below a lowered `sigma_k` either, the fallback keeps
+        // the defaults' proportion. The warning rounds it: a `sigma_k` of 2
+        // leaves 1.3333333333333333.
+        if t.sigma_close_k >= t.sigma_k {
+            let default = Self::default();
+            let (fallback, used) = if default.sigma_close_k < t.sigma_k {
+                let v = default.sigma_close_k;
+                (v, format!("the default {v}"))
+            } else {
+                let v = t.sigma_k * default.sigma_close_k / default.sigma_k;
+                let shown = (v * 100.0).round() / 100.0;
+                (v, format!("{shown}, two thirds of it,"))
+            };
+            warnings.push(format!(
+                "diagnose_thresholds.sigma_close_k = {} must be below sigma_k = {}, so {used} is used",
+                t.sigma_close_k, t.sigma_k
+            ));
+            t.sigma_close_k = fallback;
+        }
+        if t.consecutive_n == 0 {
+            t.consecutive_n = Self::default().consecutive_n;
+            warnings.push(format!(
+                "diagnose_thresholds.consecutive_n = 0 must be at least 1, so the default {} is used",
+                t.consecutive_n
+            ));
+        }
+        (t, warnings)
     }
 }
 
@@ -354,6 +500,36 @@ pub struct GatewayObs {
     pub internet_reachable: Option<bool>,
 }
 
+/// The configuration a sample ran with. Whether an issue's subject went
+/// away or only stopped being measured depends on it: a socket that closed,
+/// a target the user removed, a resolver that left the system config. It is
+/// recorded with the readings so a replay decides the same way.
+///
+/// The resolver and interface lists are the app's last read of each, taken
+/// every tenth tick in the TUI and only at start under `diagnose run`, and
+/// neither carries a time of its own.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservedConfig {
+    /// The system resolvers, in the order the platform lists them. `None`
+    /// when it listed none: the collector returns the same empty list when
+    /// it cannot read the resolver config, so an empty list never says a
+    /// resolver left.
+    pub resolvers: Option<Vec<String>>,
+    /// Enabled `[[diagnose_targets]]` as (name, revision). The revision is
+    /// the target's baseline key, which changes when any field of its entry
+    /// does.
+    pub targets: Vec<(String, String)>,
+    /// `diagnose_probes.trace_target`.
+    pub trace_target: String,
+    /// Seconds between periodic traces; `None` while periodic tracing is
+    /// off, as it always is under `diagnose run`.
+    pub trace_refresh_secs: Option<u64>,
+    /// Every interface the platform lists, up or down. `None` when it
+    /// listed none, as after a read that failed at start.
+    pub interfaces: Option<Vec<String>>,
+}
+
 /// Everything a detector pass gets to look at.
 /// Serialisable so an episode can store exactly what the detectors saw and
 /// replay it. `default` keeps older recordings loadable as fields are added.
@@ -380,6 +556,10 @@ pub struct Observations {
     pub nat: Option<NatObs>,
     /// Configured developer targets with a fresh probe result.
     pub targets: Vec<super::targets::TargetObs>,
+    /// The configuration the sample ran with. `None` means unknown: a
+    /// recording made before it was recorded, or a synthetic episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ObservedConfig>,
 }
 
 /// A candidate issue. The engine supplies identity and history.
@@ -412,9 +592,15 @@ impl Detection {
         }
     }
 
-    /// Stable identity for merging across ticks: one issue per (rule, subject).
+    /// Stable identity for merging across ticks: one issue per (rule,
+    /// subject), and per revision for a configured target. See
+    /// [`super::issue::finding_key`].
     pub fn key(&self) -> String {
-        format!("{}|{}", self.rule, self.subject.label())
+        super::issue::finding_key(
+            self.rule,
+            &self.subject,
+            self.scope.configuration.as_deref(),
+        )
     }
 }
 
@@ -455,12 +641,7 @@ fn detect_targets(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                 // resolver belongs to. Suppression uses both: a resolver
                 // failure elsewhere, or a link failure on another interface,
                 // does not explain this finding.
-                if let Some(answered) = target
-                    .lookups
-                    .iter()
-                    .find(|l| l.outcome == super::targets::LookupOutcome::Answered)
-                    .or_else(|| target.lookups.first())
-                {
+                if let Some(answered) = target.route_lookup() {
                     d.scope.via_resolver = Some(answered.resolver.clone());
                     d.scope.via_iface = answered.link.clone();
                 }
@@ -988,8 +1169,8 @@ fn target_detection(
                     *cause,
                     *word,
                     ms,
-                    b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
-                    b.map(|b| b.mean),
+                    b.and_then(|b| ms.and_then(|v| b.sigma_above(v, t.sigma_floor()))),
+                    b.map(|b| (b.mean, b.sigma_floored(t.sigma_floor()))),
                     *applies,
                 )
             })
@@ -1002,14 +1183,16 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
-        let (_, word, ms, _, mean, _) = worst.0;
+        // Closes below the open line, as gateway.rtt_spike does.
+        d.verify.threshold = t.sigma_close_k;
+        let (_, word, ms, _, baseline, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
             ms.unwrap_or_default(),
             "ms",
         );
-        if let Some(mean) = mean {
-            ev = ev.with_baseline(*mean, 0.0);
+        if let Some((mean, sigma)) = baseline {
+            ev = ev.with_baseline(*mean, *sigma);
         }
         d.evidence.push(ev);
         d.evidence
@@ -1055,7 +1238,9 @@ fn target_detection(
         )];
     }
 
-    // What isn't a network fault shouldn't read like one.
+    // What isn't a network fault shouldn't read like one. It stays an
+    // Observation here; `diagnose run --target` asks whether this target
+    // works, and counts it as an Issue.
     let top = d
         .causes
         .iter()
@@ -1064,7 +1249,7 @@ fn target_detection(
     if let Some((id, score)) = top {
         if score >= 0.6 && ["service_down", "name_does_not_exist", "service_error"].contains(&id) {
             d.severity = Severity::Info;
-            d.scope.note = Some("not a network fault".into());
+            d.scope.note = Some("service, not network".into());
         }
     }
     Some(d)
@@ -1563,18 +1748,23 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
         // without a baseline this rule stays quiet rather than guessing.
         return vec![];
     };
-    let Some(sigma) = b.sigma_above(rtt) else {
+    let Some(sigma) = b.sigma_above(rtt, t.sigma_floor()) else {
         return vec![];
     };
-    if sigma < t.sigma_k {
+    // Both: many σ on a quiet wired gateway can still be a few ms nobody
+    // feels, and 10 ms on a noisy wireless one can still be ordinary.
+    if sigma < t.sigma_k || rtt - b.mean < t.gateway_delta_floor_ms {
         return vec![];
     }
 
     let mut d = Detection::new("gateway.rtt_spike", Subject::Iface { name: addr.clone() });
     d.subject = Subject::Host;
+    // Closing below the open line keeps an rtt hovering at 3σ one issue.
+    // The catalogue's line is the default one; this is the configured one.
+    d.verify.threshold = t.sigma_close_k;
     d.evidence.push(
         Evidence::new("gateway.rtt", rtt, "ms")
-            .with_baseline(b.mean, b.sigma())
+            .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
             .with_window(30, 30),
     );
     d.evidence
@@ -1880,19 +2070,20 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
 
     let baseline = base.get(&dns.resolver, "dns.rtt_p50");
+    // The ceiling applies with a baseline too: 160 ms is slow whatever the
+    // resolver usually does.
     let over_ceiling = p50 > t.dns_ceiling_ms;
-    let over_sigma = baseline
-        .and_then(|b| b.sigma_above(p50))
-        .map(|s| s >= t.sigma_k)
-        .unwrap_or(false);
+    let over_baseline = baseline
+        .and_then(|b| dns_open_line(b, t))
+        .is_some_and(|line| p50 >= line);
 
-    if !over_ceiling && !over_sigma {
+    if !over_ceiling && !over_baseline {
         return out;
     }
 
     let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(dns.window_secs, dns.queries);
     if let Some(b) = baseline {
-        ev = ev.with_baseline(b.mean, b.sigma());
+        ev = ev.with_baseline(b.mean, b.sigma_floored(t.sigma_floor()));
     }
 
     let mut d = Detection::new(
@@ -2123,7 +2314,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     ];
 
     d.remediation = dns_remediation(dns, Some(p50));
-    d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
+    d.verify.threshold = dns_close_line(baseline, t);
     d.scope = Scope {
         configuration: None,
         processes: vec![],
@@ -2144,6 +2335,52 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
     out.push(d);
     out
+}
+
+/// The p50 at which a resolver with this baseline is slow: `sigma_k` floored
+/// σ above the mean, but at least `dns_delta_floor_ms` above it and
+/// `dns_delta_multiple` times it. The σ floor alone opens on a LAN resolver
+/// moving from 1.2 to 2.7 ms, and 5 ms over a 30 ms resolver is noise. `None`
+/// when the floored σ is zero and the baseline cannot be scored.
+///
+/// With the ceiling, one of the two lines an issue opens on; the close line
+/// is derived from the lower of them ([`dns_close_line`]).
+fn dns_open_line(b: &Baseline, t: &Thresholds) -> Option<f64> {
+    let sigma = b.sigma_floored(t.sigma_floor());
+    (sigma > f64::EPSILON).then(|| {
+        (b.mean + t.sigma_k * sigma)
+            .max(b.mean + t.dns_delta_floor_ms)
+            .max(t.dns_delta_multiple * b.mean)
+    })
+}
+
+/// The share of its open line a slow resolver's p50 must fall under before
+/// the issue closes.
+const DNS_CLOSE_SHARE: f64 = 0.8;
+
+/// The p50 a `dns.slow_resolver` issue must stay under for its 60 s hold:
+/// `sigma_close_k` floored σ above the baseline mean, or 0.8 of the line the
+/// issue opened on, whichever is higher. With no baseline it is 0.8 of the
+/// ceiling. The engine keeps the line set at open.
+///
+/// The open line is the lower of the ceiling and the baseline's line,
+/// because crossing either opens the issue. A router answering in 10.5 ms
+/// opens at 21 ms and closes under 16.8 ms, whether a 60 ms or a 150 ms spike
+/// opened it. The σ term keeps the line above the resolver's normal range:
+/// 0.8 of the open line alone can fall inside it, and the issue would never
+/// close, as the flat 5 ms this replaces never did for a 10 ms router.
+///
+/// On a resolver whose normal range reaches the ceiling, the σ term can put
+/// the close line above it. The issue then closes once the p50 has stayed
+/// under the ceiling for the hold, because a p50 over it keeps the issue open.
+fn dns_close_line(baseline: Option<&Baseline>, t: &Thresholds) -> f64 {
+    let open = baseline
+        .and_then(|b| dns_open_line(b, t))
+        .map_or(t.dns_ceiling_ms, |line| line.min(t.dns_ceiling_ms));
+    let under_open = DNS_CLOSE_SHARE * open;
+    baseline.map_or(under_open, |b| {
+        under_open.max(b.mean + t.sigma_close_k * b.sigma_floored(t.sigma_floor()))
+    })
 }
 
 /// Steps for a failing or slow resolver. A switch is proposed only to an
@@ -2215,7 +2452,7 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
     let b = base
         .get(&path.target, "path.rtt")
         .or_else(|| base.get("internet", "path.rtt"))?;
-    let sigma = b.sigma_above(rtt)?;
+    let sigma = b.sigma_above(rtt, t.sigma_floor())?;
     if sigma < t.sigma_k {
         return None;
     }
@@ -2237,9 +2474,11 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
             target: path.target.clone(),
         },
     );
+    // Closes below the open line, as gateway.rtt_spike does.
+    d.verify.threshold = t.sigma_close_k;
     d.evidence.push(
         Evidence::new("path.rtt", rtt, "ms")
-            .with_baseline(b.mean, b.sigma())
+            .with_baseline(b.mean, b.sigma_floored(t.sigma_floor()))
             .with_window(60, 60),
     );
     d.evidence
@@ -3419,6 +3658,371 @@ mod tests {
         assert!(d.evidence[0].multiple_label().is_none());
     }
 
+    /// `dns.slow_resolver` for a LAN resolver that answers in 1.2ms, give or
+    /// take 0.05, once its p50 moves to `p50`.
+    fn lan_resolver_at(p50: f64, t: &Thresholds) -> Option<Detection> {
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.05, 2_000);
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(p50);
+        detect(&obs_with_dns(dns), &base, t)
+            .into_iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+    }
+
+    #[test]
+    fn a_flat_resolver_baseline_is_judged_against_the_floor() {
+        // 1.2ms with σ 0.05: raw, 1.5ms is 6σ; against the 0.5ms floor it is
+        // 0.6σ, and 3ms is 3.6σ. The delta floors are off: they keep all of
+        // these quiet, and this is about the σ.
+        let slow = lan_resolver_at;
+        let t = Thresholds {
+            dns_delta_floor_ms: 0.0,
+            dns_delta_multiple: 0.0,
+            ..Thresholds::default()
+        };
+        assert!(slow(1.5, &t).is_none());
+        let unfloored = Thresholds {
+            sigma_floor_ms: 0.0,
+            sigma_floor_pct: 0.0,
+            ..t
+        };
+        assert!(slow(1.5, &unfloored).is_some());
+
+        let d = slow(3.0, &t).expect("3.6σ against the floor");
+        // The evidence carries the σ the resolver was judged against.
+        assert_eq!(d.evidence[0].sigma, Some(0.5));
+        assert!((d.evidence[0].sigma_above().unwrap() - 3.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_lan_resolver_moving_from_1_2_to_2_7ms_does_not_fire() {
+        // 2.7ms is 3σ over the 0.5ms floor and 2.25 times the mean, and
+        // the σ floor alone reported it. It is 1.5ms slower.
+        let t = Thresholds::default();
+        assert!(lan_resolver_at(2.7, &t).is_none());
+        let no_delta = Thresholds {
+            dns_delta_floor_ms: 0.0,
+            ..t
+        };
+        assert!(
+            lan_resolver_at(2.7, &no_delta).is_some(),
+            "only the 5ms floor holds it back"
+        );
+    }
+
+    #[test]
+    fn a_lan_resolver_moving_from_1_2_to_7ms_fires() {
+        let t = Thresholds::default();
+        let d = lan_resolver_at(7.0, &t).expect("5.8ms slower, 5.8 times the mean, 11.6σ");
+        assert_eq!(d.evidence[0].value, 7.0);
+        assert_eq!(d.evidence[0].baseline, Some(1.2));
+        // 4.9ms slower is still under the floor.
+        assert!(lan_resolver_at(6.1, &t).is_none());
+    }
+
+    #[test]
+    fn a_resolver_with_a_high_baseline_opens_at_twice_its_mean() {
+        // 30ms, give or take 1: the floor is 5% of the mean, so 3σ is
+        // 34.5ms, and 5ms slower is 35ms. A resolver that normally takes 30ms
+        // is not slow at 40.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 30.0, 1.0, 2_000);
+        let slow = |p50: f64| {
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            rules_of(&detect(&obs_with_dns(dns), &base, &Thresholds::default()))
+                .contains(&"dns.slow_resolver")
+        };
+        assert!(!slow(40.0));
+        assert!(!slow(59.0));
+        assert!(slow(60.0));
+    }
+
+    #[test]
+    fn the_ceiling_fires_on_a_resolver_whose_baseline_would_not() {
+        // 80ms, give or take 5: the baseline opens at twice the mean, 160ms,
+        // so from a mean of 50ms up the 100ms ceiling is the only way this
+        // rule opens. It must not wait for the baseline to agree.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 80.0, 5.0, 2_000);
+        let t = Thresholds::default();
+        let b = base.get("169.254.1.1", "dns.rtt_p50").unwrap();
+        assert_eq!(dns_open_line(b, &t), Some(160.0));
+        let slow = |p50: f64| {
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            detect(&obs_with_dns(dns), &base, &t)
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+        };
+        assert!(slow(100.0).is_none(), "the ceiling is exclusive");
+        let d = slow(120.0).expect("120ms is over the 100ms ceiling");
+        assert_eq!(d.evidence[0].value, 120.0);
+        assert_eq!(d.evidence[0].baseline, Some(80.0));
+        assert_eq!(d.severity, Severity::Medium, "1.5 times the mean");
+    }
+
+    #[test]
+    fn the_dns_open_line_is_the_highest_of_its_three_tests() {
+        let t = Thresholds::default();
+        let line = |mean: f64, sigma: f64| {
+            let mut base = store();
+            base.seed("169.254.1.1", "dns.rtt_p50", mean, sigma, 2_000);
+            dns_open_line(base.get("169.254.1.1", "dns.rtt_p50").unwrap(), &t)
+        };
+        // Each of the three can be the one that sets it.
+        assert_eq!(line(1.2, 0.05), Some(6.2), "5ms above the mean");
+        assert_eq!(line(30.0, 1.0), Some(60.0), "twice the mean");
+        assert_eq!(line(10.0, 4.0), Some(22.0), "3σ above the mean");
+        // With both σ floors at 0 a baseline that never varied cannot be
+        // scored, as `sigma_above` cannot score it.
+        let unfloored = Thresholds {
+            sigma_floor_ms: 0.0,
+            sigma_floor_pct: 0.0,
+            ..t
+        };
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.0, 2_000);
+        let flat = base.get("169.254.1.1", "dns.rtt_p50").unwrap();
+        assert_eq!(dns_open_line(flat, &unfloored), None);
+    }
+
+    #[test]
+    fn the_verify_line_sits_below_the_open_line() {
+        // The line `dns.slow_resolver` closes on, for a p50 that opens it
+        // against a baseline of (mean, σ), or none.
+        let close_line = |baseline: Option<(f64, f64)>, p50: f64, t: &Thresholds| {
+            let mut base = store();
+            if let Some((mean, sigma)) = baseline {
+                base.seed("169.254.1.1", "dns.rtt_p50", mean, sigma, 2_000);
+            }
+            let mut dns = slow_dns();
+            dns.rtt_p50_ms = Some(p50);
+            let d = detect(&obs_with_dns(dns), &base, t)
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+                .unwrap_or_else(|| panic!("{p50}ms against {baseline:?} should open"));
+            assert_eq!(d.verify.metric, "dns.rtt_p50");
+            assert_eq!(d.verify.hold_secs, 60);
+            d.verify.threshold
+        };
+        let t = Thresholds::default();
+        // (baseline, the p50 that opens, the line it opened on, the close line)
+        for (baseline, p50, open, close) in [
+            // A router at 10.5ms opens at twice its mean. The flat 5ms this
+            // replaces was under anything it ever answers in.
+            (Some((10.5, 0.3)), 60.0, 21.0, 16.8),
+            // Over the ceiling too, but the baseline's line is the lower of
+            // the two it crossed: the issue opened there, not at 100ms.
+            (Some((10.5, 0.3)), 150.0, 21.0, 16.8),
+            // A LAN resolver opens 5ms above its mean.
+            (Some((1.2, 0.05)), 7.0, 6.2, 4.96),
+            // A noisy one: 2σ above its mean is over 0.8 of its line, 17.6ms,
+            // and a close line inside its normal range would never hold.
+            (Some((10.0, 4.0)), 25.0, 22.0, 18.0),
+            // Twice an 80ms mean is 160ms, so the ceiling opens it.
+            (Some((80.0, 5.0)), 120.0, 100.0, 90.0),
+            // No baseline: 0.8 of the ceiling.
+            (None, 160.0, 100.0, 80.0),
+        ] {
+            let line = close_line(baseline, p50, &t);
+            assert!(
+                (line - close).abs() < 1e-9,
+                "{baseline:?} at {p50}ms closes under {line}, not {close}"
+            );
+            assert!(line < open, "{baseline:?}: {line} is not below {open}");
+        }
+        // The exception: a resolver whose normal range reaches the ceiling.
+        // Its mean plus 2σ, 110ms, is over the 100ms it opened on, so it
+        // closes once its p50 has stayed under the ceiling for the hold.
+        let line = close_line(Some((90.0, 10.0)), 120.0, &t);
+        assert!((line - 110.0).abs() < 1e-9, "{line}");
+        assert!(line > t.dns_ceiling_ms);
+
+        // The catalogue's line is the one with no baseline.
+        let catalogued = rules::default_verify("dns.slow_resolver").unwrap();
+        assert_eq!(catalogued.threshold, close_line(None, 160.0, &t));
+        // A configured ceiling moves it.
+        let low = Thresholds {
+            dns_ceiling_ms: 30.0,
+            ..t
+        };
+        assert!((close_line(None, 40.0, &low) - 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_gateway_moving_2_to_9ms_does_not_fire_but_2_to_15ms_does() {
+        // A wired gateway at 2ms, give or take 0.3: 9ms is 14σ over the
+        // floor but 7ms slower; 15ms is 13ms slower.
+        let mut base = store();
+        base.seed("192.168.8.1", "gateway.rtt", 2.0, 0.3, 2_000);
+        let spike = |rtt: f64, t: &Thresholds| {
+            let obs = Observations {
+                gateway: Some(GatewayObs {
+                    addr: Some("192.168.8.1".into()),
+                    rtt_ms: Some(rtt),
+                    loss_pct: 0.0,
+                    arp_ok: Some(true),
+                    icmp_ok: true,
+                    internet_reachable: Some(true),
+                }),
+                ..Default::default()
+            };
+            rules_of(&detect(&obs, &base, t)).contains(&"gateway.rtt_spike")
+        };
+        let t = Thresholds::default();
+        assert!(!spike(9.0, &t));
+        assert!(spike(15.0, &t));
+        let no_delta = Thresholds {
+            gateway_delta_floor_ms: 0.0,
+            ..t
+        };
+        assert!(spike(9.0, &no_delta), "only the 10ms floor holds it back");
+    }
+
+    #[test]
+    fn a_lowered_dns_ceiling_fires_where_the_default_does_not() {
+        // A 40ms resolver on a first run, with no baseline: under the 100ms
+        // default it is ordinary, under a configured 30ms ceiling it is slow.
+        let obs = obs_with_dns(slow_dns());
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"dns.slow_resolver"));
+
+        let t = Thresholds {
+            dns_ceiling_ms: 30.0,
+            ..Thresholds::default()
+        };
+        let found = detect(&obs, &store(), &t);
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("40ms is over a 30ms ceiling");
+        assert_eq!(d.evidence[0].value, 40.0);
+        assert!(d.evidence[0].baseline.is_none());
+    }
+
+    #[test]
+    fn an_invalid_threshold_falls_back_to_its_default() {
+        let default = Thresholds::default();
+        assert_eq!(default.validated(), (default, vec![]));
+
+        let (t, warnings) = Thresholds {
+            sigma_k: 0.0,
+            sigma_close_k: f64::NAN,
+            sigma_floor_ms: -0.5,
+            gateway_delta_floor_ms: -10.0,
+            consecutive_n: 0,
+            saturation_pct: 150.0,
+            dns_tc_pct: -1.0,
+            dns_ceiling_ms: f64::NAN,
+            // TOML reads `inf`, a natural way to switch a rule off, but an
+            // episode that embeds it would not load again.
+            loaded_rtt_delta_ms: f64::INFINITY,
+            iface_drop_floor: f64::NEG_INFINITY,
+            // Valid values that are not the defaults are kept, the edges
+            // of a share included.
+            sigma_floor_pct: 0.0,
+            dns_delta_floor_ms: 0.0,
+            dns_delta_multiple: 0.0,
+            dns_mismatch_pct: 100.0,
+            wifi_retry_pct: 0.0,
+            wifi_rssi_dbm: -80.0,
+            socket_rtt_ms: 0.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(
+            t,
+            Thresholds {
+                sigma_floor_pct: 0.0,
+                dns_delta_floor_ms: 0.0,
+                dns_delta_multiple: 0.0,
+                dns_mismatch_pct: 100.0,
+                wifi_retry_pct: 0.0,
+                wifi_rssi_dbm: -80.0,
+                socket_rtt_ms: 0.0,
+                ..default
+            }
+        );
+        assert_eq!(
+            warnings,
+            [
+                "diagnose_thresholds.sigma_k = 0 must be a finite number above 0, so the default 3 is used",
+                "diagnose_thresholds.sigma_close_k = NaN must be a finite number above 0, so the default 2 is used",
+                "diagnose_thresholds.sigma_floor_ms = -0.5 must be a finite number of 0 or more, so the default 0.5 is used",
+                "diagnose_thresholds.gateway_delta_floor_ms = -10 must be a finite number of 0 or more, so the default 10 is used",
+                "diagnose_thresholds.dns_ceiling_ms = NaN must be a finite number, so the default 100 is used",
+                "diagnose_thresholds.loaded_rtt_delta_ms = inf must be a finite number, so the default 100 is used",
+                "diagnose_thresholds.saturation_pct = 150 must be within 0..=100, so the default 90 is used",
+                "diagnose_thresholds.iface_drop_floor = -inf must be a finite number, so the default 60 is used",
+                "diagnose_thresholds.dns_tc_pct = -1 must be within 0..=100, so the default 10 is used",
+                "diagnose_thresholds.consecutive_n = 0 must be at least 1, so the default 3 is used",
+            ]
+        );
+
+        let (t, warnings) = Thresholds {
+            sigma_k: f64::INFINITY,
+            ..default
+        }
+        .validated();
+        assert_eq!(t, default);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_k = inf must be a finite number above 0, so the default 3 is used"]
+        );
+    }
+
+    #[test]
+    fn a_close_line_at_or_above_the_open_line_is_refused() {
+        let default = Thresholds::default();
+        let (t, warnings) = Thresholds {
+            sigma_close_k: 3.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(t, default);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 3 must be below sigma_k = 3, so the default 2 is used"]
+        );
+
+        // A sigma_k lowered below the default close line takes the close
+        // line down with it, in the defaults' proportion.
+        let (t, warnings) = Thresholds {
+            sigma_k: 1.5,
+            ..default
+        }
+        .validated();
+        assert_eq!((t.sigma_k, t.sigma_close_k), (1.5, 1.0));
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 2 must be below sigma_k = 1.5, so 1, two thirds of it, is used"]
+        );
+
+        // The warning rounds what it reports; the value is not rounded.
+        let (t, warnings) = Thresholds {
+            sigma_k: 2.0,
+            ..default
+        }
+        .validated();
+        assert_eq!(t.sigma_close_k, 2.0 * 2.0 / 3.0);
+        assert_eq!(
+            warnings,
+            ["diagnose_thresholds.sigma_close_k = 2 must be below sigma_k = 2, so 1.33, two thirds of it, is used"]
+        );
+
+        // Any line below the open one stands.
+        let (t, warnings) = Thresholds {
+            sigma_k: 4.0,
+            sigma_close_k: 3.5,
+            ..default
+        }
+        .validated();
+        assert_eq!((t.sigma_k, t.sigma_close_k), (4.0, 3.5));
+        assert!(warnings.is_empty());
+    }
+
     #[test]
     fn failing_dns_replaces_slow_dns_rather_than_joining_it() {
         let mut base = store();
@@ -4228,7 +4832,7 @@ mod tests {
         let base = fixture::baselines();
         let found = detect(&obs, &base, &Thresholds::default());
         assert!(!rules_of(&found).contains(&"link.down"));
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let link_down = coverage
             .rules
             .iter()
@@ -4341,7 +4945,11 @@ mod tests {
             iface: Some(uncounted_drops(3)),
             ..Default::default()
         };
-        let coverage = crate::diagnose::coverage::Coverage::from_observations(&obs, &store());
+        let coverage = crate::diagnose::coverage::Coverage::from_observations(
+            &obs,
+            &store(),
+            Default::default(),
+        );
         let row = coverage
             .rules
             .iter()
@@ -4549,7 +5157,7 @@ mod tests {
         }
 
         let coverage_of = |dns: DnsObs| {
-            Coverage::from_observations(&obs_with_dns(dns), &store())
+            Coverage::from_observations(&obs_with_dns(dns), &store(), Default::default())
                 .rules
                 .into_iter()
                 .find(|r| r.rule == "dns.slow_resolver")
@@ -5209,6 +5817,13 @@ mod tests {
                 traced_at: "2026-09-14 09:59:30".into(),
             }],
             idle_rtt_ms: Some(18.0),
+            config: Some(ObservedConfig {
+                resolvers: Some(vec!["192.168.8.1".into(), "fe80::1%wlan0".into()]),
+                targets: vec![("api".into(), "target-config:0123abcd".into())],
+                trace_target: "1.1.1.1".into(),
+                trace_refresh_secs: Some(120),
+                interfaces: Some(vec!["lo".into(), "wlan0".into()]),
+            }),
             ..Default::default()
         };
         let json = serde_json::to_string(&obs).unwrap();
@@ -5216,6 +5831,11 @@ mod tests {
         // A recording from before a field existed still loads.
         let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
         assert_eq!(old.now, "2026-09-14 10:00:00");
+        // Without a configuration it is unknown, not empty, and a sample
+        // that has none writes nothing for it.
+        assert_eq!(old.config, None);
+        let unknown = serde_json::to_value(&old).unwrap();
+        assert!(unknown.get("config").is_none(), "{unknown}");
     }
 
     #[test]
@@ -5375,7 +5995,7 @@ mod target_tests {
         let d = detect_one(t);
         assert_eq!(d.causes[0].id, "name_does_not_exist");
         assert_eq!(d.severity, Severity::Info);
-        assert_eq!(d.scope.note.as_deref(), Some("not a network fault"));
+        assert_eq!(d.scope.note.as_deref(), Some("service, not network"));
     }
 
     #[test]
@@ -5445,6 +6065,8 @@ mod target_tests {
         assert_eq!(d.causes[0].id, "tls_intercepting_proxy");
     }
 
+    /// An Observation on the Diagnose tab. `diagnose run --target api`
+    /// counts it as an Issue (D33-B07).
     #[test]
     fn a_503_is_the_service_not_the_network() {
         let mut t = healthy();
@@ -5454,6 +6076,7 @@ mod target_tests {
         assert_eq!(d.rule, "target.http_error");
         assert_eq!(d.causes[0].id, "service_error");
         assert_eq!(d.severity, Severity::Info);
+        assert_eq!(d.scope.note.as_deref(), Some("service, not network"));
     }
 
     #[test]
@@ -5517,6 +6140,78 @@ mod target_tests {
             })
             .unwrap();
         assert_eq!(top.id, "server_stage_slow");
+
+        // The evidence carries the σ the stage was judged against. It used to
+        // carry 0, and the report printed "σ0".
+        let ev = &d.evidence[0];
+        assert_eq!(ev.metric, "target.first_byte_ms");
+        assert_eq!((ev.baseline, ev.sigma), (Some(40.0), Some(4.0)));
+        // A first byte that never varied is judged, and reported, against the
+        // floor.
+        base.seed("api", "target.ttfb_ms", 5.0, 0.1, 2_400);
+        let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+        assert_eq!(d.evidence[0].sigma, Some(0.5));
+    }
+
+    /// `default_verify` cannot read `Thresholds`, so each σ rule's detector
+    /// sets its own close line. 1.5 is not the default, so a line of 1.5
+    /// came from the configuration.
+    #[test]
+    fn the_sigma_rules_close_on_the_configured_close_line() {
+        let mut base = crate::diagnose::fixture::baselines();
+        base.seed("192.168.8.1", "gateway.rtt", 2.0, 0.3, 2_400);
+        base.seed("internet", "path.rtt", 10.0, 1.0, 2_400);
+        base.seed("api", "target.ttfb_ms", 40.0, 4.0, 2_400);
+        let mut target = healthy();
+        target.http_stage = ok(900.0);
+        let obs = Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: Some(40.0),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            paths: vec![PathObs {
+                target: "1.1.1.1".into(),
+                hops: vec![HopObs {
+                    number: 1,
+                    ip: Some("1.1.1.1".into()),
+                    asn: None,
+                    rtt_p50_ms: Some(90.0),
+                    rtt_p95_ms: Some(95.0),
+                    loss_pct: 0.0,
+                    silent: false,
+                }],
+                previous: None,
+                traced_at: "2026-09-14 09:59:30".into(),
+                destination_reached: Some(true),
+            }],
+            targets: vec![target],
+            ..Default::default()
+        };
+        let t = Thresholds {
+            sigma_close_k: 1.5,
+            ..Thresholds::default()
+        };
+        let found = detect(&obs, &base, &t);
+        for rule in ["gateway.rtt_spike", "path.rtt_spike", "target.slow_stage"] {
+            let d = found
+                .iter()
+                .find(|d| d.rule == rule)
+                .unwrap_or_else(|| panic!("{rule} should fire: {found:#?}"));
+            let catalogued = rules::default_verify(rule).unwrap();
+            assert_eq!(catalogued.threshold, Thresholds::default().sigma_close_k);
+            assert_eq!(
+                d.verify,
+                Verify {
+                    threshold: 1.5,
+                    ..catalogued
+                },
+                "{rule}"
+            );
+        }
     }
 
     #[test]

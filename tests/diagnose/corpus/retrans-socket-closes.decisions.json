@@ -1,0 +1,13 @@
+{
+  "episode": "retrans-socket-closes",
+  "frames": 421,
+  "issues": [
+    {
+      "key": "tcp.retrans_burst|10.88.0.2:48210 → 203.0.113.20:22",
+      "opened": "2026-09-03 06:46:32",
+      "closed": "2026-09-03 06:50:00",
+      "top_cause": "tcp.retrans_burst/packet_loss",
+      "close_reason": "expired"
+    }
+  ]
+}

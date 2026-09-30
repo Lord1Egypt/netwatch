@@ -83,6 +83,15 @@ fn endpoint(raw: &str) -> Result<url::Url, String> {
     Ok(u)
 }
 impl Config {
+    /// Seconds between automatic traces, or `None` when they do not run:
+    /// no interval, one outside 30–3600, or a trace target that is not an
+    /// IP address.
+    pub fn periodic_trace_secs(&self) -> Option<u64> {
+        self.trace_refresh_secs
+            .filter(|s| (30..=3600).contains(s))
+            .filter(|_| self.trace_target.parse::<std::net::IpAddr>().is_ok())
+    }
+
     pub fn validate(&self, rule: &str) -> Result<(), String> {
         match rule {
             "ipv6.broken" => {

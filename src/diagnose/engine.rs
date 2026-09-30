@@ -12,11 +12,11 @@
 //! stable, human-sized list of findings happens here.
 
 use chrono::{DateTime, Duration, Local, TimeZone};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::baseline::BaselineStore;
+use super::baseline::{BaselineStore, SigmaFloor};
 use super::detectors::{self, Detection, Observations, Thresholds};
-use super::issue::{Issue, IssueId, IssueState, Severity};
+use super::issue::{Issue, IssueId, IssueState, Kind, Severity};
 use super::rules;
 
 /// Time source. A trait so the fixture and the tests can pin the clock and
@@ -127,6 +127,104 @@ fn sample_time(
     }
 }
 
+/// Why an open issue's subject has gone away, or `None` while it may still be
+/// there. Gone is a positive finding about the subject, never an absence of
+/// readings about it: an unmeasured gateway, a stale probe or a collector
+/// that did not run leaves the issue open, however long it lasts.
+///
+/// | Subject | Gone when |
+/// |---|---|
+/// | Socket | the sockets collector is fresh (≤ 30 s), the rule's coverage is available or has no subjects, and no socket matches |
+/// | Target | its name has left the config, or no entry under its name has the revision the issue was found under |
+/// | Resolver | it has left the system resolvers, and so has any resolver an applied step switched to |
+/// | Path (`path.*`) | it was the periodic trace target while open, periodic tracing is still on, and the trace target is now another |
+/// | Iface | the interface collector is fresh (≤ 15 s) and does not read it, and the platform no longer lists it |
+/// | Host, anything else, or no recorded config | never |
+///
+/// The returned reason is authored text, never the subject's name, because
+/// redacted exports keep a state verbatim.
+fn subject_gone(
+    issue: &Issue,
+    obs: &Observations,
+    coverage: &super::coverage::Coverage,
+    live: Option<(&ObservationTimes, std::time::Instant)>,
+    periodic_path: bool,
+) -> Option<&'static str> {
+    use super::coverage::Availability;
+    use super::issue::Subject;
+    // A recording from before the configuration was recorded, or a frame
+    // built without one: unknown, which never expires anything.
+    let config = obs.config.as_ref()?;
+    let fresh = |at: fn(&ObservationTimes) -> Option<std::time::Instant>, max_secs| {
+        live.is_some_and(|(times, now)| {
+            crate::collectors::health::ProbeTimes::fresh_at(at(times), max_secs, now)
+        })
+    };
+    match &issue.subject {
+        Subject::Socket { local, remote } => {
+            // The collector listed every socket it could see, just now.
+            let listed = coverage.rules.iter().any(|r| {
+                r.rule == issue.rule
+                    && matches!(r.status, Availability::Available | Availability::NoSubjects)
+            });
+            let open = obs
+                .sockets
+                .iter()
+                .any(|s| &s.local == local && &s.remote == remote);
+            (fresh(|t| t.sockets, 30) && listed && !open).then_some("socket closed")
+        }
+        Subject::Target { name } => {
+            let mut revisions = config
+                .targets
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, r)| r)
+                .peekable();
+            if revisions.peek().is_none() {
+                Some("target removed from the config")
+            } else if let Some(found) = &issue.scope.configuration {
+                // A duplicated name is a config error netwatch reports, and
+                // one entry still carrying this revision keeps the subject.
+                (!revisions.any(|r| r == found)).then_some("target configuration changed")
+            } else {
+                None
+            }
+        }
+        Subject::Resolver { addr } => {
+            let resolvers = config.resolvers.as_ref()?;
+            let listed = |a: &str| resolvers.iter().any(|r| r == a);
+            (!listed(addr) && !replacement_resolvers(issue).any(listed))
+                .then_some("resolver left the config")
+        }
+        Subject::Path { target } if issue.rule.starts_with("path.") => {
+            (periodic_path && config.trace_refresh_secs.is_some() && &config.trace_target != target)
+                .then_some("trace target changed")
+        }
+        Subject::Iface { name } => {
+            // The list lags the collector, and on Windows may name adapters
+            // differently, so a fresh reading of the interface keeps it.
+            let listed = config.interfaces.as_ref()?.contains(name)
+                || obs.iface.as_ref().is_some_and(|i| &i.name == name);
+            (!listed && fresh(|t| t.interface, 15)).then_some("interface removed")
+        }
+        _ => None,
+    }
+}
+
+/// Resolvers an applied step switched this issue's lookups to. Their results
+/// stand in for the original resolver's, so they can verify its issue and
+/// keep its subject from counting as gone.
+fn replacement_resolvers(issue: &Issue) -> impl Iterator<Item = &str> {
+    use super::issue::{Action, Applied};
+    issue
+        .remediation
+        .iter()
+        .filter_map(|step| match (&step.action, &step.applied) {
+            (Some(Action::SetResolver { addr }), Some(Applied::Yes { .. })) => Some(addr.as_str()),
+            _ => None,
+        })
+}
+
 pub fn format_ts(dt: DateTime<Local>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -142,6 +240,19 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Local>> {
         .and_then(|n| Local.from_local_datetime(&n).single())
 }
 
+/// Whether a mute that ends at `until`, a stamp like [`parse_ts`] reads, is
+/// over at `now`. The stamp carries no offset, so in the hour a clock goes
+/// back it names two instants, and [`parse_ts`] returns neither. This takes
+/// the later: at worst the mute lasts an hour longer, where returning neither
+/// ended it on the next tick. A stamp that does not parse has ended: a mute
+/// that never ends would hide the issue for good.
+fn mute_over<Tz: TimeZone>(until: &str, now: &DateTime<Tz>) -> bool {
+    chrono::NaiveDateTime::parse_from_str(until, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|n| now.timezone().from_local_datetime(&n).latest())
+        .is_none_or(|u| u <= *now)
+}
+
 /// How long after closing a recurrence reopens the same issue instead of
 /// filing a new one. Flapping should read as one problem with a count.
 const RECURRENCE_WINDOW_MINS: i64 = 30;
@@ -150,8 +261,14 @@ const RECURRENCE_WINDOW_MINS: i64 = 30;
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub thresholds: Thresholds,
-    /// How long a resolved condition must stay resolved before auto-closing.
-    pub auto_close_secs: u64,
+    /// How long an issue's subject must stay gone before the issue closes as
+    /// [`IssueState::Expired`]. Recovery is the verify condition's business
+    /// (`Verify::hold_secs`); this is only about absence.
+    ///
+    /// Episodes recorded before 0.34 call it `auto_close_secs`; nothing read
+    /// it then.
+    #[serde(alias = "auto_close_secs")]
+    pub expire_after_secs: u64,
     /// Closed issues kept for the report and the timeline.
     pub history_limit: usize,
 }
@@ -160,7 +277,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             thresholds: Thresholds::default(),
-            auto_close_secs: 300,
+            expire_after_secs: 60,
             history_limit: 50,
         }
     }
@@ -191,8 +308,8 @@ pub struct ObservationTimes {
 /// Something done to an issue from outside the detection loop: a user action,
 /// or (later) a diagnostic test result. Logged so an episode can replay it.
 ///
-/// Events name issues by `rule|subject` rather than id, because a replayed
-/// engine numbers its issues independently.
+/// Events name issues by key ([`super::issue::finding_key`]) rather than
+/// id, because a replayed engine numbers its issues independently.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EngineEvent {
@@ -222,6 +339,20 @@ pub enum EngineEvent {
         step: usize,
         at: String,
     },
+}
+
+impl EngineEvent {
+    /// The key of the issue this event is about.
+    pub fn issue_mut(&mut self) -> &mut String {
+        match self {
+            EngineEvent::Acked { issue }
+            | EngineEvent::Muted { issue, .. }
+            | EngineEvent::Resolved { issue, .. }
+            | EngineEvent::Applied { issue, .. }
+            | EngineEvent::TestCompleted { issue, .. }
+            | EngineEvent::StepDone { issue, .. } => issue,
+        }
+    }
 }
 
 /// No target result newer than this means target rules have no input.
@@ -260,6 +391,13 @@ pub struct Engine {
     seq: u32,
     coverage: super::coverage::Coverage,
     verification_samples: HashMap<IssueId, (std::time::Instant, std::time::Instant)>,
+    /// When an open issue's subject was first seen gone; see
+    /// [`subject_gone`]. Cleared the moment it is not.
+    gone_since: HashMap<IssueId, DateTime<Local>>,
+    /// Path issues whose target was the periodic trace target on some tick
+    /// while they were open. Only these can expire when the trace target
+    /// changes: a path traced by hand was never going to be traced again.
+    periodic_paths: HashSet<IssueId>,
     /// Conditions detected but not yet open, by `Detection::key()`.
     pending: HashMap<String, Pending>,
     /// Events since the last [`Engine::take_events`].
@@ -277,6 +415,8 @@ impl Engine {
             seq: 0,
             coverage: Default::default(),
             verification_samples: HashMap::new(),
+            gone_since: HashMap::new(),
+            periodic_paths: HashSet::new(),
             pending: HashMap::new(),
             events: Vec::new(),
         }
@@ -300,8 +440,46 @@ impl Engine {
     }
 
     /// Findings to show: open, and not a consequence of another open issue.
+    /// Both kinds, in the order the Diagnose tab lists them; replay records
+    /// this list, so it is not narrowed to either kind.
     pub fn primary(&self) -> Vec<&Issue> {
-        rules::primary_issues(&self.issues)
+        rules::primary_findings(&self.issues)
+    }
+
+    /// The primary findings that are Issues: what the verdict line counts.
+    pub fn primary_issues(&self) -> Vec<&Issue> {
+        self.primary_of(Kind::Issue)
+    }
+
+    /// The primary findings that are Observations.
+    pub fn primary_observations(&self) -> Vec<&Issue> {
+        self.primary_of(Kind::Observation)
+    }
+
+    fn primary_of(&self, kind: Kind) -> Vec<&Issue> {
+        self.primary()
+            .into_iter()
+            .filter(|i| i.kind() == kind)
+            .collect()
+    }
+
+    /// The Observations the verdict line leaves out, counted the way it counts
+    /// Issues. Nothing draws it yet; it lives here so the surface that does
+    /// cannot count differently from the verdict.
+    pub fn observation_count(&self) -> usize {
+        self.primary_observations()
+            .into_iter()
+            .filter(|i| !matches!(i.state, IssueState::Muted { .. }))
+            .count()
+    }
+
+    /// The Issues the verdict line leaves out because they are muted, so the
+    /// line that stops counting them can say how many it left out.
+    pub fn muted_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|i| i.state.muted_until().is_some() && i.kind() == Kind::Issue)
+            .count()
     }
 
     pub fn open_count(&self) -> usize {
@@ -314,6 +492,12 @@ impl Engine {
 
     pub fn get(&self, id: &str) -> Option<&Issue> {
         self.issues.iter().find(|i| i.id == id)
+    }
+
+    /// The issue filed under a key ([`super::issue::finding_key`]): the open
+    /// one, or the last to close. `None` once history pruning has dropped it.
+    pub fn get_by_key(&self, key: &str) -> Option<&Issue> {
+        self.by_key.get(key).and_then(|id| self.get(id))
     }
 
     /// One tick. Detections are merged into the existing list, issues whose
@@ -392,7 +576,7 @@ impl Engine {
         if !fresh(times.egress, 30) {
             observed.egress = None;
         }
-        self.observe_inner(&observed, base, Some(times));
+        self.observe_inner(&observed, base, Some((times, now)));
         self.coverage.mark_stale_probes(&times.health, now);
         for row in &mut self.coverage.rules {
             if matches!(
@@ -443,14 +627,21 @@ impl Engine {
         }
     }
 
+    /// `live` is the collectors' completion times and the instant they are
+    /// judged at, when the caller has them.
     fn observe_inner(
         &mut self,
         obs: &Observations,
         base: &BaselineStore,
-        times: Option<&ObservationTimes>,
+        live: Option<(&ObservationTimes, std::time::Instant)>,
     ) {
-        self.coverage = super::coverage::Coverage::from_observations(obs, base);
+        self.coverage = super::coverage::Coverage::from_observations(
+            obs,
+            base,
+            self.settings.thresholds.sigma_floor(),
+        );
         let now = self.clock.now();
+        self.end_mutes(now);
         let detections: Vec<_> = detectors::detect(obs, base, &self.settings.thresholds)
             .into_iter()
             .filter(|d| {
@@ -463,15 +654,15 @@ impl Engine {
         self.pending.retain(|key, _| seen.contains(key));
 
         for d in detections {
-            if self.is_open_key(&d.key()) {
+            if self.is_tracked_key(&d.key()) {
                 self.merge(d, now, now);
-            } else if let Some(since) = self.confirmed(&d, times, now) {
+            } else if let Some(since) = self.confirmed(&d, live.map(|(t, _)| t), now) {
                 self.pending.remove(&d.key());
                 self.merge(d, now, since);
             }
         }
 
-        self.age_unseen(&seen, obs, base, now, times);
+        self.age_unseen(&seen, obs, base, now, live);
         self.decide_verifications(now);
 
         rules::apply_suppression(&mut self.issues);
@@ -479,11 +670,26 @@ impl Engine {
         self.prune();
     }
 
-    fn is_open_key(&self, key: &str) -> bool {
-        self.by_key
-            .get(key)
-            .and_then(|id| self.issues.iter().find(|i| &i.id == id))
-            .is_some_and(|i| i.state.is_open())
+    /// Whether `key` already has an issue the engine is watching. A muted
+    /// issue counts: its condition coming back each tick is the same issue,
+    /// not a new one to confirm and file beside it.
+    fn is_tracked_key(&self, key: &str) -> bool {
+        self.get_by_key(key).is_some_and(|i| i.state.is_tracked())
+    }
+
+    /// Return every issue whose mute has run out to Open. Read from the clock,
+    /// not a timer, so a replayed episode ends each mute on the frame the live
+    /// engine did.
+    fn end_mutes(&mut self, now: DateTime<Local>) {
+        for issue in &mut self.issues {
+            let ended = issue
+                .state
+                .muted_until()
+                .is_some_and(|until| mute_over(until, &now));
+            if ended {
+                issue.state = IssueState::Open;
+            }
+        }
     }
 
     /// Hysteresis for a condition that isn't open yet: it has to hold for
@@ -524,21 +730,38 @@ impl Engine {
 
     /// `since` is when the condition was first seen: `now` for an issue that
     /// is already open, earlier for one that just passed hysteresis.
+    ///
+    /// The verify condition is the one the detection carried when the issue
+    /// opened or reopened. A close line derived from the metric and taken
+    /// afresh every tick would move with the value it judges, and the issue
+    /// could chase it forever. A merge that changes the severity keeps it
+    /// too, so an issue that escalates from Info keeps the verify it opened
+    /// with.
     fn merge(&mut self, d: Detection, now: DateTime<Local>, since: DateTime<Local>) {
         let key = d.key();
         let ts = format_ts(now);
 
         if let Some(id) = self.by_key.get(&key).cloned() {
             if let Some(idx) = self.issues.iter().position(|i| i.id == id) {
-                let reopening = !self.issues[idx].state.is_open();
+                // A muted issue is not reopening: its mute has not ended, or
+                // `end_mutes` would have made it Open already.
+                let reopening = !self.issues[idx].state.is_tracked();
                 let issue = &mut self.issues[idx];
 
                 if reopening {
                     // Within the recurrence window this is the same problem
                     // coming back, so it keeps its id and gains a count.
                     // Outside it, the old issue stays closed and we file new.
+                    // An expired issue counts too: a resolver that left the
+                    // config and came back still slow is the same problem.
+                    // A target's key carries its revision, so this never
+                    // crosses an edit. An entry put back to the revision
+                    // the issue was found under probes the same endpoint the
+                    // same way, and is this problem coming back.
                     let closed_at = match &issue.state {
-                        IssueState::Resolved { at } | IssueState::AutoClosed { at } => parse_ts(at),
+                        IssueState::Resolved { at }
+                        | IssueState::AutoClosed { at }
+                        | IssueState::Expired { at, .. } => parse_ts(at),
                         _ => None,
                     };
                     let within = closed_at
@@ -555,15 +778,18 @@ impl Engine {
                     }
                 }
 
-                // A muted issue keeps accruing evidence silently; it just
-                // doesn't reach the verdict line.
+                // A muted issue keeps accruing evidence silently and stays
+                // muted; it just doesn't reach the verdict line.
                 issue.last_seen = ts.clone();
+                issue.stale_since = None;
                 issue.severity = d.severity;
                 issue.title = d.title;
                 issue.evidence = d.evidence;
                 issue.causes = d.causes;
                 issue.scope = d.scope;
-                issue.verify = d.verify;
+                if reopening {
+                    issue.verify = d.verify;
+                }
                 // Preserve applied outcomes across ticks: a step the user
                 // already ran must keep saying so.
                 merge_remediation(&mut issue.remediation, d.remediation);
@@ -572,6 +798,7 @@ impl Engine {
                 super::next_test::apply(issue, &ts);
                 self.verifying_since.remove(&id);
                 self.verification_samples.remove(&id);
+                self.gone_since.remove(&id);
                 return;
             }
             self.by_key.remove(&key);
@@ -593,6 +820,7 @@ impl Engine {
             subject: d.subject,
             since: format_ts(since),
             last_seen: ts,
+            stale_since: None,
             state: IssueState::Open,
             evidence: d.evidence,
             scope: d.scope,
@@ -615,36 +843,76 @@ impl Engine {
     /// checked against live metrics; once it has held for `hold_secs` the
     /// issue auto-closes. Until then it stays open — a metric dipping under
     /// the threshold for one sample is not a fix.
+    ///
+    /// An issue whose subject has gone, per [`subject_gone`], for
+    /// `expire_after_secs` closes as Expired instead. One whose evidence has
+    /// only stopped arriving stays open and records `stale_since`: a probe
+    /// that cannot run looks just like a fault that has not cleared.
+    ///
+    /// Muted issues age like open ones. A mute quiets an issue; it does not
+    /// stop netwatch watching it clear.
     fn age_unseen(
         &mut self,
         seen: &[String],
         obs: &Observations,
         base: &BaselineStore,
         now: DateTime<Local>,
-        times: Option<&ObservationTimes>,
+        live: Option<(&ObservationTimes, std::time::Instant)>,
     ) {
         let mut closed: Vec<IssueId> = Vec::new();
+        let floor = self.settings.thresholds.sigma_floor();
+        // A replayed episode's settings come from its file unchecked, and
+        // one too long for a Duration means never.
+        let expire_after = i64::try_from(self.settings.expire_after_secs)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .unwrap_or(Duration::MAX);
         for issue in self.issues.iter_mut() {
-            if !issue.state.is_open() {
+            if !issue.state.is_tracked() {
                 continue;
             }
-            let key = format!("{}|{}", issue.rule, issue.subject.label());
-            if seen.contains(&key) {
+            if let (super::issue::Subject::Path { target }, Some(config)) =
+                (&issue.subject, &obs.config)
+            {
+                if config.trace_refresh_secs.is_some() && &config.trace_target == target {
+                    self.periodic_paths.insert(issue.id.clone());
+                }
+            }
+            if seen.contains(&issue.key()) {
                 continue;
+            }
+
+            let periodic = self.periodic_paths.contains(&issue.id);
+            match subject_gone(issue, obs, &self.coverage, live, periodic) {
+                Some(reason) => {
+                    let since = *self.gone_since.entry(issue.id.clone()).or_insert(now);
+                    if now - since >= expire_after {
+                        issue.state = IssueState::Expired {
+                            at: format_ts(now),
+                            reason: reason.into(),
+                        };
+                        closed.push(issue.id.clone());
+                        continue;
+                    }
+                }
+                None => {
+                    self.gone_since.remove(&issue.id);
+                }
             }
 
             let mut scoped = obs.clone();
             match &issue.subject {
                 super::issue::Subject::Resolver { addr } => {
-                    scoped.dns = scoped.dns.filter(|d| &d.resolver == addr || issue.remediation.iter().any(|step| {
-                        matches!((&step.action, &step.applied),
-                            (Some(super::issue::Action::SetResolver { addr: replacement }), Some(super::issue::Applied::Yes { .. }))
-                            if replacement == &d.resolver)
-                    }))
+                    scoped.dns = scoped.dns.filter(|d| {
+                        &d.resolver == addr || replacement_resolvers(issue).any(|r| r == d.resolver)
+                    })
                 }
                 super::issue::Subject::Path { target } => {
                     scoped.paths.retain(|p| &p.target == target);
-                    scoped.active.pmtu = scoped.active.pmtu.filter(|p| p.target.as_ref() == Some(target))
+                    scoped.active.pmtu = scoped
+                        .active
+                        .pmtu
+                        .filter(|p| p.target.as_ref() == Some(target))
                 }
                 super::issue::Subject::Socket { local, remote } => scoped
                     .sockets
@@ -652,27 +920,36 @@ impl Engine {
                 super::issue::Subject::Iface { name } => {
                     scoped.iface = scoped.iface.filter(|i| &i.name == name)
                 }
-                super::issue::Subject::Target { name } => {
-                    scoped.targets.retain(|t| &t.name == name && (issue.scope.configuration.is_none() || issue.scope.configuration == t.baseline_key))
-                }
+                super::issue::Subject::Target { name } => scoped.targets.retain(|t| {
+                    &t.name == name
+                        && (issue.scope.configuration.is_none()
+                            || issue.scope.configuration == t.baseline_key)
+                }),
                 _ => {}
             }
             let mut values = metric_values(&scoped);
-            add_sigma_metrics(&mut values, &scoped, base);
-            let holding = if issue.rule.starts_with("egress.") {
-                obs.egress
+            add_sigma_metrics(&mut values, &scoped, base, floor);
+            let available = self.coverage.rules.iter().any(|r| {
+                r.rule == issue.rule && r.status == super::coverage::Availability::Available
+            });
+            let (measured, holding) = if issue.rule.starts_with("egress.") {
+                let recovered = obs
+                    .egress
                     .as_ref()
-                    .and_then(|o| o.recovered(&issue.subject, &issue.rule))
-                    == Some(true)
+                    .and_then(|o| o.recovered(&issue.subject, &issue.rule));
+                (recovered.is_some(), recovered == Some(true))
             } else {
-                self.coverage.rules.iter().any(|r| {
-                    r.rule == issue.rule && r.status == super::coverage::Availability::Available
-                }) && match values.get(&issue.verify.metric) {
-                    Some(v) => issue.verify.holds(*v),
+                match values.get(&issue.verify.metric) {
+                    Some(v) => (true, available && issue.verify.holds(*v)),
                     // Missing evidence is not recovery; reset the hold timer.
-                    None => false,
+                    None => (false, false),
                 }
             };
+            if available && measured {
+                issue.stale_since = None;
+            } else if issue.stale_since.is_none() {
+                issue.stale_since = Some(format_ts(now));
+            }
 
             if !holding {
                 self.verifying_since.remove(&issue.id);
@@ -681,7 +958,7 @@ impl Engine {
             }
 
             let mut live_held = None;
-            if let Some(times) = times {
+            if let Some((times, _)) = live {
                 if let Some(sample) = sample_time(&issue.rule, &issue.subject, times) {
                     let Some(sample) = sample else {
                         self.verifying_since.remove(&issue.id);
@@ -732,6 +1009,8 @@ impl Engine {
         for id in closed {
             self.verifying_since.remove(&id);
             self.verification_samples.remove(&id);
+            self.gone_since.remove(&id);
+            self.periodic_paths.remove(&id);
         }
     }
 
@@ -747,12 +1026,15 @@ impl Engine {
         });
     }
 
+    /// Drops the oldest closed issues past `history_limit`. A muted issue is
+    /// not history: pruning it would drop its key, and the next detection of
+    /// its condition would file a second issue.
     fn prune(&mut self) {
         let closed: Vec<usize> = self
             .issues
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.state.is_open())
+            .filter(|(_, i)| !i.state.is_tracked())
             .map(|(n, _)| n)
             .collect();
         if closed.len() <= self.settings.history_limit {
@@ -770,6 +1052,8 @@ impl Engine {
         self.verifying_since.retain(|id, _| !doomed.contains(id));
         self.verification_samples
             .retain(|id, _| !doomed.contains(id));
+        self.gone_since.retain(|id, _| !doomed.contains(id));
+        self.periodic_paths.retain(|id| !doomed.contains(id));
     }
 
     // ------------------------------------------------------ user actions
@@ -912,8 +1196,9 @@ impl Engine {
     }
 
     /// Decide pending verifications: closed issues recovered (fully, unless a
-    /// re-run test still points at the cause); open ones past their deadline
-    /// did not.
+    /// re-run test still points at the cause), except hand-resolved and
+    /// expired ones, which nothing measured; open and muted ones past their
+    /// deadline did not.
     fn decide_verifications(&mut self, now: DateTime<Local>) {
         use super::issue::VerifyOutcome;
         let ts = format_ts(now);
@@ -956,10 +1241,15 @@ impl Engine {
             });
             // Only an auto-close is measured: netwatch watched the verify
             // condition hold. A hand-resolved issue closed because someone
-            // said so, which is not evidence that the step worked.
+            // said so, and an expired one because its subject went away;
+            // neither is evidence that the step worked. A muted issue has
+            // not closed at all, so it waits for its deadline as an open one
+            // does.
             let outcome = if matches!(issue.state, IssueState::Resolved { .. }) {
                 Some(VerifyOutcome::ClosedByOperator)
-            } else if !issue.state.is_open() {
+            } else if matches!(issue.state, IssueState::Expired { .. }) {
+                Some(VerifyOutcome::NotMeasured)
+            } else if !issue.state.is_tracked() {
                 Some(if still_supported {
                     VerifyOutcome::Partial
                 } else {
@@ -992,7 +1282,7 @@ impl Engine {
         let Some(issue) = self.issues.iter().find(|i| i.id == id) else {
             return;
         };
-        let key = format!("{}|{}", issue.rule, issue.subject.label());
+        let key = issue.key();
         if self.events.len() >= EVENT_LOG_CAP {
             self.events.remove(0);
         }
@@ -1034,9 +1324,13 @@ impl Engine {
     /// The line under the tab bar. Collapses to one dim sentence when nothing
     /// is wrong, and never claims health it hasn't verified — a host still
     /// learning its baselines says so rather than saying "all nominal".
+    ///
+    /// Only Issues make it say so. A host whose only findings are
+    /// Observations reads as learning or incomplete, as an empty one does,
+    /// and the Diagnose tab still lists them.
     pub fn verdict(&self, base: &BaselineStore) -> Verdict {
-        let primary = self.primary();
-        let visible: Vec<&Issue> = primary
+        let visible: Vec<&Issue> = self
+            .primary_issues()
             .into_iter()
             .filter(|i| !matches!(i.state, IssueState::Muted { .. }))
             .collect();
@@ -1101,9 +1395,9 @@ fn merge_remediation(existing: &mut Vec<super::issue::Step>, fresh: Vec<super::i
 /// What the verdict line says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Baselines are ready and nothing is open.
+    /// Baselines are ready and no Issue is open.
     Clear,
-    /// Nothing is open, but netwatch doesn't yet have the baselines to say so
+    /// No Issue is open, but netwatch doesn't yet have the baselines to say so
     /// with confidence.
     Learning {
         detail: String,
@@ -1111,6 +1405,8 @@ pub enum Verdict {
     Incomplete {
         detail: String,
     },
+    /// At least one Issue is open. `count` leaves Observations out, so
+    /// `severity` is never Info.
     Issues {
         severity: Severity,
         count: usize,
@@ -1125,7 +1421,7 @@ impl Verdict {
         match self {
             Verdict::Clear => "no issues · baselines ready".to_string(),
             Verdict::Learning { detail } | Verdict::Incomplete { detail } => {
-                format!("no visible findings · {detail}")
+                format!("no visible issues · {detail}")
             }
             Verdict::Issues {
                 count, headline, ..
@@ -1198,19 +1494,26 @@ impl Verdict {
     }
 }
 
-/// Derive the σ-denominated metrics from the raw readings and the baselines.
+/// Derive the σ-denominated metrics from the raw readings and the baselines,
+/// scored against the same floored σ the detectors open on.
 ///
 /// A rule that opened because a value was 3σ above baseline closes when it is
-/// back inside 3σ — not when it drops below some absolute number, which would
-/// be a different claim on every network.
-fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base: &BaselineStore) {
+/// back under 2σ (`sigma_close_k`) — not when it drops below some absolute
+/// number, which would be a different claim on every network. The gap between
+/// the two lines keeps a value hovering at 3σ from opening and closing in turn.
+fn add_sigma_metrics(
+    values: &mut HashMap<String, f64>,
+    obs: &Observations,
+    base: &BaselineStore,
+    floor: SigmaFloor,
+) {
     if let Some(t) = obs.targets.first() {
         let readings = t.stage_readings();
         let worst = readings
             .iter()
             .filter_map(|(metric, ms)| {
                 base.get(t.baseline_subject(), metric)
-                    .and_then(|b| b.sigma_above(*ms))
+                    .and_then(|b| b.sigma_above(*ms, floor))
             })
             .reduce(f64::max);
         // Every stage within its baseline, or none has one yet: nothing slow.
@@ -1220,7 +1523,7 @@ fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base
         if let (Some(addr), Some(rtt)) = (&gw.addr, gw.rtt_ms) {
             if let Some(sigma) = base
                 .get(addr, "gateway.rtt")
-                .and_then(|b| b.sigma_above(rtt))
+                .and_then(|b| b.sigma_above(rtt, floor))
             {
                 values.insert("gateway.rtt_sigma".to_string(), sigma);
             }
@@ -1234,7 +1537,7 @@ fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base
         let sigma = base
             .get(&path.target, "path.rtt")
             .or_else(|| base.get("internet", "path.rtt"))
-            .and_then(|b| b.sigma_above(rtt));
+            .and_then(|b| b.sigma_above(rtt, floor));
         if let Some(sigma) = sigma {
             values.insert("path.rtt_sigma".to_string(), sigma);
             values.insert("path.rtt".to_string(), rtt);
@@ -1401,7 +1704,7 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
 mod tests {
     use super::*;
     use crate::diagnose::baseline::NetworkFingerprint;
-    use crate::diagnose::detectors::{DnsObs, GatewayObs, IfaceObs, SocketObs};
+    use crate::diagnose::detectors::{DnsObs, GatewayObs, IfaceObs, ObservedConfig, SocketObs};
 
     fn base() -> BaselineStore {
         let mut b = BaselineStore::new(NetworkFingerprint::new(
@@ -1800,7 +2103,8 @@ mod tests {
         let b = base();
         e.observe(&obs(40.0), &b);
 
-        // dns.slow_resolver verifies on p50 < 5ms held for 60s.
+        // Against this baseline dns.slow_resolver closes once p50 has held
+        // under 4.96ms, 0.8 of its 6.2ms open line, for 60s.
         for _ in 0..61 {
             clock.advance_secs(1);
             e.observe(&obs(1.3), &b);
@@ -1846,8 +2150,8 @@ mod tests {
 
     #[test]
     fn an_auto_close_after_a_step_still_reports_a_measured_recovery() {
-        // The counterpart: the engine watched p50 hold under 5ms for the
-        // rule's window, so the step keeps its credit.
+        // The counterpart: the engine watched p50 hold under its close line
+        // for the rule's window, so the step keeps its credit.
         let (mut e, clock) = engine_at("2026-09-03 06:48:10");
         let b = base();
         e.observe(&obs(40.0), &b);
@@ -1865,6 +2169,1091 @@ mod tests {
             issue.verification.as_ref().unwrap().outcome,
             Some(super::super::issue::VerifyOutcome::Recovered)
         );
+    }
+
+    /// Close `id` as Expired at the clock's time, as the expiry guard does,
+    /// so these tests are about what follows an expiry rather than what
+    /// causes one. The guard's own tests drive [`subject_gone`].
+    fn expire(e: &mut Engine, id: &str, reason: &str) {
+        let at = format_ts(e.clock.now());
+        let issue = e.issues.iter_mut().find(|i| i.id == id).unwrap();
+        issue.state = IssueState::Expired {
+            at,
+            reason: reason.into(),
+        };
+        e.verifying_since.remove(id);
+        e.verification_samples.remove(id);
+        e.gone_since.remove(id);
+    }
+
+    #[test]
+    fn expired_is_closed_and_not_a_recovery() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        expire(&mut e, &id, "resolver left the config");
+
+        // The resolver is fast again afterwards. That is not the issue's
+        // verify holding, because nothing watches a closed issue: it stays
+        // Expired and never turns into a close netwatch saw clear.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        let issue = e.get(&id).unwrap();
+        assert!(!issue.state.is_open());
+        assert_eq!(e.open_count(), 0);
+        assert!(
+            matches!(&issue.state, IssueState::Expired { reason, .. } if reason == "resolver left the config"),
+            "{:?}",
+            issue.state
+        );
+        assert_eq!(issue.state.label(), "expired");
+    }
+
+    #[test]
+    fn a_step_before_expiry_is_not_credited() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+
+        // The verify condition holds for half its window, then the subject
+        // goes. Counting that close as a recovery would credit the step
+        // with a fix nothing finished measuring.
+        for _ in 0..30 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            None
+        );
+        expire(&mut e, &id, "resolver left the config");
+        clock.advance_secs(1);
+        e.observe(&obs(1.3), &b);
+
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, Some(VerifyOutcome::NotMeasured));
+        assert_eq!(v.decided_at.as_deref(), Some("2026-09-03 06:48:41"));
+        assert_eq!(
+            VerifyOutcome::NotMeasured.label(),
+            "closed without a measurement"
+        );
+    }
+
+    #[test]
+    fn an_expired_condition_that_returns_within_the_window_reopens() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        expire(&mut e, &id, "resolver left the config");
+
+        // Back five minutes later and still slow: the same problem, once
+        // more, not a second finding.
+        clock.advance_secs(5 * 60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(issue.recurrence, 1);
+        assert_eq!(issue.since, "2026-09-03 06:53:10");
+
+        // Past the recurrence window it is a new incident.
+        expire(&mut e, &id, "resolver left the config");
+        clock.advance_secs((RECURRENCE_WINDOW_MINS + 1) * 60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 2);
+        assert_eq!(e.primary()[0].recurrence, 0);
+        assert_ne!(e.primary()[0].id, id);
+    }
+
+    #[test]
+    fn settings_with_auto_close_secs_still_load() {
+        // The settings block of an episode recorded before the rename, as
+        // the pinned corpus held it.
+        let old = r#"{"thresholds":{"sigma_k":3.0,"consecutive_n":3,"verdict_hold_secs":30,
+            "dns_ceiling_ms":100.0,"socket_rtt_ms":100.0,"loaded_rtt_delta_ms":100.0,
+            "saturation_pct":90.0,"iface_error_floor":1.0,"iface_drop_floor":60.0,
+            "dns_tc_pct":10.0,"dns_mismatch_pct":50.0,"wifi_rssi_dbm":-70.0,
+            "wifi_retry_pct":20.0},"auto_close_secs":300,"history_limit":50}"#;
+        let loaded: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.expire_after_secs, 300);
+        assert_eq!(loaded.history_limit, 50);
+
+        // It writes back under the new name only.
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(json.contains(r#""expire_after_secs":300"#), "{json}");
+        assert!(!json.contains("auto_close_secs"), "{json}");
+        assert_eq!(Settings::default().expire_after_secs, 60);
+    }
+
+    // ------------------------------------------------------ the expiry guard
+
+    fn find(e: &Engine, rule: &str) -> Issue {
+        e.issues()
+            .iter()
+            .find(|i| i.rule == rule)
+            .unwrap_or_else(|| panic!("no {rule} issue: {:#?}", e.issues()))
+            .clone()
+    }
+
+    fn expired(reason: &str, at: &str) -> IssueState {
+        IssueState::Expired {
+            at: at.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// A socket retransmitting 12 segments a minute at 20 ms: tcp.retrans_burst.
+    fn retransmitting() -> SocketObs {
+        SocketObs {
+            local: "10.88.0.2:52344".into(),
+            remote: "10.88.0.3:9000".into(),
+            process: Some("ncat".into()),
+            rtt_ms: Some(20.0),
+            rttvar_ms: Some(2.0),
+            retrans: Some(12),
+            cwnd: Some(10),
+            ssthresh: Some(u32::MAX),
+            rwnd: Some(64_000),
+            mss: Some(1448),
+            tx_bps: 2.4e6,
+            rx_bps: 0.0,
+            verdict_age_secs: 90,
+        }
+    }
+
+    /// What the sampler reports once a successful dump lists no sockets.
+    fn no_sockets(config: Option<ObservedConfig>) -> Observations {
+        let mut o = Observations {
+            config,
+            ..Default::default()
+        };
+        for rule in [
+            "tcp.bufferbloat_remote",
+            "tcp.retrans_burst",
+            "tcp.zero_window",
+        ] {
+            o.coverage_hints.insert(
+                rule.into(),
+                (
+                    super::super::coverage::Availability::NoSubjects,
+                    "successful TCP dump contained no established sockets".into(),
+                ),
+            );
+        }
+        o
+    }
+
+    /// Collector completion times `t` seconds after `start`, as a live tick
+    /// sees them when every listed collector has just run.
+    fn ran_at(start: std::time::Instant, t: u64) -> ObservationTimes {
+        let at = start + std::time::Duration::from_secs(t);
+        let mut times = ObservationTimes {
+            interface: Some(at),
+            sockets: Some(at),
+            ..Default::default()
+        };
+        times.health.gateway = Some(at);
+        times.health.internet = Some(at);
+        times.health.gateway_target = Some("192.168.8.1".into());
+        times
+    }
+
+    #[test]
+    fn a_closed_socket_expires_its_retrans_issue() {
+        let mut other = retransmitting();
+        other.local = "10.88.0.2:52390".into();
+        other.retrans = Some(0);
+        // The socket closes, and the collector's next dumps say so: either
+        // they list nothing at all, or they list the sockets still open.
+        let empty = no_sockets(Some(ObservedConfig::default()));
+        let others = Observations {
+            sockets: vec![other],
+            config: Some(ObservedConfig::default()),
+            ..Default::default()
+        };
+        for closed in [empty, others] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            let open = Observations {
+                sockets: vec![retransmitting()],
+                config: Some(ObservedConfig::default()),
+                ..Default::default()
+            };
+            e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "tcp.retrans_burst").id;
+
+            for t in 1..=60 {
+                clock.advance_secs(1);
+                e.observe_live_at(&closed, &b, &ran_at(start, t), at(t));
+            }
+            let issue = e.get(&id).unwrap();
+            assert_eq!(issue.state, IssueState::Open, "gone for 59 s");
+            assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:11"));
+
+            clock.advance_secs(1);
+            e.observe_live_at(&closed, &b, &ran_at(start, 61), at(61));
+            assert_eq!(
+                e.get(&id).unwrap().state,
+                expired("socket closed", "2026-09-03 06:49:11")
+            );
+        }
+    }
+
+    /// Outside the Dense view nothing refreshes the socket collector, so its
+    /// last dump ages out. An empty list from a collector that has stopped,
+    /// or one whose input the rule cannot use, is not a socket closing.
+    #[test]
+    fn a_socket_issue_goes_stale_when_its_collector_stops() {
+        let mut unusable = no_sockets(Some(ObservedConfig::default()));
+        unusable.coverage_hints.insert(
+            "tcp.retrans_burst".into(),
+            (
+                super::super::coverage::Availability::CollectorFailed,
+                "netlink dump failed".into(),
+            ),
+        );
+        let cases = [
+            (no_sockets(Some(ObservedConfig::default())), false),
+            (unusable, true),
+        ];
+        for (closed, collector_runs) in cases {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            let open = Observations {
+                sockets: vec![retransmitting()],
+                config: Some(ObservedConfig::default()),
+                ..Default::default()
+            };
+            e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "tcp.retrans_burst").id;
+
+            for t in 1..=600 {
+                clock.advance_secs(1);
+                let ran = if collector_runs { t } else { 0 };
+                e.observe_live_at(&closed, &b, &ran_at(start, ran), at(t));
+            }
+            let issue = e.get(&id).unwrap();
+            assert_eq!(issue.state, IssueState::Open);
+            assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:11"));
+        }
+    }
+
+    /// The gateway probe measures nothing when ICMP cannot be sent and no
+    /// TCP port answers, and the sampler then reports no gateway at all. That
+    /// is what a gateway outage looks like from a host that cannot ping, so
+    /// it must never close the outage.
+    #[test]
+    fn an_unmeasured_gateway_never_expires_the_outage() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let config = Some(ObservedConfig {
+            resolvers: Some(vec!["169.254.1.1".into()]),
+            interfaces: Some(vec!["lo".into(), "eth0".into()]),
+            ..Default::default()
+        });
+        let down = Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: None,
+                loss_pct: 100.0,
+                arp_ok: None,
+                icmp_ok: false,
+                internet_reachable: Some(false),
+            }),
+            config: config.clone(),
+            ..Default::default()
+        };
+        e.observe_live_at(&down, &b, &ran_at(start, 0), at(0));
+        let id = find(&e, "gateway.unreachable").id;
+
+        let unmeasured = Observations {
+            config,
+            ..Default::default()
+        };
+        for t in (5..=1800).step_by(5) {
+            clock.advance_secs(5);
+            e.observe_live_at(&unmeasured, &b, &ran_at(start, t), at(t));
+        }
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open, "half an hour unmeasured");
+        assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 06:48:15"));
+    }
+
+    fn target_obs(revision: &str, refused: bool) -> crate::diagnose::targets::TargetObs {
+        use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
+        TargetObs {
+            baseline_key: Some(revision.into()),
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
+            name: "api".into(),
+            host: "127.0.0.1".into(),
+            port: 8443,
+            tls: false,
+            http: false,
+            expect_status: None,
+            probed_at: String::new(),
+            resolve: Stage {
+                ms: Some(0.0),
+                error: None,
+            },
+            addresses: vec!["127.0.0.1".into()],
+            lookups: vec![],
+            connect: Some(Stage {
+                ms: Some(1.0),
+                error: refused.then_some(StageError::Refused),
+            }),
+            connect_v4: None,
+            connect_v6: None,
+            tls_stage: None,
+            http_stage: None,
+            status: None,
+            stale_after_secs: None,
+            context: TargetContext::default(),
+        }
+    }
+
+    fn targets_config(revisions: &[&str]) -> Option<ObservedConfig> {
+        Some(ObservedConfig {
+            targets: revisions
+                .iter()
+                .map(|r| ("api".to_string(), r.to_string()))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_removed_target_expires() {
+        // Taken out of the config, the target is no longer probed. Edited,
+        // it is probed afresh under its new revision, and that result,
+        // healthy or not, says nothing about the endpoint the issue is about.
+        let removed = Observations {
+            config: targets_config(&[]),
+            ..Default::default()
+        };
+        let edited = Observations {
+            targets: vec![target_obs("target-config:bbbb", false)],
+            config: targets_config(&["target-config:bbbb"]),
+            ..Default::default()
+        };
+        for (after, reason) in [
+            (removed, "target removed from the config"),
+            (edited, "target configuration changed"),
+        ] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![target_obs("target-config:aaaa", true)],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            for _ in 0..60 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{reason}");
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+            assert_eq!(
+                e.get(&id).unwrap().state,
+                expired(reason, "2026-09-03 06:49:11")
+            );
+        }
+
+        // Still there: a duplicated name, one of whose entries keeps the
+        // revision, and an issue found with no revision to compare against.
+        let mut unrevised = target_obs("", true);
+        unrevised.baseline_key = None;
+        for (found, after, case) in [
+            (
+                target_obs("target-config:aaaa", true),
+                targets_config(&["target-config:bbbb", "target-config:aaaa"]),
+                "duplicated name",
+            ),
+            (
+                unrevised,
+                targets_config(&["target-config:bbbb"]),
+                "no revision",
+            ),
+        ] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![found],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            let after = Observations {
+                config: after,
+                ..Default::default()
+            };
+            for _ in 0..120 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{case}");
+        }
+    }
+
+    /// `api` refused under `revision`, the only entry the config lists.
+    fn refused_under(revision: &str) -> Observations {
+        Observations {
+            targets: vec![target_obs(revision, true)],
+            config: targets_config(&[revision]),
+            ..Default::default()
+        }
+    }
+
+    /// The issue that is not `old`, once there is one.
+    fn other_than(e: &Engine, old: &str) -> Option<Issue> {
+        e.issues().iter().find(|i| i.id != old).cloned()
+    }
+
+    /// Edited while it still fails the same way, a target's issue used to
+    /// take the new detection in: same rule, same name, same key. The merge
+    /// overwrote the revision it was found under, so the expiry check found
+    /// that revision in the config and the issue never expired, carrying its
+    /// history onto an endpoint nobody had diagnosed.
+    #[test]
+    fn an_edited_target_still_failing_expires_and_files_a_new_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        // It flaps once, so it has a count. Target steps have no hotkey for
+        // record_applied, so one is marked applied here as it would.
+        assert!(e.resolve(&old));
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        assert_eq!(e.get(&old).unwrap().recurrence, 1);
+        let issue = e.issues.iter_mut().find(|i| i.id == old).unwrap();
+        issue.remediation[0].applied = Some(crate::diagnose::issue::Applied::Yes {
+            at: "2026-09-03 06:48:15".into(),
+            before: String::new(),
+            after: String::new(),
+        });
+
+        // Edited at 06:48:16. The new revision confirms on its own samples.
+        let after = refused_under("target-config:bbbb");
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+            assert!(other_than(&e, &old).is_none(), "needs three samples");
+        }
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(new.state, IssueState::Open);
+        assert_eq!(new.since, "2026-09-03 06:48:16");
+        assert_eq!(new.recurrence, 0);
+        assert!(new.remediation.iter().all(|s| s.applied.is_none()));
+        assert_eq!(
+            new.scope.configuration.as_deref(),
+            Some("target-config:bbbb")
+        );
+
+        // The old revision is no longer probed: gone from 06:48:16.
+        let old_issue = e.get(&old).unwrap();
+        assert_eq!(
+            old_issue.scope.configuration.as_deref(),
+            Some("target-config:aaaa")
+        );
+        assert!(old_issue.remediation[0].applied.is_some());
+        while clock.now() < parse_ts("2026-09-03 06:49:15").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        assert_eq!(e.get(&old).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:16")
+        );
+        assert_eq!(e.get(&new.id).unwrap().state, IssueState::Open);
+        let primary: Vec<_> = e.primary().into_iter().map(|i| i.id.clone()).collect();
+        assert_eq!(primary, vec![new.id]);
+    }
+
+    /// Edited before its issue opens, a target starts counting again. Two
+    /// samples of the old entry and one of the new are not three of either,
+    /// and the issue the new entry opens starts at its own first sample.
+    #[test]
+    fn an_edited_target_confirms_on_its_own_samples() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        clock.advance_secs(1);
+        e.observe(&before, &b);
+
+        // Edited at 06:48:12.
+        let after = refused_under("target-config:bbbb");
+        clock.advance_secs(1);
+        e.observe(&after, &b);
+        assert!(e.issues().is_empty(), "{:#?}", e.issues());
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        let issue = find(&e, "target.connect_failed");
+        assert_eq!(e.issues().len(), 1);
+        assert_eq!(issue.since, "2026-09-03 06:48:12");
+        assert_eq!(
+            issue.scope.configuration.as_deref(),
+            Some("target-config:bbbb")
+        );
+    }
+
+    #[test]
+    fn a_muted_target_edited_while_failing_expires_and_leaves_its_mute_behind() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let before = refused_under("target-config:aaaa");
+        e.observe(&before, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&before, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        assert!(e.mute(&old, 60));
+        let muted = e.get(&old).unwrap().state.clone();
+
+        // Edited at 06:48:13; the new revision opens on its third sample.
+        let after = refused_under("target-config:bbbb");
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(
+            new.state,
+            IssueState::Open,
+            "the mute stays with the old issue"
+        );
+        assert_eq!(e.get(&old).unwrap().state, muted);
+
+        while clock.now() < parse_ts("2026-09-03 06:49:13").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&after, &b);
+        }
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:13")
+        );
+        assert_eq!(e.get(&new.id).unwrap().state, IssueState::Open);
+        assert_eq!(e.primary().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_target_does_not_inherit_the_old_verification() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        // Probed every 10 s; each tick reads the result just published.
+        let tick = |e: &mut Engine, o: &Observations, t: u64| {
+            let times = ObservationTimes {
+                targets: [("api".to_string(), at(t))].into_iter().collect(),
+                ..Default::default()
+            };
+            e.observe_live_at(o, &b, &times, at(t));
+        };
+        let failing = refused_under("target-config:aaaa");
+        let mut healthy = failing.clone();
+        healthy.targets[0] = target_obs("target-config:aaaa", false);
+        tick(&mut e, &failing, 0);
+        for t in [10, 20] {
+            clock.advance_secs(10);
+            tick(&mut e, &failing, t);
+        }
+        let old = find(&e, "target.connect_failed").id;
+        assert!(e.mark_step_done(&old, 0));
+
+        // It recovers for two probes, so its hold is running.
+        for t in [30, 40] {
+            clock.advance_secs(10);
+            tick(&mut e, &healthy, t);
+        }
+        assert!(e.verifying_since.contains_key(&old));
+        assert!(e.verification_samples.contains_key(&old));
+
+        // Edited at 06:49:00 to an entry that fails.
+        let after = refused_under("target-config:bbbb");
+        for t in [50, 60, 70] {
+            clock.advance_secs(10);
+            tick(&mut e, &after, t);
+        }
+        let new = other_than(&e, &old).expect("the edited target files its own issue");
+        assert_eq!(new.verification, None, "the step was done on the old entry");
+        assert!(!e.verifying_since.contains_key(&new.id));
+        assert!(!e.verification_samples.contains_key(&new.id));
+        // The old entry is not measured any more, so its hold stops.
+        assert!(!e.verifying_since.contains_key(&old));
+        assert!(!e.verification_samples.contains_key(&old));
+
+        // The new entry recovers: its hold starts on its own first sample.
+        let mut recovered = after.clone();
+        recovered.targets[0] = target_obs("target-config:bbbb", false);
+        clock.advance_secs(10);
+        tick(&mut e, &recovered, 80);
+        assert_eq!(
+            e.verifying_since.get(&new.id).copied(),
+            parse_ts("2026-09-03 06:49:30")
+        );
+        assert_eq!(e.verification_samples.get(&new.id), Some(&(at(80), at(80))));
+
+        // Gone since 06:49:00, the old issue expires a minute later, and the
+        // step done on it was never measured.
+        for t in [90, 100, 110] {
+            clock.advance_secs(10);
+            tick(&mut e, &recovered, t);
+        }
+        let old = e.get(&old).unwrap();
+        assert_eq!(
+            old.state,
+            expired("target configuration changed", "2026-09-03 06:50:00")
+        );
+        assert_eq!(
+            old.verification.as_ref().and_then(|v| v.outcome),
+            Some(crate::diagnose::issue::VerifyOutcome::NotMeasured)
+        );
+        assert!(e.get(&new.id).unwrap().state.is_open(), "held 30 s of 120");
+    }
+
+    /// Put back to the revision it was found under within the recurrence
+    /// window, a target reopens its old issue. The revision is a digest of
+    /// every field of the entry, so the same revision probes the same
+    /// endpoint the same way: by merge()'s rule, the same problem coming back
+    /// after an expiry, like a resolver that left the config and returned
+    /// still slow. The revision in between is a different problem, and
+    /// expires in its turn.
+    #[test]
+    fn a_target_edited_back_within_the_window_reopens_its_old_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let first = refused_under("target-config:aaaa");
+        let second = refused_under("target-config:bbbb");
+        e.observe(&first, &b);
+        for _ in 0..2 {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        let old = find(&e, "target.connect_failed").id;
+
+        // Edited at 06:48:13: the first issue expires at 06:49:13.
+        while clock.now() < parse_ts("2026-09-03 06:50:00").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&second, &b);
+        }
+        assert_eq!(
+            e.get(&old).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:49:13")
+        );
+        let between = other_than(&e, &old)
+            .expect("the second revision's issue")
+            .id;
+
+        // Put back at 06:50:01, it confirms again and reopens the first.
+        for _ in 0..3 {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        let reopened = e.get(&old).unwrap();
+        assert_eq!(reopened.state, IssueState::Open);
+        assert_eq!(reopened.recurrence, 1);
+        assert_eq!(reopened.since, "2026-09-03 06:50:01");
+        assert_eq!(e.issues().len(), 2, "no third issue");
+        while clock.now() < parse_ts("2026-09-03 06:51:01").unwrap() {
+            clock.advance_secs(1);
+            e.observe(&first, &b);
+        }
+        assert_eq!(
+            e.get(&between).unwrap().state,
+            expired("target configuration changed", "2026-09-03 06:51:01")
+        );
+        assert!(e.get(&old).unwrap().state.is_open());
+    }
+
+    #[test]
+    fn an_expiry_window_too_long_for_a_duration_never_expires() {
+        // A replayed episode's settings are whatever its file says. Cast
+        // straight to i64, u64::MAX was -1 s and expired on the first tick
+        // gone; 1e17 s panicked out of TimeDelta::seconds.
+        for secs in [u64::MAX, 100_000_000_000_000_000] {
+            let (e, clock) = engine_at("2026-09-03 06:48:10");
+            let settings = Settings {
+                expire_after_secs: secs,
+                ..*e.settings()
+            };
+            let mut e = e.with_settings(settings);
+            let b = base();
+            e.observe(
+                &Observations {
+                    targets: vec![target_obs("target-config:aaaa", true)],
+                    config: targets_config(&["target-config:aaaa"]),
+                    ..Default::default()
+                },
+                &b,
+            );
+            let id = find(&e, "target.connect_failed").id;
+            let removed = Observations {
+                config: targets_config(&[]),
+                ..Default::default()
+            };
+            for _ in 0..60 {
+                clock.advance_secs(60);
+                e.observe(&removed, &b);
+            }
+            assert_eq!(e.get(&id).unwrap().state, IssueState::Open, "{secs}");
+        }
+    }
+
+    #[test]
+    fn a_stale_target_probe_is_stale_not_expired() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let refused = Observations {
+            targets: vec![target_obs("target-config:aaaa", true)],
+            config: targets_config(&["target-config:aaaa"]),
+            ..Default::default()
+        };
+        // The target stays configured, but its prober publishes once and
+        // then stops, so its one result ages past the stale limit.
+        let times = ObservationTimes {
+            targets: [("api".to_string(), at(0))].into_iter().collect(),
+            ..Default::default()
+        };
+        e.observe_live_at(&refused, &b, &times, at(0));
+        let id = find(&e, "target.connect_failed").id;
+        for t in (60..=3600).step_by(60) {
+            clock.advance_secs(60);
+            e.observe_live_at(&refused, &b, &times, at(t));
+        }
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        // Fresh up to 900 s, so first missing on the tick at 960 s.
+        assert_eq!(issue.stale_since.as_deref(), Some("2026-09-03 07:04:10"));
+    }
+
+    #[test]
+    fn stale_since_is_set_once_and_cleared_on_fresh_evidence() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let stale = |e: &Engine| e.issues()[0].stale_since.clone();
+        e.observe(&obs(40.0), &b);
+        assert_eq!(stale(&e), None);
+
+        let unmeasured = Observations::default();
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        assert_eq!(stale(&e).as_deref(), Some("2026-09-03 06:48:15"));
+
+        // The metric returns, under the verify line: measured again, so no
+        // longer stale, though not yet closed.
+        clock.advance_secs(5);
+        e.observe(&obs(1.3), &b);
+        assert_eq!(stale(&e), None);
+        assert!(e.issues()[0].state.is_open());
+
+        // Missing again, then the condition itself comes back.
+        clock.advance_secs(5);
+        e.observe(&unmeasured, &b);
+        assert_eq!(stale(&e).as_deref(), Some("2026-09-03 06:48:30"));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(stale(&e), None);
+        assert_eq!(e.open_count(), 1);
+    }
+
+    /// An episode recorded before the configuration was recorded replays
+    /// with `config: None`. Its socket closing is the same evidence as in
+    /// the tests above, but the guard reads unknown as "never expire", so
+    /// the replay keeps the issue open as the recording did. The same frames
+    /// with a configuration expire it.
+    #[test]
+    fn an_episode_without_config_never_expires() {
+        use crate::diagnose::{episode, fixture};
+        // The socket retransmits for 30 s, then a fresh dump lists nothing.
+        fn frame(t: u64) -> Observations {
+            if t < 30 {
+                Observations {
+                    sockets: vec![retransmitting()],
+                    ..Default::default()
+                }
+            } else {
+                no_sockets(None)
+            }
+        }
+        let old = fixture::record(&fixture::Scenario {
+            id: "socket-closes-before-0.34",
+            start: "2026-09-03 06:48:10",
+            secs: 240,
+            baselines: base,
+            obs: frame,
+            cadence: fixture::Cadence::live(),
+            thresholds: Thresholds::default(),
+        });
+        assert!(old.frames.iter().all(|f| f.obs.config.is_none()));
+        let span = |replay: &episode::ReplayReport| {
+            let spans: Vec<_> = replay
+                .issues
+                .iter()
+                .filter(|s| s.key.starts_with("tcp.retrans_burst|"))
+                .cloned()
+                .collect();
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            spans[0].clone()
+        };
+
+        let replayed = episode::replay(&old);
+        assert!(replayed.matches(), "{:?}", replayed.divergences);
+        assert_eq!(span(&replayed).closed, None);
+
+        let mut new = old.clone();
+        for f in &mut new.frames {
+            f.obs.config = Some(ObservedConfig::default());
+        }
+        let span = span(&episode::replay(&new));
+        // Gone from the frame at 30 s, expired 60 s later.
+        assert_eq!(span.closed.as_deref(), Some("2026-09-03 06:49:40"));
+        assert_eq!(span.close_reason.as_deref(), Some("expired"));
+    }
+
+    fn on_resolver(p50: f64, resolver: &str, listed: Option<&[&str]>) -> Observations {
+        let mut o = obs(p50);
+        o.dns.as_mut().unwrap().resolver = resolver.into();
+        o.config = Some(ObservedConfig {
+            resolvers: listed.map(|l| l.iter().map(|r| r.to_string()).collect()),
+            ..Default::default()
+        });
+        o
+    }
+
+    #[test]
+    fn a_resolver_that_left_the_config_expires() {
+        let b = base();
+        let old = "169.254.1.1";
+        let new = "192.168.8.1";
+        // The network now hands out another resolver, which answers fast.
+        // Its results cannot verify the old resolver's issue.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, Some(&[new])), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            expired("resolver left the config", "2026-09-03 06:49:11")
+        );
+
+        // A resolver list that could not be read says nothing about it.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        for _ in 0..600 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, None), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+    }
+
+    /// A resolver switched to by an applied step stands in for the old one:
+    /// its answers verify the issue, so the old one leaving is the fix
+    /// working, not the subject going away.
+    #[test]
+    fn a_resolver_switched_to_by_an_applied_step_is_a_recovery_not_an_expiry() {
+        use crate::diagnose::issue::Applied;
+        let b = base();
+        let old = "169.254.1.1";
+        let new = "192.168.8.1";
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&on_resolver(40.0, old, Some(&[old])), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        assert!(e.record_applied(
+            &id,
+            '1',
+            Applied::Yes {
+                at: "2026-09-03 06:48:10".into(),
+                before: old.into(),
+                after: new.into(),
+            }
+        ));
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&on_resolver(1.3, new, Some(&[new])), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:49:11".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_path_expires_only_when_its_periodic_trace_target_changes() {
+        use crate::diagnose::detectors::{HopObs, PathObs};
+        let b = base();
+        let hop = |number, loss_pct| HopObs {
+            number,
+            ip: Some(format!("10.0.0.{number}")),
+            asn: None,
+            rtt_p50_ms: Some(5.0),
+            rtt_p95_ms: None,
+            loss_pct,
+            silent: false,
+        };
+        let lossy = |trace: &str, every| Observations {
+            paths: vec![PathObs {
+                target: "1.1.1.1".into(),
+                hops: vec![hop(1, 0.0), hop(2, 20.0)],
+                previous: None,
+                traced_at: "2026-09-03 06:48:05".into(),
+                destination_reached: Some(false),
+            }],
+            config: Some(ObservedConfig {
+                trace_target: trace.into(),
+                trace_refresh_secs: every,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let untraced = |trace: &str, every| Observations {
+            paths: vec![],
+            ..lossy(trace, every)
+        };
+        let cases = [
+            // Traced every 5 minutes, then the trace target is changed.
+            (
+                lossy("1.1.1.1", Some(300)),
+                untraced("9.9.9.9", Some(300)),
+                true,
+            ),
+            // Traced by hand while the periodic trace follows another
+            // target: nothing will trace it again, but it has not gone.
+            (
+                lossy("9.9.9.9", Some(300)),
+                untraced("9.9.9.9", Some(300)),
+                false,
+            ),
+            // The target changed, but tracing is by hand from now on.
+            (
+                lossy("1.1.1.1", Some(300)),
+                untraced("9.9.9.9", None),
+                false,
+            ),
+        ];
+        for (before, after, expires) in cases {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            e.observe(&before, &b);
+            let id = find(&e, "path.high_loss").id;
+            for _ in 0..61 {
+                clock.advance_secs(1);
+                e.observe(&after, &b);
+            }
+            let state = e.get(&id).unwrap().state.clone();
+            if expires {
+                assert_eq!(
+                    state,
+                    expired("trace target changed", "2026-09-03 06:49:11")
+                );
+            } else {
+                assert_eq!(state, IssueState::Open, "{after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_removed_interface_expires_only_on_a_fresh_collector() {
+        let b = base();
+        let listing = |names: &[&str]| {
+            Some(ObservedConfig {
+                interfaces: Some(names.iter().map(|n| n.to_string()).collect()),
+                ..Default::default()
+            })
+        };
+        let down = Observations {
+            iface: Some(IfaceObs {
+                carrier: Some(false),
+                ..crate::diagnose::fixture::observations_at(0).iface.unwrap()
+            }),
+            config: listing(&["lo", "eth0"]),
+            ..Default::default()
+        };
+        // The USB adapter is pulled: the platform stops listing it.
+        let pulled = Observations {
+            config: listing(&["lo"]),
+            ..Default::default()
+        };
+        // Replugged, or brought up after `diagnose run` read the list: the
+        // collector reads it while the list does not name it yet.
+        let unlisted = Observations {
+            iface: Some(IfaceObs {
+                carrier: None,
+                ..down.iface.clone().unwrap()
+            }),
+            config: listing(&["lo"]),
+            ..Default::default()
+        };
+        for (after, collector_runs, gone) in [
+            (&pulled, true, true),
+            (&pulled, false, false),
+            (&unlisted, true, false),
+        ] {
+            let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+            let start = std::time::Instant::now();
+            let at = |t| start + std::time::Duration::from_secs(t);
+            e.observe_live_at(&down, &b, &ran_at(start, 0), at(0));
+            let id = find(&e, "link.down").id;
+            for t in 1..=61 {
+                clock.advance_secs(1);
+                let ran = if collector_runs { t } else { 0 };
+                e.observe_live_at(after, &b, &ran_at(start, ran), at(t));
+            }
+            let state = e.get(&id).unwrap().state.clone();
+            if gone {
+                assert_eq!(state, expired("interface removed", "2026-09-03 06:49:11"));
+            } else {
+                assert_eq!(state, IssueState::Open);
+            }
+        }
     }
 
     #[test]
@@ -1924,6 +3313,127 @@ mod tests {
         assert_eq!(e.primary()[0].recurrence, 0);
     }
 
+    /// A detector that derives its close line from the metric sends a new
+    /// line with every detection. Taken every tick, the line would follow
+    /// the metric and never judge it against where the issue opened.
+    #[test]
+    fn the_verify_condition_is_the_one_set_at_open() {
+        use crate::diagnose::issue::{Subject, Verify};
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let slow = |line: f64| {
+            let mut d = Detection::new(
+                "dns.slow_resolver",
+                Subject::Resolver {
+                    addr: "169.254.1.1".into(),
+                },
+            );
+            d.verify = Verify::below("dns.rtt_p50", line, "ms").holding_for(60);
+            d
+        };
+        let line = |e: &Engine| e.issues()[0].verify.threshold;
+        let now = clock.now();
+        e.merge(slow(10.0), now, now);
+        assert_eq!(line(&e), 10.0);
+
+        // Neither a later detection with another line nor the detector's
+        // own pass, with the line it derives from the baseline, moves it.
+        clock.advance_secs(5);
+        let now = clock.now();
+        e.merge(slow(30.0), now, now);
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        assert_eq!(line(&e), 10.0, "a merge keeps the line set at open");
+
+        // Closed, and back inside the recurrence window: a reopen sets the
+        // line again, as an open does.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(e.open_count(), 0);
+        clock.advance_secs(60);
+        let now = clock.now();
+        e.merge(slow(20.0), now, now);
+        assert_eq!(e.issues()[0].state, IssueState::Open);
+        assert_eq!(e.issues()[0].recurrence, 1);
+        assert_eq!(line(&e), 20.0);
+    }
+
+    /// The verify used to be a flat 5 ms, which a router answering in 10 to
+    /// 11 ms never meets, so an issue opened on one stayed open until
+    /// netwatch restarted.
+    #[test]
+    fn a_router_resolver_issue_can_close() {
+        let mut b = base();
+        b.seed("169.254.1.1", "dns.rtt_p50", 10.5, 0.3, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(60.0), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        // It opened at twice the mean, 21ms, and closes under 0.8 of that.
+        let line = e.get(&id).unwrap().verify.threshold;
+        assert!((line - 16.8).abs() < 1e-9, "{line}");
+
+        // Five minutes at 18ms: under the open line, over the close line.
+        for _ in 0..300 {
+            clock.advance_secs(1);
+            e.observe(&obs(18.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+
+        // Back to 11ms: open through the hold, closed once 60s have held.
+        for _ in 0..60 {
+            clock.advance_secs(1);
+            e.observe(&obs(11.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&obs(11.0), &b);
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:54:11".into()
+            }
+        );
+    }
+
+    /// A resolver at 90 ms, give or take 10, closes under 110 ms, over the
+    /// 100 ms ceiling it opened on. A p50 over the ceiling fires again and
+    /// keeps the issue open, so it closes only under the ceiling.
+    #[test]
+    fn a_resolver_near_the_ceiling_closes_under_it() {
+        let mut b = base();
+        b.seed("169.254.1.1", "dns.rtt_p50", 90.0, 10.0, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(120.0), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        let line = e.get(&id).unwrap().verify.threshold;
+        assert!((line - 110.0).abs() < 1e-9, "{line}");
+
+        // Five minutes at 105ms: under the close line, over the ceiling.
+        for _ in 0..300 {
+            clock.advance_secs(1);
+            e.observe(&obs(105.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+
+        // Just under the ceiling: closed once 60s have held.
+        for _ in 0..60 {
+            clock.advance_secs(1);
+            e.observe(&obs(99.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&obs(99.0), &b);
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:54:11".into()
+            }
+        );
+    }
+
     #[test]
     fn suppression_reaches_the_verdict_line() {
         let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
@@ -1947,6 +3457,55 @@ mod tests {
         let v = e.verdict(&b);
         assert!(v.line().contains("gateway unreachable"), "{}", v.line());
         assert!(v.line().contains("1 issue"), "{}", v.line());
+    }
+
+    /// A trace to 1.1.1.1 whose hop 3 moved, adding `added_ms`. Up to 20 ms
+    /// that is an Info `path.changed`: an Observation.
+    fn rerouted(added_ms: f64) -> Observations {
+        let before = crate::diagnose::fixture::path_before();
+        let mut after = before.clone();
+        after[2].ip = Some("203.0.113.44".into());
+        after[2].rtt_p50_ms = after[2].rtt_p50_ms.map(|r| r + added_ms);
+        Observations {
+            now: "2026-09-03 06:48:10".into(),
+            paths: vec![crate::diagnose::detectors::PathObs {
+                target: "1.1.1.1".into(),
+                hops: after,
+                previous: Some(before),
+                traced_at: "2026-09-03 06:48:10".into(),
+                destination_reached: Some(true),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn observations_alone_do_not_make_the_verdict_say_issues() {
+        let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&rerouted(2.0), &b);
+
+        let listed: Vec<&str> = e.primary().iter().map(|i| i.rule.as_str()).collect();
+        assert_eq!(listed, ["path.changed"], "the tab still lists it");
+        assert_eq!(e.primary_observations().len(), 1);
+        assert!(e.primary_issues().is_empty());
+        assert_eq!(e.observation_count(), 1);
+        let v = e.verdict(&b);
+        assert!(!matches!(v, Verdict::Issues { .. }), "{v:?}");
+        assert_eq!(v.count(), 0);
+        // The line must not deny the finding the tab lists beside it.
+        assert!(v.line().starts_with("no visible issues"), "{}", v.line());
+
+        // An Issue beside it is what the verdict counts and leads with.
+        let mut both = rerouted(2.0);
+        both.dns = Some(dns(40.0));
+        e.observe(&both, &b);
+        assert_eq!(e.primary().len(), 2);
+        let v = e.verdict(&b);
+        assert_eq!(v.count(), 1, "{}", v.line());
+        assert!(v.line().contains("slow dns resolver"), "{}", v.line());
+        assert_ne!(v.severity(), Some(Severity::Info));
+        assert_eq!(e.observation_count(), 1);
     }
 
     #[test]
@@ -2287,20 +3846,294 @@ mod tests {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
         assert_eq!(
             e.verdict(&base()).line(),
-            "no visible findings · coverage not recorded"
+            "no visible issues · coverage not recorded"
         );
     }
 
     #[test]
     fn muted_issues_leave_the_verdict_line_but_stay_in_the_list() {
-        let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+
+        assert!(e.verdict(&b).is_clear(), "a muted issue must not shout");
+        assert_eq!(e.muted_count(), 1, "the verdict says what it left out");
+        assert_eq!(e.issues().len(), 1, "but it is still on the Diagnose tab");
+        assert_eq!(
+            e.get(&id).unwrap().state.muted_until(),
+            Some("2026-09-03 07:48:10")
+        );
+    }
+
+    /// Muting used to make an issue look closed to the engine. Its condition,
+    /// still firing, went back through hysteresis and filed a second issue
+    /// beside it after `consecutive_n` samples, while the first read "muted
+    /// until" long after its mute had ended.
+    #[test]
+    fn a_muted_condition_stays_one_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        for _ in 0..3 {
+            e.observe(&obs(40.0), &b);
+            clock.advance_secs(5);
+        }
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+
+        // Ten minutes more of the same fault.
+        for _ in 0..120 {
+            e.observe(&obs(38.0), &b);
+            clock.advance_secs(5);
+        }
+        assert_eq!(e.issues().len(), 1, "{:#?}", e.issues());
+        let issue = e.get(&id).unwrap();
+        assert!(matches!(issue.state, IssueState::Muted { .. }));
+        assert_eq!(e.open_count(), 0);
+        assert!(e.verdict(&b).is_clear());
+        // The evidence keeps arriving, quietly.
+        assert_eq!(issue.last_seen, "2026-09-03 06:58:20");
+        assert_eq!(issue.headline().unwrap().value, 38.0);
+    }
+
+    #[test]
+    fn a_mute_ends_at_its_time() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
         let b = base();
         e.observe(&obs(40.0), &b);
         let id = e.primary()[0].id.clone();
         assert!(e.mute(&id, 60));
 
-        assert!(e.verdict(&b).is_clear(), "a muted issue must not shout");
-        assert_eq!(e.issues().len(), 1, "but it is still on the Diagnose tab");
+        for _ in 0..59 {
+            clock.advance_secs(60);
+            e.observe(&obs(40.0), &b);
+        }
+        assert!(matches!(
+            e.get(&id).unwrap().state,
+            IssueState::Muted { .. }
+        ));
+
+        // 07:48:10: the hour is up and the resolver is still slow.
+        clock.advance_secs(60);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1);
+        let issue = e.get(&id).unwrap();
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(issue.recurrence, 0, "the same incident, not a return");
+        assert_eq!(issue.since, "2026-09-03 06:48:10");
+        assert!(!e.verdict(&b).is_clear());
+        assert_eq!(e.muted_count(), 0);
+
+        // It ends on the clock, not on a detection: a mute that runs out
+        // while nothing fires is over too.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 1));
+        clock.advance_secs(60);
+        e.observe(&Observations::default(), &b);
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+    }
+
+    /// A zone whose clocks go back at 01:00 UTC on 25 October 2026, as
+    /// London's do, so wall time 01:00 to 02:00 happens twice that night.
+    #[derive(Clone, Copy, Debug)]
+    struct ClocksGoBack;
+
+    impl ClocksGoBack {
+        const SUMMER: i32 = 3_600;
+        fn change() -> chrono::NaiveDateTime {
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+                .and_then(|d| d.and_hms_opt(1, 0, 0))
+                .unwrap()
+        }
+        fn offset(secs: i32) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(secs).unwrap()
+        }
+    }
+
+    impl TimeZone for ClocksGoBack {
+        type Offset = chrono::FixedOffset;
+        fn from_offset(_: &chrono::FixedOffset) -> Self {
+            ClocksGoBack
+        }
+        fn offset_from_local_date(
+            &self,
+            _: &chrono::NaiveDate,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            unreachable!("mute_over reads date-times")
+        }
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            let (summer, winter) = (Self::offset(Self::SUMMER), Self::offset(0));
+            if *local < Self::change() {
+                chrono::LocalResult::Single(summer)
+            } else if *local < Self::change() + Duration::hours(1) {
+                chrono::LocalResult::Ambiguous(summer, winter)
+            } else {
+                chrono::LocalResult::Single(winter)
+            }
+        }
+        fn offset_from_utc_date(&self, _: &chrono::NaiveDate) -> chrono::FixedOffset {
+            unreachable!("mute_over reads date-times")
+        }
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
+            Self::offset(if *utc < Self::change() {
+                Self::SUMMER
+            } else {
+                0
+            })
+        }
+    }
+
+    /// A mute set at 01:10 summer time ends at 01:10 winter time, a stamp
+    /// that names two instants. Read as neither, it ended on the next tick.
+    #[test]
+    fn a_mute_into_the_hour_the_clocks_go_back_lasts_its_hour() {
+        let muted_at = ClocksGoBack
+            .from_local_datetime(&ClocksGoBack::change())
+            .earliest()
+            .unwrap()
+            + Duration::minutes(10);
+        let until = (muted_at + Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(until, "2026-10-25 01:10:00");
+
+        assert!(!mute_over(&until, &muted_at));
+        assert!(!mute_over(&until, &(muted_at + Duration::minutes(59))));
+        assert!(mute_over(&until, &(muted_at + Duration::hours(1))));
+        // A stamp that does not parse still ends the mute.
+        assert!(mute_over("07:48", &muted_at));
+    }
+
+    #[test]
+    fn a_muted_issue_still_closes_when_verify_holds() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+
+        // Against this baseline dns.slow_resolver closes once p50 has held
+        // under 4.96ms, 0.8 of its 6.2ms open line, for 60s.
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert!(
+            matches!(e.get(&id).unwrap().state, IssueState::AutoClosed { .. }),
+            "{:?}",
+            e.get(&id).unwrap().state
+        );
+        assert_eq!(e.muted_count(), 0);
+    }
+
+    #[test]
+    fn a_muted_socket_issue_still_expires() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let at = |t| start + std::time::Duration::from_secs(t);
+        let open = Observations {
+            sockets: vec![retransmitting()],
+            config: Some(ObservedConfig::default()),
+            ..Default::default()
+        };
+        e.observe_live_at(&open, &b, &ran_at(start, 0), at(0));
+        let id = find(&e, "tcp.retrans_burst").id;
+        assert!(e.mute(&id, 60));
+
+        let closed = no_sockets(Some(ObservedConfig::default()));
+        for t in 1..=61 {
+            clock.advance_secs(1);
+            e.observe_live_at(&closed, &b, &ran_at(start, t), at(t));
+        }
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            expired("socket closed", "2026-09-03 06:49:11")
+        );
+    }
+
+    /// A mute is the user asking for quiet, not a fix. It used to count as
+    /// a close, so a step marked done before it was credited with a recovery
+    /// on the next tick.
+    #[test]
+    fn a_mute_after_a_step_is_not_a_recovery() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, None);
+
+        // Past the verify hold and its grace, still slow: it did not work.
+        clock.advance_secs(60 + VERIFY_GRACE_SECS);
+        e.observe(&obs(40.0), &b);
+        let v = e.get(&id).unwrap().verification.clone().unwrap();
+        assert_eq!(v.outcome, Some(VerifyOutcome::NotRecovered));
+    }
+
+    #[test]
+    fn a_muted_issue_is_not_pruned_as_history() {
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.settings.history_limit = 0;
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mute(&id, 60));
+        clock.advance_secs(5);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.issues().len(), 1, "a muted issue is still tracked");
+        assert!(e.get(&id).is_some());
+    }
+
+    /// The root is what the verdict names, so it is what gets muted. Muting
+    /// it released its consequences, and for the hour a symptom led the
+    /// verdict while its cause was hidden.
+    #[test]
+    fn muting_a_root_keeps_its_consequences_suppressed() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let mut o = obs(40.0);
+        o.gateway = Some(GatewayObs {
+            addr: Some("192.168.8.1".into()),
+            rtt_ms: None,
+            loss_pct: 100.0,
+            arp_ok: Some(true),
+            icmp_ok: false,
+            internet_reachable: Some(false),
+        });
+        for _ in 0..3 {
+            e.observe(&o, &b);
+            clock.advance_secs(5);
+        }
+        let root = find(&e, "gateway.unreachable").id;
+        assert_eq!(e.open_count(), 1);
+        assert!(e.mute(&root, 60));
+
+        // Ten minutes more of the same fault.
+        for _ in 0..120 {
+            e.observe(&o, &b);
+            clock.advance_secs(5);
+        }
+        assert_eq!(e.issues().len(), 2, "{:#?}", e.issues());
+        let dns = find(&e, "dns.slow_resolver");
+        assert_eq!(dns.suppressed_by.as_deref(), Some(root.as_str()));
+        assert_eq!(e.get(&root).unwrap().consequences, vec![dns.id.clone()]);
+        assert_eq!(e.open_count(), 0, "{:?}", e.primary());
+        assert!(e.verdict(&b).is_clear(), "{}", e.verdict(&b).line());
+        assert_eq!(e.muted_count(), 1);
     }
 
     #[test]
@@ -2400,6 +4233,148 @@ mod tests {
         assert!(
             closed <= 3,
             "history limit not enforced: {closed} closed issues"
+        );
+    }
+
+    /// The verify reads `gateway.rtt_sigma`, scored against the same floored
+    /// σ as the open. Scored raw, a 0.9ms gateway with σ 0.05 that settles
+    /// at 1.3ms would sit at 8σ and its issue would never close.
+    #[test]
+    fn a_gateway_back_inside_the_floor_closes() {
+        let gw = "192.168.8.1";
+        let mut b = base();
+        b.seed(gw, "gateway.rtt", 0.9, 0.05, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:00:00");
+        let gateway = |rtt: f64| Observations {
+            gateway: Some(GatewayObs {
+                addr: Some(gw.into()),
+                rtt_ms: Some(rtt),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            ..Default::default()
+        };
+        let state = |e: &Engine| {
+            e.issues()
+                .iter()
+                .find(|i| i.rule == "gateway.rtt_spike")
+                .map(|i| i.state.clone())
+        };
+        e.observe(&gateway(12.0), &b);
+        assert_eq!(
+            state(&e),
+            Some(IssueState::Open),
+            "22.2σ over the floor, and 11.1ms slower"
+        );
+
+        for _ in 0..=24 {
+            clock.advance_secs(5);
+            e.observe(&gateway(1.3), &b);
+        }
+        assert!(
+            matches!(state(&e), Some(IssueState::AutoClosed { .. })),
+            "0.8σ held for 120s: {:?}",
+            state(&e)
+        );
+    }
+
+    /// A wireless gateway at 4ms, give or take 4: 3σ is 16ms, which is 12ms
+    /// slower and clears the delta floor, and 2σ is 12ms.
+    fn wireless_gateway() -> BaselineStore {
+        let mut b = base();
+        b.seed("192.168.8.1", "gateway.rtt", 4.0, 4.0, 2000);
+        b
+    }
+
+    /// That gateway answering `sigma` σ above its mean.
+    fn gateway_at_sigma(sigma: f64) -> Observations {
+        Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: Some(4.0 + sigma * 4.0),
+                loss_pct: 0.0,
+                arp_ok: Some(true),
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn gateway_rtt_issues(e: &Engine) -> Vec<Issue> {
+        e.issues()
+            .iter()
+            .filter(|i| i.rule == "gateway.rtt_spike")
+            .cloned()
+            .collect()
+    }
+
+    /// The open and close lines used to be the same 3σ. A gateway hovering at
+    /// the line closed each time it sat just under it for the 120 s hold,
+    /// and reopened each time it rose back, so one condition read as a run of
+    /// recoveries. The dips here outlast the hold: alternating sample by
+    /// sample never closed even at 3σ/3σ, because each detection restarts
+    /// the hold.
+    #[test]
+    fn a_gateway_rtt_hovering_at_three_sigma_does_not_flap() {
+        let b = wireless_gateway();
+        let hover = |close_k: f64| {
+            let (e, clock) = hysteresis_engine_at("2026-09-03 06:00:00");
+            let mut settings = *e.settings();
+            settings.thresholds.sigma_close_k = close_k;
+            let mut e = e.with_settings(settings);
+            for _ in 0..3 {
+                // 30 s at 3.1σ, then 3 minutes at 2.9σ.
+                for sigma in [3.1; 6].into_iter().chain([2.9; 36]) {
+                    e.observe(&gateway_at_sigma(sigma), &b);
+                    clock.advance_secs(5);
+                }
+            }
+            gateway_rtt_issues(&e)
+        };
+
+        let issues = hover(2.0);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(issues[0].state, IssueState::Open);
+        assert_eq!(issues[0].recurrence, 0);
+
+        // With the close line on the open line, the same gateway closes after
+        // every dip and reopens after every rise.
+        let flapping = hover(3.0);
+        assert_eq!(flapping.len(), 1, "{flapping:#?}");
+        assert_eq!(flapping[0].recurrence, 2);
+        assert!(matches!(flapping[0].state, IssueState::AutoClosed { .. }));
+    }
+
+    #[test]
+    fn gateway_rtt_spike_closes_below_two_sigma() {
+        let b = wireless_gateway();
+        let (mut e, clock) = engine_at("2026-09-03 06:00:00");
+        e.observe(&gateway_at_sigma(4.0), &b);
+        let issues = gateway_rtt_issues(&e);
+        assert_eq!(issues[0].state, IssueState::Open, "20ms is 4σ, 16ms slower");
+        assert_eq!(issues[0].verify.threshold, 2.0);
+
+        // Five minutes at 2.1σ: under the open line, over the close line.
+        for _ in 0..60 {
+            clock.advance_secs(5);
+            e.observe(&gateway_at_sigma(2.1), &b);
+        }
+        assert_eq!(gateway_rtt_issues(&e)[0].state, IssueState::Open);
+
+        // 1.9σ held for the 120 s verify.
+        for _ in 0..=24 {
+            clock.advance_secs(5);
+            e.observe(&gateway_at_sigma(1.9), &b);
+        }
+        let issues = gateway_rtt_issues(&e);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            matches!(issues[0].state, IssueState::AutoClosed { .. }),
+            "{:?}",
+            issues[0].state
         );
     }
 

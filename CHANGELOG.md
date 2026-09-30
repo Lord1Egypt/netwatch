@@ -2,6 +2,197 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+Diagnose issues now end when they should, and moves nobody can feel no
+longer start them. A slow resolver on a home router can close. An issue whose
+subject went away closes as expired instead of waiting for a recovery that
+cannot come, and a muted fault stays one issue. A gateway hovering at its line
+stays one open issue instead of a string of recoveries. `diagnose run` exits 1
+only on an issue, and its JSON is now schema 2, which breaks scripts that read
+info findings or `passed`. The gap 0.33 listed is closed: every rule whose
+open or close changed since 0.32 has a pinned episode in which it opens and
+closes, apart from `iface.errors` on Wi-Fi.
+
+### Changed
+- **Breaking:** `diagnose run --format json` is now schema 2. `issues` holds
+  issues only, a new `observations` array holds the rest, and each finding
+  carries a `kind` of `issue` or `observation`. Checks carry `state`, and
+  `why_not` when they did not run. `passed` is no longer written anywhere,
+  including recordings and exports. Scripts that read info findings from
+  `issues`, or `passed` from checks, need updating. Older recordings still
+  load, but 0.33 and earlier cannot read one made by this release.
+- Info findings are now Observations: a symmetric NAT, a route change that
+  added 20 ms or less, a receiver-limited socket, or a target that fails for
+  reasons that are not the network's. Diagnose still lists them, but the
+  status line on every tab counts only issues. A host whose only findings are
+  Observations reads "no issues" (learning or limited) instead of "1 issue",
+  and the report's summary counts observations separately instead of calling
+  the host "nominal with notes".
+- `diagnose run` exits 1 only on an issue. An observation is listed under its
+  own heading and leaves the exit status at 0.
+- `diagnose run --target api` now exits 1 when the target's service fails: an
+  HTTP 503, a refused port or a name that does not exist. It reports this as a
+  medium issue marked "service, not network", and the Diagnose tab still
+  lists it as an observation. The run also keeps the gateway, interface and
+  resolver issues that could lie on the target's route, so a gateway failure
+  that hides the target's own finding no longer exits 0. `--target` can
+  therefore exit 1 while the target itself is healthy, if an issue such as
+  weak Wi-Fi, a gateway RTT spike or local bufferbloat is open. A script that
+  uses it as a service health check should look at which subject is in
+  `issues`. A target on loopback keeps only an issue that hides its own
+  finding, and a target never probed inside the budget still exits 2.
+- Diagnose no longer calls a move nobody can feel a deviation. Every
+  baseline's σ is now at least 0.5 ms, or 5% of its mean if larger. A
+  resolver that answers from cache in 1.2 ms, give or take 0.05 ms, now needs
+  2.7 ms to reach 3σ, where 1.35 ms did before. The Dashboard's latency tiles
+  and Diagnose evidence show the floored σ, so a slow target stage no longer
+  reports its baseline as "σ0". Baselines also learn against it, so ordinary
+  jitter on a quiet link is no longer held out as an outlier. Setting
+  `sigma_floor_ms` and `sigma_floor_pct` to 0 restores the raw σ.
+- DNS and gateway issues open later. `gateway.rtt_spike` also needs the
+  gateway at least 10 ms slower than its baseline, and `dns.slow_resolver`'s
+  baseline test needs the median at least 5 ms slower than its baseline and
+  at least twice it. A LAN resolver going from 1.2 to 2.7 ms, or a wired
+  gateway from 2 to 9 ms, no longer opens an issue. Its Dashboard tile can
+  still turn red, and says no issue was raised. The 100 ms DNS ceiling still
+  opens with or without a baseline.
+- `gateway.rtt_spike`, `path.rtt_spike` and `target.slow_stage` still open at
+  3σ, but now close only once the metric has stayed under 2σ
+  (`sigma_close_k`) for the verify hold. Noisy links take longer to close. A
+  `sigma_close_k` at or above `sigma_k` is replaced and logged, and a
+  `sigma_k` of 2 or less brings the default close line down to two thirds of
+  it, with a warning.
+- An issue keeps the close condition it opened or reopened with, so a close
+  line worked out from the metric no longer moves with the value it judges.
+- The engine setting `auto_close_secs`, which nothing ever read, is now
+  `expire_after_secs`, default 60 s: how long what an issue is about must
+  stay gone before the issue expires. Recordings that use the old name still
+  load.
+- Recordings now store the configuration each sample ran with: the system
+  resolvers, the enabled targets and their revisions, the trace target and
+  interval, and the interfaces. A resolver or interface list the platform
+  returned empty is recorded as unknown, not as "none". `diagnose run`
+  records periodic tracing as off, because it never traces on a timer. Older
+  recordings load as "configuration unknown", and redacted exports hide
+  target names and revisions.
+- The coverage document no longer says `gateway.unreachable` fires on a
+  failed ARP or ICMP probe. netwatch sends no ARP, and the rule needs ICMP and
+  the TCP fallback to the gateway to fail, and the internet probe too.
+  `link.down` now says where each OS's "down" comes from. On macOS it is the
+  admin `UP` flag, so an unplugged cable on an interface still configured up
+  is not reported yet.
+
+### Added
+- Diagnose thresholds can be set in `config.toml` under
+  `[diagnose_thresholds]`, for example `dns_ceiling_ms = 30`. Keys left out
+  keep their defaults. The engine used to ignore anything set there and
+  always ran on the built-in numbers. A value that cannot mean anything, such
+  as a σ multiple of 0 or less, `consecutive_n = 0`, a percentage outside
+  0 to 100, a negative σ floor, `nan` or `inf`, falls back to its default
+  with a warning in the log, and `diagnose run` and `diagnose coverage` print
+  the warning to stderr too. The keys new in this release are `sigma_close_k`,
+  `sigma_floor_ms`, `sigma_floor_pct`, `gateway_delta_floor_ms`,
+  `dns_delta_floor_ms` and `dns_delta_multiple`. A recording made before a
+  threshold existed replays with that threshold at its default, so one from
+  0.33 is judged against floors it ran without.
+- A closed state, `expired`, for an issue whose subject went away. Diagnose
+  closes an issue as "expired, evidence gone" only after what it was about
+  has been gone for 60 s: the socket closed, the target left the config or
+  its entry changed, the resolver left the system list, the periodic trace
+  moved to another target, or the platform stopped listing the interface and
+  the collector no longer reads it. An expiry is never a recovery. A step
+  carried out before one reads "closed without a measurement", not
+  "recovered". An expired condition that returns within 30 minutes reopens
+  the same issue with its count.
+- "stale since HH:MM:SS" on an open issue whose evidence stopped arriving, in
+  the tab and the report. The issue stays open, so a gateway that can't be
+  probed because ICMP is blocked no longer risks closing a real outage.
+  netwatch reads sockets only in the Dense view and under `diagnose run`, so
+  socket issues expire there; in the Full and Lite views they go stale
+  instead, until a later release reads sockets in every view. `diagnose run
+  --format json` findings carry an optional `stale_since`, and a socket issue
+  whose socket closed a minute or more before the run ended no longer counts
+  toward the exit code.
+- The pinned replay corpus lists its episodes in
+  `tests/diagnose/corpus/manifest.toml`, and `netwatch diagnose corpus --only
+  ID` regenerates one. It now pins an open→close episode for each rule whose
+  open or close changed since 0.32: a router resolver, a gateway spike and a
+  gateway hovering at its line, a lost carrier, a weak Wi-Fi signal, a path
+  RTT spike and a slow target stage that close only under the 2σ line, and
+  three socket issues that expire a minute after their socket closes. An
+  unknown carrier is pinned too, and opens nothing. A test fails unless every
+  such rule opens and closes in a pinned episode or is listed with the reason
+  it can't close yet, and another fails when a synthetic episode is no longer
+  what its scenario in `fixture.rs` records.
+- Pinned decisions record why each issue left the list (`close_reason`):
+  auto-closed, expired, resolved, muted, suppressed, or pruned when the
+  history limit dropped it on the tick it closed. An expiry, a suppression
+  and a verified fix no longer pin the same way. Decision files without the
+  field still load.
+- A test that fails when a rule's trigger text quotes a number its detector
+  does not judge with, or leaves out one it does.
+
+### Fixed
+- Enter in Settings loads the row you are on again. Since 0.29 added the
+  View row, the edit box filled with the next row's value, so accepting GeoIP
+  DB Path unchanged saved the ASN database path as `geoip_db`.
+- A slow-resolver issue on a router never closed. It needed the median under
+  a flat 5 ms, which a router answering in 10 ms never reaches, so the issue
+  stayed open until netwatch restarted. It now closes against a line set when
+  it opens: 0.8 of the line it opened on, or 2σ above the resolver's mean if
+  that is higher, held for 60 s. With no baseline it closes under 0.8 of
+  `dns_ceiling_ms`, which is 80 ms by default. On a resolver whose normal
+  range reaches the ceiling, the issue closes once the median has stayed
+  under the ceiling for 60 s.
+- Muting a Diagnose issue (`m`) filed a second, identical issue while the
+  fault continued, and the muted one was drawn and reported as fixed. A muted
+  issue now stays one issue, and the mute ends on time an hour later,
+  including when that hour is the one the clocks go back. The chronology
+  shows `◌ muted until 07:48` in the muted colour, the verdict row and the
+  report summary add "· 1 muted", the report lists it under Muted findings
+  instead of Retained closed findings, and the status after `m` names the
+  time the mute ends. A muted issue can still auto-close or expire, and a step
+  marked done before the mute is no longer credited with a recovery.
+- Muting a root cause let its consequences out from under it, so a symptom
+  such as a slow resolver headed the verdict for the hour. They now stay
+  under it. A mute that ends while the fault continues is recorded as one
+  incident and replays as one, not two.
+- An Observation no longer hides an issue. A route change that added 20 ms or
+  less used to take a path RTT spike on the same path out of the list. A
+  route change that adds more than 20 ms is still an issue and still explains
+  the spike.
+- Recorded episodes serialize the same way on every run. Issue snapshots and
+  baseline metrics came out in a different order each time, so regenerating
+  the corpus changed its files even when no decision had changed.
+- Recordings and `baselines.json` read their numbers back exactly. A replay
+  used to start from a baseline up to one bit off the one the live engine
+  judged against.
+- Editing a `[[diagnose_targets]]` entry while the target kept failing the
+  same way left the old issue open for good. The new result merged into it
+  and replaced the revision it was found under, so it never expired. It also
+  kept its mute, its applied steps and its close condition, now pointing at
+  an endpoint nobody had diagnosed. A target's issue now belongs to the
+  revision it was found under. The old issue expires 60 s after the edit.
+  The edited entry opens its own issue once its own probes confirm the
+  fault, unmuted and with no history. Changing the entry back within 30
+  minutes of that expiry reopens the old issue with its count. Recordings
+  now name a target's issue by rule, name and revision. A recording made
+  before this change gets the same names when it loads, so its labels, test
+  results and actions still find their issue. The exception is an issue it
+  recorded under two revisions, which is this bug. That issue keeps its old
+  name, `diagnose replay` shows it as divergent, and its labels and test
+  results drop out of `diagnose features` and the history.
+
+### Known gaps
+- `iface.errors` can open on a Wi-Fi driver's background drops, 70 a minute
+  in the pinned episode, and then never close, because it closes only under
+  one error or drop a minute combined. It is the one rule changed since 0.32
+  whose pinned episode stays open.
+- The close line of a slow-resolver issue does not follow the baseline. An
+  issue whose median settles between its close and open lines stays open
+  until netwatch restarts or the resolver leaves the config.
+
 ## [0.33.0] - 2026-09-29
 
 Diagnose stops reading what it did not measure as evidence. A check that

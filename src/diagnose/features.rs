@@ -263,7 +263,7 @@ fn build(input: &Input<'_>) -> Builder {
         let base = input.baselines?.get(subject?, metric)?;
         let value = value?;
         Some((
-            base.sigma_above(value),
+            base.sigma_above(value, input.thresholds.sigma_floor()),
             (base.mean > 0.0).then(|| value / base.mean),
         ))
     };
@@ -339,10 +339,17 @@ fn build(input: &Input<'_>) -> Builder {
 
     // ------------------------------------------------------ target
     b.group(Group::Target);
-    let target = match input.issue.map(|i| &i.subject) {
-        Some(super::issue::Subject::Target { name }) => {
-            obs.targets.iter().find(|t| &t.name == name)
-        }
+    // The probe of the entry the issue was found under: after an edit, the
+    // name's new entry is another target.
+    let target = match input.issue {
+        Some(Issue {
+            subject: super::issue::Subject::Target { name },
+            scope,
+            ..
+        }) => obs.targets.iter().find(|t| {
+            &t.name == name
+                && (scope.configuration.is_none() || scope.configuration == t.baseline_key)
+        }),
         _ => None,
     };
     let stage_ok = |s: Option<&super::targets::Stage>| s.map(|s| s.is_ok());
@@ -804,7 +811,7 @@ mod tests {
     #[test]
     fn names_do_not_depend_on_the_data() {
         let (issues, obs, base) = rich();
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let open: Vec<&Issue> = issues.iter().collect();
         let t = Thresholds::default();
         for issue in &issues {
@@ -830,7 +837,7 @@ mod tests {
             .iter()
             .find(|i| i.rule == "dns.slow_resolver")
             .unwrap();
-        let coverage = Coverage::from_observations(&obs, &base);
+        let coverage = Coverage::from_observations(&obs, &base, Default::default());
         let t = Thresholds::default();
         let v = extract(&Input {
             issue: Some(dns),
@@ -857,11 +864,43 @@ mod tests {
             at("check.gateway.rtt_spike.local_network_congested.gateway_rtt_above_baseline")
                 .is_nan()
         );
-        assert!(at("dns.rtt_p50.sigma") > 3.0);
+        // 40ms against 1.2ms, scored against the 0.5ms floor rather than the
+        // fixture's σ 0.4, as the detector scored it.
+        assert!((at("dns.rtt_p50.sigma") - 77.6).abs() < 1e-3);
         assert!(at("dns.rtt_p50_ms") > 30.0);
         assert!(at("context.secs_since_onset") > 0.0);
         assert!(at("nat.symmetric").is_nan(), "missing stays NaN, not 0");
         assert_eq!(at("load.idle_rtt_ms"), 12.0);
+    }
+
+    #[test]
+    fn a_target_issue_reads_the_probe_of_the_entry_it_was_found_under() {
+        let ep = fixture::synthetic("target-slow-stage").unwrap();
+        let issue = &ep.issues.first().unwrap().issue;
+        assert!(issue.scope.configuration.is_some());
+        let coverage = Coverage::default();
+        let t = Thresholds::default();
+        let connect_ms = |obs: &Observations| {
+            let v = extract(&Input {
+                issue: Some(issue),
+                obs,
+                baselines: None,
+                coverage: &coverage,
+                open: &[issue],
+                thresholds: &t,
+                capability_root: false,
+                ts: "2026-09-03 06:55:00",
+            });
+            v[schema()
+                .iter()
+                .position(|s| s.name == "target.connect_ms")
+                .unwrap()]
+        };
+        let mut obs = ep.frames.last().unwrap().obs.clone();
+        assert_eq!(connect_ms(&obs), 12.0);
+        // Edited: the name's probe is now of another entry.
+        obs.targets[0].baseline_key = Some("target-config:edited".into());
+        assert!(connect_ms(&obs).is_nan());
     }
 
     #[test]
