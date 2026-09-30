@@ -781,6 +781,104 @@ fn dns_slow_router(t: u64) -> Observations {
     obs
 }
 
+/// A healthy probe's rtt: `mean`, give or take `spread`, moving from one
+/// probe to the next in a fixed order, so a recording stays the same.
+fn wobble(probe: u64, mean: f64, spread: f64) -> f64 {
+    const STEPS: [f64; 6] = [0.0, 0.7, -0.3, 1.0, -1.0, 0.3];
+    mean + spread * STEPS[(probe % 6) as usize]
+}
+
+/// [`live_baselines`] with the router answering its own pings in 1.0 ms,
+/// σ 0.3.
+fn wired_gateway_baselines() -> BaselineStore {
+    let mut b = live_baselines();
+    b.seed(GATEWAY, "gateway.rtt", 1.0, 0.3, 2_400);
+    b
+}
+
+/// The router, answering its own pings in 1.0 ms, give or take 0.3. From
+/// 120 s its CPU is busy and it answers in 40 ms, though what it forwards
+/// is not held up; from 300 s it answers in 1.0 ms again. The issue opens
+/// on the third slow probe and closes once the rtt has held under 2σ,
+/// 2.0 ms against the 0.5 ms σ floor, for 120 s.
+fn gateway_rtt(t: u64) -> Observations {
+    let rtt = match phase(t, &STORY) {
+        Phase::Fault => 40.0,
+        _ => wobble(t / 5, 1.0, 0.3),
+    };
+    let mut obs = quiet_frame();
+    obs.gateway = Some(GatewayObs {
+        rtt_ms: Some(rtt),
+        // The sampler has no ARP probe.
+        arp_ok: None,
+        ..healthy_gateway()
+    });
+    obs
+}
+
+/// The laptop's Wi-Fi interface.
+const WLAN: &str = "wlan0";
+
+/// The demo network's live baselines over Wi-Fi, where the access point
+/// answers its own pings in 4 ms, σ 4.
+fn wifi_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(NetworkFingerprint::new(
+        WLAN,
+        Some(GATEWAY.to_string()),
+        vec![RESOLVER.to_string()],
+        Some("192.168.8.0/24".to_string()),
+    ));
+    b.seed(RESOLVER, "dns.rtt_p50", 1.2, 0.4, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 4.0, 4.0, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// [`quiet_frame`] on a laptop on Wi-Fi: wlan0 at −53 dBm with 7% of
+/// frames retried, what `iw station dump` showed on a healthy link, and
+/// the access point answering in 4 ms, give or take 3.
+fn wifi_frame(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.iface = Some(IfaceObs {
+        name: WLAN.into(),
+        counter_window_secs: Some(60.0),
+        wireless: Some(true),
+        // The sampler reads no link rate on a radio.
+        link_rate_bps: None,
+        signal_dbm: Some(-53),
+        tx_retry_pct: Some(7.0),
+        ..healthy_iface()
+    });
+    obs.gateway = Some(GatewayObs {
+        rtt_ms: Some(wobble(t / 5, 4.0, 3.0)),
+        arp_ok: None,
+        ..healthy_gateway()
+    });
+    if let Some(config) = &mut obs.config {
+        config.interfaces = Some(vec!["lo".into(), WLAN.into()]);
+    }
+    obs
+}
+
+/// The access point hovering at the open line. Against its 4 ms baseline
+/// (σ 4), 3σ is 16 ms, 12 ms over the mean and past the 10 ms delta
+/// floor. From 120 s its own replies slow: 30 s at 16.4 ms (3.1σ), then
+/// three minutes at 15.6 ms (2.9σ), three times over. Each dip is under
+/// the open line and over the 2σ close line, so the issue stays one
+/// issue; under a 3σ close line each dip outlasts the 120 s hold, and the
+/// issue closes and reopens. From 750 s it answers in 4 ms again, and the
+/// issue closes 120 s later.
+fn gateway_rtt_edge(t: u64) -> Observations {
+    let mut obs = wifi_frame(t);
+    if (120..750).contains(&t) {
+        let sigma = if (t - 120) % 210 < 30 { 3.1 } else { 2.9 };
+        if let Some(gw) = &mut obs.gateway {
+            gw.rtt_ms = Some(4.0 + sigma * 4.0);
+        }
+    }
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -818,6 +916,14 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             baselines: router_baselines,
             ..Scenario::live("dns-slow-router", 420, dns_slow_router)
+        },
+        Scenario {
+            baselines: wired_gateway_baselines,
+            ..Scenario::live("gateway-rtt", 480, gateway_rtt)
+        },
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("gateway-rtt-edge", 930, gateway_rtt_edge)
         },
     ]
 }
@@ -1282,6 +1388,62 @@ mod tests {
         let ep = synthetic("dns-slow-router").unwrap();
         let line = ep.issues[0].issue.verify.threshold;
         assert!((line - 16.8).abs() < 1e-9, "{line}");
+    }
+
+    /// A router answering in 40 ms opens gateway.rtt_spike on the third slow
+    /// probe, at 130 s, and back at 1.0 ms from 300 s it closes once that
+    /// has held under 2σ for 120 s.
+    #[test]
+    fn a_gateway_rtt_spike_closes_once_the_router_answers_again() {
+        assert_eq!(
+            pinned_spans("gateway-rtt"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:51:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// B11's deadband, in the corpus. An access point hovering at the open
+    /// line is one issue from its first open, at 130 s, until 120 s after
+    /// the hover ends at 750 s. With the close line on the open line, the
+    /// same frames close it after each dip and reopen it on each rise.
+    #[test]
+    fn a_gateway_hovering_at_the_open_line_stays_one_issue() {
+        assert_eq!(
+            pinned_spans("gateway-rtt-edge"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:58:30",
+                "auto-closed"
+            )]
+        );
+        let edge = scenarios()
+            .into_iter()
+            .find(|s| s.id == "gateway-rtt-edge")
+            .unwrap();
+        let flapping = record(&Scenario {
+            thresholds: Thresholds {
+                sigma_close_k: 3.0,
+                ..Thresholds::default()
+            },
+            ..edge
+        });
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&flapping);
+        let closes: Vec<_> = decisions
+            .issues
+            .iter()
+            .map(|s| s.closed.as_deref())
+            .collect();
+        assert_eq!(
+            closes,
+            vec![
+                Some("2026-09-03 06:48:30"),
+                Some("2026-09-03 06:52:00"),
+                Some("2026-09-03 06:55:30"),
+            ]
+        );
     }
 
     /// Without an age under its own name a target's result is dropped as
