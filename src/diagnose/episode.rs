@@ -19,7 +19,7 @@
 //!
 //! Recording is local. Nothing here uploads or redacts; exports do that.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -741,14 +741,62 @@ pub fn load(path: &Path) -> std::io::Result<Episode> {
     } else {
         std::io::BufReader::new(file).read_to_string(&mut text)?;
     }
-    let episode: Episode = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+    let mut episode: Episode = serde_json::from_str(&text).map_err(std::io::Error::other)?;
     if episode.schema_version > SCHEMA_VERSION {
         return Err(std::io::Error::other(format!(
             "episode schema {} is newer than this netwatch ({SCHEMA_VERSION})",
             episode.schema_version
         )));
     }
+    add_target_revisions(&mut episode);
     Ok(episode)
+}
+
+/// Rename target issues recorded as `rule|name` to `rule|name|revision`.
+///
+/// Before 0.34 a target's issue key had no revision. The engine now files
+/// that issue under its revision, so an older recording's labels, test
+/// results, actions and open keys would match nothing it replays to: the
+/// labels and "tested" rows would drop out of `diagnose features` and the
+/// history, and replay would skip the actions. A key is renamed only when
+/// every snapshot of that rule and name carries the same revision. One seen
+/// under two revisions is the edit the new key fixes, and the recording does
+/// not say which revision each event meant. A recording made since has no
+/// `rule|name` key with a revision to add, so this changes nothing in it.
+fn add_target_revisions(episode: &mut Episode) {
+    let mut revisions: HashMap<String, HashSet<Option<String>>> = HashMap::new();
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    for snap in &episode.issues {
+        let issue = &snap.issue;
+        if matches!(issue.subject, Subject::Target { .. }) {
+            let old = super::issue::finding_key(&issue.rule, &issue.subject, None);
+            revisions
+                .entry(old.clone())
+                .or_default()
+                .insert(issue.scope.configuration.clone());
+            renamed.insert(old, issue.key());
+        }
+    }
+    renamed.retain(|old, new| revisions[old].len() == 1 && new != old);
+    if renamed.is_empty() {
+        return;
+    }
+    let rename = |key: &mut String| {
+        if let Some(new) = renamed.get(key.as_str()) {
+            key.clone_from(new);
+        }
+    };
+    for label in &mut episode.labels {
+        rename(&mut label.issue);
+    }
+    for frame in &mut episode.frames {
+        for open in &mut frame.open {
+            rename(&mut open.key);
+        }
+        for event in &mut frame.events {
+            rename(event.issue_mut());
+        }
+    }
 }
 
 /// One incident in the history list: enough to render a row and open the
@@ -2112,6 +2160,83 @@ mod tests {
         let choices = label_choices(issue);
         assert_eq!(choices[0].0, "gateway.rtt_spike/local_network_congested");
         assert_eq!(choices.last().unwrap().0, "unknown");
+    }
+
+    /// Recorded before a target's key carried its revision, an episode names
+    /// its target issue `rule|name`. The engine files that issue under
+    /// `rule|name|revision` now, so unless loading renames them, its labels
+    /// and test results match nothing and drop out of the training rows and
+    /// the history.
+    #[test]
+    fn a_recording_from_before_target_revisions_keeps_its_labels_and_tests() {
+        use crate::diagnose::engine::EngineEvent;
+        use crate::diagnose::next_test::{Outcome, TestRun};
+        let key = "target.slow_stage|api|target-config:synthetic-api";
+        let old = "target.slow_stage|api";
+        let mut older = crate::diagnose::fixture::synthetic("target-slow-stage").unwrap();
+        assert_eq!(older.issue_keys(), vec![key.to_string()]);
+        for open in older.frames.iter_mut().flat_map(|f| &mut f.open) {
+            open.key = old.into();
+        }
+        older.labels.push(Label {
+            issue: old.into(),
+            cause: "target.slow_stage/server_stage_slow".into(),
+            source: LabelSource::User,
+            ts: "2026-09-03 06:56:00".into(),
+            note: None,
+        });
+        let tested = older
+            .frames
+            .iter()
+            .position(|f| !f.open.is_empty())
+            .unwrap()
+            + 1;
+        let at = older.frames[tested].ts.clone();
+        older.frames[tested]
+            .events
+            .push(EngineEvent::TestCompleted {
+                issue: old.into(),
+                run: TestRun {
+                    test: "load.idle_vs_loaded".into(),
+                    at,
+                    outcome: Outcome::Negative,
+                    detail: String::new(),
+                    measurements: Default::default(),
+                    after_action: false,
+                },
+            });
+        assert!(!replay(&older).matches());
+
+        let dir = std::env::temp_dir().join(format!("nw-old-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = save(&dir, &older).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.issue_keys(), vec![key.to_string()]);
+        assert_eq!(back.labels[0].issue, key);
+        assert!(matches!(
+            back.frames[tested].events.as_slice(),
+            [EngineEvent::TestCompleted { issue, .. }] if issue == key
+        ));
+        let report = replay(&back);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        let rows = crate::diagnose::features::decisions(&back);
+        let triggers: Vec<_> = rows.iter().map(|r| r.trigger).collect();
+        assert_eq!(triggers, ["opened", "tested", "closed"]);
+        assert!(rows
+            .iter()
+            .all(|r| r.label.as_deref() == Some("target.slow_stage/server_stage_slow")));
+        let summary = summarise(&back, &path);
+        assert!(summary.issues[0].label.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Seen under two revisions, the issue is the one the new key splits,
+        // and which revision each label or event meant is not recorded.
+        let mut edited = older.clone();
+        edited.issues.last_mut().unwrap().issue.scope.configuration =
+            Some("target-config:edited".into());
+        add_target_revisions(&mut edited);
+        assert_eq!(edited.labels[0].issue, old);
+        assert_eq!(edited.issue_keys(), vec![old.to_string()]);
     }
 
     #[test]

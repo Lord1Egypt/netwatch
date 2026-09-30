@@ -173,10 +173,13 @@ closes, apart from `iface.errors` on Wi-Fi.
   revision it was found under. The old issue expires 60 s after the edit.
   The edited entry opens its own issue once its own probes confirm the
   fault, unmuted and with no history. Changing the entry back within 30
-  minutes reopens the old issue with its count. Recordings now name a
-  target's issue by rule, name and revision. `diagnose replay` of a
-  recording made before this change therefore shows its target issues as
-  divergent, and skips actions taken on them.
+  minutes of that expiry reopens the old issue with its count. Recordings
+  now name a target's issue by rule, name and revision. A recording made
+  before this change gets the same names when it loads, so its labels, test
+  results and actions still find their issue. The exception is an issue it
+  recorded under two revisions, which is this bug. That issue keeps its old
+  name, `diagnose replay` shows it as divergent, and its labels and test
+  results drop out of `diagnose features` and the history.
 
 ### Known gaps
 - `iface.errors` can open on a Wi-Fi driver's background drops, 70 a minute

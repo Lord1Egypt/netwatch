@@ -341,6 +341,20 @@ pub enum EngineEvent {
     },
 }
 
+impl EngineEvent {
+    /// The key of the issue this event is about.
+    pub fn issue_mut(&mut self) -> &mut String {
+        match self {
+            EngineEvent::Acked { issue }
+            | EngineEvent::Muted { issue, .. }
+            | EngineEvent::Resolved { issue, .. }
+            | EngineEvent::Applied { issue, .. }
+            | EngineEvent::TestCompleted { issue, .. }
+            | EngineEvent::StepDone { issue, .. } => issue,
+        }
+    }
+}
+
 /// No target result newer than this means target rules have no input.
 const TARGET_STALE_SECS: u64 = 900;
 
