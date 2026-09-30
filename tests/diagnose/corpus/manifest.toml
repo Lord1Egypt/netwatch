@@ -45,3 +45,9 @@ id = "target-slow-stage"
 kind = "synthetic"
 rules = ["target.slow_stage"]
 note = "The api target, probed once a minute against a 40 ms first-byte baseline (σ 4): 41 ms, then 400 ms from 180 s, 50 ms (2.5σ, between the close and open lines) from 360 s, and 41 ms from 480 s. Opens on the third slow probe and closes after 180 s under the 2σ line."
+
+[[episode]]
+id = "dns-slow-router"
+kind = "synthetic"
+rules = ["dns.slow_resolver"]
+note = "A router resolver, 10.5 ms (σ 0.3): a p50 of 10 ms, then 150 ms from 120 s, over the ceiling, and 11 ms from 300 s. Opens on the third slow probe and closes after 60 s under 16.8 ms, 0.8 of the 21 ms baseline line it opened on."

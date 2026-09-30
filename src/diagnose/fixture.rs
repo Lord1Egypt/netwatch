@@ -474,10 +474,11 @@ fn quiet_frame() -> Observations {
     }
 }
 
-/// Healthy until 120 s, faulty until the socket closes at 300 s, then gone.
-/// A socket verdict holds 30 s and three samples before it opens, so each
-/// socket episode opens at 152 s, and expires 60 s after the close.
-const SOCKET_STORY: [(u64, Phase); 3] = [
+/// Healthy until 120 s, faulty until 300 s, then clear. In a socket
+/// episode the socket closes at 300 s; a socket verdict holds 30 s and
+/// three samples before it opens, so each opens at 152 s, and expires 60 s
+/// after the close.
+const STORY: [(u64, Phase); 3] = [
     (0, Phase::Healthy),
     (120, Phase::Fault),
     (300, Phase::Clear),
@@ -525,7 +526,7 @@ fn retrans_socket_closes(t: u64) -> Observations {
         rx_bps: 4.2e4,
         verdict_age_secs: t,
     };
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(scp),
         Phase::Fault => obs.sockets.push(SocketObs {
             rtt_ms: Some(38.0),
@@ -546,7 +547,7 @@ fn retrans_socket_closes(t: u64) -> Observations {
 fn bufferbloat_remote_socket_closes(t: u64) -> Observations {
     let mut obs = quiet_frame();
     obs.sockets.push(neighbour_socket(t));
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(SocketObs {
             rtt_ms: Some(1.1),
             rttvar_ms: Some(0.3),
@@ -579,7 +580,7 @@ fn zero_window_socket_closes(t: u64) -> Observations {
         rx_bps: 2.2e5,
         verdict_age_secs: t,
     };
-    match phase(t, &SOCKET_STORY) {
+    match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(rsync),
         Phase::Fault => obs.sockets.push(SocketObs {
             rwnd: Some(0),
@@ -725,6 +726,61 @@ fn target_slow_stage(t: u64) -> Observations {
     obs
 }
 
+/// [`live_baselines`] on a network whose router is its resolver too,
+/// answering in 10.5 ms (σ 0.3), as the notes measured one.
+fn router_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(NetworkFingerprint::new(
+        IFACE,
+        Some(GATEWAY.to_string()),
+        vec![GATEWAY.to_string()],
+        Some("192.168.8.0/24".to_string()),
+    ));
+    b.seed(GATEWAY, "dns.rtt_p50", 10.5, 0.3, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 0.9, 0.2, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// The router's DNS forwarder. The p50 reads 10 ms, then 150 ms from
+/// 120 s, when the router's upstream slows, and 11 ms from 300 s. Live,
+/// the p50 is a median over ten minutes of probes, so these are the times
+/// the median moves, some minutes after the resolver does. The issue opens
+/// on the third slow probe. It closes once 11 ms has held 60 s under
+/// 16.8 ms, 0.8 of the 21 ms line it opened on, twice the baseline, though
+/// the 100 ms ceiling fired too. The flat 5 ms line this replaced never
+/// closed it.
+fn dns_slow_router(t: u64) -> Observations {
+    let (p50, p95) = match phase(t, &STORY) {
+        Phase::Healthy => (10.0, 12.0),
+        Phase::Fault => (150.0, 180.0),
+        Phase::Clear => (11.0, 13.0),
+    };
+    let mut obs = quiet_frame();
+    if let Some(config) = &mut obs.config {
+        config.resolvers = Some(vec![GATEWAY.into()]);
+    }
+    // As the live sampler fills it: ten minutes of probes to the one
+    // resolver, and no alternate, icmp or cached timing, which it never
+    // measures.
+    obs.dns = Some(DnsObs {
+        resolver: GATEWAY.into(),
+        rtt_p50_ms: Some(p50),
+        rtt_p95_ms: Some(p95),
+        failure_rate_pct: 0.0,
+        truncation_rate_pct: 0.0,
+        queries: 120,
+        failed: 0,
+        truncated: 0,
+        alt_resolver: None,
+        alt_rtt_ms: None,
+        icmp_rtt_ms: None,
+        cached_rtt_ms: None,
+        window_secs: 600,
+        cross: None,
+    });
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -758,6 +814,10 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             baselines: target_baselines,
             ..Scenario::live("target-slow-stage", 720, target_slow_stage)
+        },
+        Scenario {
+            baselines: router_baselines,
+            ..Scenario::live("dns-slow-router", 420, dns_slow_router)
         },
     ]
 }
@@ -1202,6 +1262,26 @@ mod tests {
                 "auto-closed"
             )]
         );
+    }
+
+    /// B13 closes a slow-resolver issue relative to the line it opened on.
+    /// The router's 150 ms p50 opens the issue on the third slow probe, at
+    /// 130 s, over the ceiling and over its baseline's 21 ms line, and 11 ms
+    /// from 300 s holds under 0.8 of the lower line for 60 s. The flat 5 ms
+    /// line B13 replaced never closed it.
+    #[test]
+    fn a_router_resolver_issue_closes_under_the_line_it_opened_on() {
+        assert_eq!(
+            pinned_spans("dns-slow-router"),
+            vec![span(
+                "2026-09-03 06:46:10",
+                "2026-09-03 06:50:00",
+                "auto-closed"
+            )]
+        );
+        let ep = synthetic("dns-slow-router").unwrap();
+        let line = ep.issues[0].issue.verify.threshold;
+        assert!((line - 16.8).abs() < 1e-9, "{line}");
     }
 
     /// Without an age under its own name a target's result is dropped as

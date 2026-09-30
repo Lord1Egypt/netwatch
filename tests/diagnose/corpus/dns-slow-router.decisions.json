@@ -1,0 +1,13 @@
+{
+  "episode": "dns-slow-router",
+  "frames": 421,
+  "issues": [
+    {
+      "key": "dns.slow_resolver|192.168.8.1",
+      "opened": "2026-09-03 06:46:10",
+      "closed": "2026-09-03 06:50:00",
+      "top_cause": "dns.slow_resolver/resolver_overloaded",
+      "close_reason": "auto-closed"
+    }
+  ]
+}
