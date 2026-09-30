@@ -687,6 +687,50 @@ mod tests {
         }
     }
 
+    /// Every on/off row reads "off" in the fixture, so the test above passes
+    /// even if one of them reads another's flag. Turn each on alone: only its
+    /// own row may read "on", and accepting "on" there must set that flag and
+    /// nothing else.
+    #[test]
+    fn each_on_off_row_owns_its_flag() {
+        let turn_on = |c: &mut NetwatchConfig, at: usize| match at {
+            cursor::SHOW_GEO => c.show_geo = true,
+            cursor::PACKET_FOLLOW => c.packet_follow = true,
+            cursor::AI_INSIGHTS => c.insights_enabled = true,
+            cursor::GRAPH_FADE => c.graph_fade = true,
+            cursor::GROUPS_COLLAPSED => c.groups_start_collapsed = true,
+            _ => panic!("no flag to turn on for {}", ROWS[at].label),
+        };
+        let flags: Vec<usize> = fixture::EDIT_VALUES
+            .iter()
+            .filter(|&&(_, v)| v == "off")
+            .map(|&(at, _)| at)
+            .collect();
+
+        for &on in &flags {
+            let mut want = fixture::config();
+            turn_on(&mut want, on);
+            for &at in &flags {
+                let reads = if at == on { "on" } else { "off" };
+                assert_eq!(
+                    get_edit_value(&want, at),
+                    reads,
+                    "{} with {} on",
+                    ROWS[at].label,
+                    ROWS[on].label
+                );
+            }
+            let mut got = fixture::config();
+            assert_eq!(apply_edit(&mut got, on, "on"), Ok(()));
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{want:?}"),
+                "{}",
+                ROWS[on].label
+            );
+        }
+    }
+
     /// Accepting what Enter loaded, unchanged, must leave the config as it
     /// was. With the old numbering, accepting GeoIP DB Path saved the ASN
     /// path into `geoip_db`.
