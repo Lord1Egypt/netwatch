@@ -63,6 +63,15 @@ gateway that is down. The socket collector refreshes only in the Dense view
 and under `netwatch diagnose run`, so in the Full and Lite views a socket issue
 goes stale instead of expiring.
 
+Muting an issue (`m`) quiets it for an hour and does not close it. It leaves
+the issue list and the verdict, which says how many it left out ("1 muted"),
+and the chronology shows it as `◌ muted until` and the time. The report lists
+it under Muted findings, not as closed. Netwatch keeps watching it: the same
+condition does not open a second issue, and the muted issue still auto-closes
+or expires as above. A muted root cause keeps its consequences under it, so a
+symptom does not take its place in the verdict. When the hour is up, an issue
+that has not closed is open again.
+
 ## History and sharing
 
 **Incident history** lists the latest 100 saved incidents, including their

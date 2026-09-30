@@ -701,7 +701,10 @@ pub fn apply_suppression(issues: &mut [Issue]) {
         }
         let mut best: Option<(usize, Severity)> = None;
         for (ri, root) in issues.iter().enumerate() {
-            if ri == ci || !root.state.is_open() {
+            // A muted root still explains its symptoms. Releasing them would
+            // put a consequence at the head of the verdict for the hour the
+            // user asked the cause to be quiet.
+            if ri == ci || !root.state.is_tracked() {
                 continue;
             }
             let Some(rule) = lookup(&root.rule) else {

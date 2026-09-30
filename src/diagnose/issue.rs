@@ -897,6 +897,22 @@ impl IssueState {
         matches!(self, IssueState::Open | IssueState::Acked)
     }
 
+    /// Open, acknowledged or muted: the engine still watches it. A muted
+    /// issue is only quiet. Its condition merges into it, its verify can close
+    /// it and its subject can expire it, so it is not closed, and nothing may
+    /// file the same condition as a second issue while it lasts.
+    pub fn is_tracked(&self) -> bool {
+        self.is_open() || matches!(self, IssueState::Muted { .. })
+    }
+
+    /// When a mute ends, for a muted issue.
+    pub fn muted_until(&self) -> Option<&str> {
+        match self {
+            IssueState::Muted { until } => Some(until),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             IssueState::Open => "open",
@@ -1153,6 +1169,12 @@ pub fn format_duration(secs: u64) -> String {
 /// TUI has 80 columns and shows the time only.
 pub fn short_time(ts: &str) -> &str {
     ts.split(' ').next_back().unwrap_or(ts)
+}
+
+/// `"2026-09-03 06:48:10"` → `"06:48"`, for a column or a status line with no
+/// room for seconds.
+pub fn hh_mm(ts: &str) -> String {
+    short_time(ts).chars().take(5).collect()
 }
 
 #[cfg(test)]

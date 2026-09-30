@@ -64,12 +64,34 @@ impl Report {
         self.issues.iter().find(|i| i.id == id)
     }
 
-    /// The one-line verdict. Same shape as the toast and the verdict line.
+    /// Findings muted by hand. Not open, since they left the verdict, and not
+    /// closed either: netwatch still watches each one.
+    fn muted(&self) -> Vec<&Issue> {
+        self.issues
+            .iter()
+            .filter(|i| i.state.muted_until().is_some())
+            .collect()
+    }
+
+    /// Findings that have closed: neither open nor muted.
+    fn closed(&self) -> Vec<&Issue> {
+        self.issues
+            .iter()
+            .filter(|i| !i.state.is_tracked())
+            .collect()
+    }
+
+    /// The one-line verdict. Same shape as the toast and the verdict line,
+    /// which also says how many findings it leaves out because they are muted.
     pub fn summary_line(&self) -> String {
+        let muted = match self.muted().len() {
+            0 => String::new(),
+            n => format!(" · {n} muted"),
+        };
         let primary = self.primary();
         if primary.is_empty() {
-            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
-            let mut line = format!("no open findings · {}", self.coverage.label());
+            let closed = self.closed().len();
+            let mut line = format!("no open findings · {}{muted}", self.coverage.label());
             if closed > 0 {
                 line.push_str(&format!(
                     " · {closed} retained closed finding{}",
@@ -88,7 +110,7 @@ impl Report {
             n => format!(" · {}", plural(n, "observation")),
         };
         let Some(worst) = issues.iter().map(|i| i.severity).max() else {
-            return format!("no open issues{notes}");
+            return format!("no open issues{notes}{muted}");
         };
         let state = match worst {
             Severity::Critical => "down",
@@ -98,7 +120,7 @@ impl Report {
         };
         let counts = severity_counts(&issues);
         format!(
-            "{state} — {} ({counts}){notes}",
+            "{state} — {} ({counts}){notes}{muted}",
             plural(issues.len(), "issue")
         )
     }
@@ -109,7 +131,8 @@ impl Report {
 
     /// The markdown report. Sections in the order the spec sets out: summary,
     /// one section per open issue in severity order, suppressed consequences
-    /// under their root cause, timeline, environment, evidence index.
+    /// under their root cause, muted findings, timeline, environment, evidence
+    /// index.
     pub fn to_markdown(&self) -> String {
         let mut m = String::new();
         let env = &self.environment;
@@ -161,7 +184,14 @@ impl Report {
                 m.push_str(&format!(" All {total} checks had their inputs."));
             }
             m.push_str("\n\n");
-            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
+            let muted = self.muted().len();
+            if muted > 0 {
+                m.push_str(&format!(
+                    "{} muted and still watched; see Muted findings.\n\n",
+                    plural(muted, "finding")
+                ));
+            }
+            let closed = self.closed().len();
             if closed > 0 {
                 m.push_str(&format!(
                     "{} closed during this session; see Retained closed findings.\n\n",
@@ -195,6 +225,33 @@ impl Report {
             m.push_str(&self.issue_section(n + 1, issue));
         }
 
+        // A muted finding is still a fault, so it comes before the history.
+        // A muted root keeps its consequences suppressed, and they are listed
+        // with it; nowhere else would name them.
+        let row = |i: &Issue, muted: String| {
+            vec![
+                format!("`{}`", i.id),
+                i.title.clone(),
+                i.severity.long_label().to_string(),
+                muted,
+            ]
+        };
+        let mut muted: Vec<Vec<String>> = Vec::new();
+        for issue in self.muted() {
+            let until = issue.state.muted_until().unwrap_or_default();
+            muted.push(row(issue, format!("until {}", time_of(until))));
+            for c in issue.consequences.iter().filter_map(|cid| self.find(cid)) {
+                muted.push(row(c, format!("with `{}`", issue.id)));
+            }
+        }
+        if !muted.is_empty() {
+            m.push_str("## Muted findings\n\n");
+            m.push_str(
+                "Muted, not closed: netwatch still watches each one, and it is open again when its mute ends.\n\n",
+            );
+            m.push_str(&md_table(&["ID", "Issue", "Severity", "Muted"], &muted));
+        }
+
         if !self.timeline.is_empty() {
             m.push_str("## Timeline\n\n");
             let rows: Vec<Vec<String>> = self
@@ -206,9 +263,8 @@ impl Report {
         }
 
         let closed: Vec<Vec<String>> = self
-            .issues
-            .iter()
-            .filter(|i| !i.state.is_open())
+            .closed()
+            .into_iter()
             .map(|i| {
                 // An expiry says what went away, so it cannot pass for one
                 // more close that netwatch watched clear.
@@ -690,6 +746,69 @@ mod tests {
             "{row}"
         );
         assert!(!row.contains("auto-closed"), "{row}");
+    }
+
+    /// A muted fault still running was filed under Retained closed findings,
+    /// and with nothing else open the summary said so too. It is listed as
+    /// muted, with the consequences it keeps suppressed.
+    #[test]
+    fn a_muted_issue_is_not_reported_closed() {
+        let (mut engine, _) = fixture::run();
+        let id = |e: &crate::diagnose::engine::Engine, rule: &str| {
+            e.issues()
+                .iter()
+                .find(|i| i.rule == rule)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let resolver = id(&engine, "dns.slow_resolver");
+        let path = id(&engine, "path.changed");
+        let spike = id(&engine, "path.rtt_spike");
+        assert!(engine.mute(&resolver, 60));
+        assert!(engine.mute(&path, 60));
+        let mut r = report();
+        r.issues = engine.issues().to_vec();
+
+        let line = r.summary_line();
+        assert!(line.ends_with(" · 2 muted"), "{line}");
+        let md = r.to_markdown();
+        assert!(!md.contains("## Retained closed findings"), "{md}");
+        let muted = md
+            .split("## Muted findings")
+            .nth(1)
+            .expect("a muted finding is listed");
+        let row = |id: &str| {
+            muted
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{id}`")))
+                .unwrap_or_else(|| panic!("no row for {id}: {muted}"))
+                .to_string()
+        };
+        // The fixture's clock stops at 06:51:20.
+        assert!(row(&resolver).contains("until 07:51:20"), "{muted}");
+        assert!(row(&path).contains("until 07:51:20"), "{muted}");
+        // path.rtt_spike is path.changed's consequence, quiet with it.
+        assert!(row(&spike).contains(&format!("with `{path}`")), "{muted}");
+
+        // Everything muted: nothing is open, and nothing has closed either.
+        let open: Vec<String> = engine
+            .issues()
+            .iter()
+            .filter(|i| i.state.is_open())
+            .map(|i| i.id.clone())
+            .collect();
+        for id in &open {
+            assert!(engine.mute(id, 60));
+        }
+        r.issues = engine.issues().to_vec();
+        let line = r.summary_line();
+        assert!(line.starts_with("no open findings"), "{line}");
+        assert!(line.ends_with(" · 4 muted"), "{line}");
+        let md = r.to_markdown();
+        assert!(md.contains("4 findings muted and still watched"), "{md}");
+        assert!(!md.contains("closed during this session"), "{md}");
+        assert!(!md.contains("## Retained closed findings"), "{md}");
     }
 
     #[test]

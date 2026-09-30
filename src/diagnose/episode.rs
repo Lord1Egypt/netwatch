@@ -437,7 +437,12 @@ impl Recorder {
         let done = match active.episode.source {
             EpisodeSource::QuietSample => elapsed >= QUIET_SAMPLE_SECS,
             _ => {
-                if open.is_empty() {
+                // Over when nothing is tracked, not when `primary` is empty. A
+                // muted issue has left `primary` but the engine still watches
+                // it, and a replay needs every frame up to its close or the
+                // end of its mute.
+                let tracked = tick.engine.issues().iter().any(|i| i.state.is_tracked());
+                if !tracked {
                     let since = *active.all_closed_since.get_or_insert(tick.at);
                     tick.at - since >= POST_ROLL_SECS
                 } else {
@@ -642,10 +647,12 @@ fn open_issue(issue: &Issue) -> OpenIssue {
     }
 }
 
-/// Keep every socket whose verdict can raise an issue or that an open issue is
-/// about, plus the busiest few by retransmits. Nothing dropped here could have
-/// produced or held an issue, and the kept set still carries rtt and rwnd
+/// Keep every socket whose verdict can raise an issue or that a tracked issue
+/// is about, plus the busiest few by retransmits. Nothing dropped here could
+/// have produced or held an issue, and the kept set still carries rtt and rwnd
 /// whenever any socket did, so replay reaches the same coverage and result.
+/// Muted issues count: the engine still closes or expires them on what their
+/// socket does.
 fn trim_sockets(obs: &mut Observations, t: &super::detectors::Thresholds, engine: &Engine) {
     if obs.sockets.len() <= TOP_SOCKETS {
         return;
@@ -653,7 +660,7 @@ fn trim_sockets(obs: &mut Observations, t: &super::detectors::Thresholds, engine
     let subjects: HashSet<(String, String)> = engine
         .issues()
         .iter()
-        .filter(|i| i.state.is_open())
+        .filter(|i| i.state.is_tracked())
         .filter_map(|i| match &i.subject {
             Subject::Socket { local, remote } => Some((local.clone(), remote.clone())),
             _ => None,
@@ -1877,6 +1884,35 @@ mod tests {
         assert_eq!(report.issues[0].close_reason.as_deref(), Some("muted"));
     }
 
+    /// A muted issue is not in `primary`, so the recorder took the incident
+    /// for over and ended it ten minutes into the mute. When the mute ran out
+    /// a second episode began, with a pre-roll recorded while the issue was
+    /// muted; a fresh engine replaying it opened the issue there, and live
+    /// showed nothing open.
+    #[test]
+    fn a_mute_that_ends_mid_fault_replays_as_one_episode() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 120.0, 5.0);
+        let id = s.engine.primary()[0].id.clone();
+        assert!(s.engine.mute(&id, 60));
+        // The fault outlasts the hour's mute by eight minutes.
+        s.run(|_| 80.0, 4_080.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        assert_eq!(s.finished.len(), 1, "{:?}", s.finished.len());
+        let report = replay(&s.finished[0]);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        // Quiet for the hour, then back on the frame the mute ended.
+        let spans: Vec<_> = report
+            .issues
+            .iter()
+            .map(|s| (s.opened.as_str(), s.close_reason.as_deref()))
+            .collect();
+        assert_eq!(spans.len(), 2, "{:#?}", report.issues);
+        assert_eq!(spans[0].1, Some("muted"));
+        assert_eq!(spans[1].0, "2026-09-14 10:17:00");
+    }
+
     #[test]
     fn a_label_lands_on_the_recording_or_the_saved_episode() {
         let key = "gateway.rtt_spike|host".to_string();
@@ -2147,6 +2183,57 @@ mod tests {
             .sockets
             .iter()
             .all(|s| s.retrans == Some(3) || s.rwnd == Some(0)));
+    }
+
+    /// The engine still closes or expires a muted issue on what its socket
+    /// does, so replay needs that socket even once it has gone quiet.
+    #[test]
+    fn a_muted_socket_issue_keeps_its_socket_in_the_recording() {
+        let t = crate::diagnose::detectors::Thresholds::default();
+        let socket = |port: u32, retrans: u32| crate::diagnose::detectors::SocketObs {
+            local: format!("10.0.0.2:{port}"),
+            remote: "10.0.0.3:9000".into(),
+            process: None,
+            rtt_ms: Some(20.0),
+            rttvar_ms: Some(2.0),
+            retrans: Some(retrans),
+            cwnd: Some(10),
+            ssthresh: Some(u32::MAX),
+            rwnd: Some(64_000),
+            mss: Some(1448),
+            tx_bps: 2.4e6,
+            rx_bps: 0.0,
+            verdict_age_secs: 90,
+        };
+        let mut settings = crate::diagnose::engine::Settings::default();
+        settings.thresholds.consecutive_n = 1;
+        let mut engine =
+            Engine::new(Box::new(crate::diagnose::engine::SystemClock)).with_settings(settings);
+        let base = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
+        let open = Observations {
+            sockets: vec![socket(40_000, 12)],
+            ..Default::default()
+        };
+        engine.observe(&open, &base);
+        let id = engine
+            .issues()
+            .iter()
+            .find(|i| i.rule == "tcp.retrans_burst")
+            .expect("the socket opens an issue")
+            .id
+            .clone();
+        assert!(engine.mute(&id, 60));
+
+        // It has stopped retransmitting, among a hundred busier sockets.
+        let quiet = socket(40_000, 0);
+        let mut obs = Observations::default();
+        obs.sockets.push(quiet.clone());
+        for i in 1..100u32 {
+            obs.sockets.push(socket(40_000 + i, 1 + i % 3));
+        }
+        assert_eq!(classify_socket(&quiet, &t), SocketVerdict::Ok);
+        trim_sockets(&mut obs, &t, &engine);
+        assert!(obs.sockets.contains(&quiet));
     }
 
     #[test]

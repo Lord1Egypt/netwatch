@@ -3033,7 +3033,16 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         {
             if let Some(id) = selected_issue_id(app) {
                 if app.diagnose.engine.mute(&id, 60) {
-                    app.diagnose.set_status(format!("{id} muted for 1h"));
+                    // The time it comes back, which the muted row repeats.
+                    let until = app
+                        .diagnose
+                        .engine
+                        .get(&id)
+                        .and_then(|i| i.state.muted_until())
+                        .map(crate::diagnose::issue::hh_mm)
+                        .unwrap_or_default();
+                    app.diagnose
+                        .set_status(format!("{id} muted until {until} — still watched"));
                 }
             }
         }
@@ -4991,5 +5000,25 @@ mod diagnose_action_tests {
         for step in &issue.remediation {
             assert_eq!(step.applied, None, "{}", step.text);
         }
+    }
+
+    /// `m` said "muted for 1h" and left the sum to the reader. It names the
+    /// time the issue comes back, and the verdict row counts what it leaves
+    /// out.
+    #[test]
+    fn m_names_the_time_the_mute_ends() {
+        let mut app = live_app_on_the_resolver_issue();
+        let id = selected_issue_id(&app).unwrap();
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        // The fixture's clock stops at 06:51:20.
+        assert_eq!(
+            app.diagnose.status.as_deref(),
+            Some(format!("{id} muted until 07:51 — still watched").as_str())
+        );
+        let summary = diagnose_summary(&app);
+        assert!(summary.ends_with(" · 1 muted"), "{summary}");
     }
 }
