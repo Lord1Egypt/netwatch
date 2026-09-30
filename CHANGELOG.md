@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.34.0] - 2026-10-01
 
 Diagnose issues now end when they should, and moves nobody can feel no
 longer start them. A slow resolver on a home router can close. An issue whose
