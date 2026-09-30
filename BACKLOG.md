@@ -24,6 +24,6 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [x] P17 diagnose/034-delta-floor-deadband (B10, B11)
 - [x] P18 diagnose/034-expiry-guard (B25)
 - [x] P19 diagnose/034-dns-verify (B13)
-- [ ] P20 diagnose/034-mute (C16)
+- [x] P20 diagnose/034-mute (C16)
 - [ ] P21 diagnose/034-episodes-net (C09 subset, C11)
 - [ ] P22 diagnose/034-episodes-transport (C10 subset)
