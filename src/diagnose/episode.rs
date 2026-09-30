@@ -1656,6 +1656,140 @@ mod tests {
         assert!(unlisted.is_empty(), "not in {MANIFEST}: {unlisted:?}");
     }
 
+    /// Every rule whose open condition or verify a 0.33 or 0.34 PR changed,
+    /// and the socket rules B25 made closable. REVIEW §2's exit clause 2
+    /// asks each for a pinned episode in which it opens and closes. A PR
+    /// that changes another rule's open condition or verify adds its row
+    /// here and its episode to the corpus. B25's expiry of a removed
+    /// target, resolver or interface holds for every rule with that subject
+    /// and is pinned by its engine tests, not by an episode per rule.
+    const TOUCHED_SINCE_0_32: &[&str] = &[
+        // B09's σ floor, B10's delta floors, B13's close line.
+        "dns.slow_resolver",
+        // B09, B10, and B11's 2σ close line.
+        "gateway.rtt_spike",
+        // A05: opens only on a carrier read as down, closes only on one
+        // read as up.
+        "link.down",
+        // A04's idle radio and A05's unknown one.
+        "wifi.weak_signal",
+        // A06: errors alone where drops are not counted.
+        "iface.errors",
+        // B09 and B11.
+        "path.rtt_spike",
+        "target.slow_stage",
+        // A03's socket with no rtt, and B25's expiry once the socket closes.
+        "tcp.bufferbloat_remote",
+        "tcp.retrans_burst",
+        // B25.
+        "tcp.zero_window",
+    ];
+
+    /// Touched rules that no episode can close yet, each with the reason.
+    /// The owner accepts each row in the PR that adds it, and
+    /// `pending_close_entries_are_still_needed` fails once the rule closes
+    /// in an episode, so the row goes with the fix.
+    const PENDING_CLOSE: &[(&str, &str)] = &[(
+        "iface.errors",
+        "it closes only under 1/min errors and drops combined, which a Wi-Fi \
+         driver's background drops never allow, until B19 retunes it",
+    )];
+
+    /// The closes the engine makes itself: a verify that held, or a
+    /// subject that went away. A suppression, a mute or a user's resolve
+    /// ends a span without the rule closing.
+    const ENGINE_CLOSES: &[&str] = &["auto-closed", "expired"];
+
+    /// Each corpus entry that lists `rule` among the rules it pins, with its
+    /// pinned spans of that rule.
+    fn pinned_spans_of(rule: &str) -> Vec<(String, Vec<IssueSpan>)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_DIR);
+        let manifest = Manifest::load(&dir).expect("corpus manifest");
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.rules.iter().any(|r| r == rule))
+            .map(|entry| {
+                let path = entry.decisions_path(&dir);
+                let decisions: CanonicalDecisions = std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let spans = decisions
+                    .issues
+                    .into_iter()
+                    .filter(|span| span.key.split('|').next() == Some(rule))
+                    .collect();
+                (entry.id.clone(), spans)
+            })
+            .collect()
+    }
+
+    fn engine_closed(span: &IssueSpan) -> bool {
+        span.close_reason
+            .as_deref()
+            .is_some_and(|reason| ENGINE_CLOSES.contains(&reason))
+    }
+
+    /// REVIEW §2's exit clause 2, as a test: each touched rule opens in an
+    /// episode that lists it, and closes there too, or has a PENDING_CLOSE
+    /// row saying why it cannot yet.
+    #[test]
+    fn every_touched_rule_has_an_open_close_episode() {
+        let failures: Vec<String> = TOUCHED_SINCE_0_32
+            .iter()
+            .filter_map(|&rule| {
+                if crate::diagnose::rules::lookup(rule).is_none() {
+                    return Some(format!("{rule}: not in the catalogue"));
+                }
+                let episodes = pinned_spans_of(rule);
+                let opening: Vec<&str> = episodes
+                    .iter()
+                    .filter(|(_, spans)| !spans.is_empty())
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                let closes = episodes
+                    .iter()
+                    .any(|(_, spans)| spans.iter().any(engine_closed));
+                let pending = PENDING_CLOSE.iter().any(|(r, _)| *r == rule);
+                if opening.is_empty() {
+                    Some(format!(
+                        "{rule}: no corpus entry that lists it opens it; pin an episode \
+                         in {MANIFEST} that does"
+                    ))
+                } else if !closes && !pending {
+                    Some(format!(
+                        "{rule}: opens in {opening:?} but never auto-closes or expires; \
+                         pin an episode that closes it, or add a PENDING_CLOSE row saying \
+                         why it cannot"
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn pending_close_entries_are_still_needed() {
+        for (rule, why) in PENDING_CLOSE {
+            assert!(
+                TOUCHED_SINCE_0_32.contains(rule),
+                "{rule} is pending a close but is not in TOUCHED_SINCE_0_32"
+            );
+            let closing: Vec<String> = pinned_spans_of(rule)
+                .into_iter()
+                .filter(|(_, spans)| spans.iter().any(engine_closed))
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                closing.is_empty(),
+                "{rule} now closes in {closing:?}, so its PENDING_CLOSE row (\"{why}\") must go"
+            );
+        }
+    }
+
     fn scratch_corpus(name: &str, manifest: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nw-corpus-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

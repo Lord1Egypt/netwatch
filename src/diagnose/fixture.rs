@@ -1613,9 +1613,10 @@ mod tests {
 
     /// A Wi-Fi driver's background drops open iface.errors two seconds in
     /// and hold it open to the end, because it closes only under 1/min
-    /// errors and drops combined. The drops are all that hold it: without
-    /// them the errors open it at 124 s and it closes at 659 s, 300 s
-    /// after the last error leaves the minute's count.
+    /// errors and drops combined; `PENDING_CLOSE` in episode.rs says so.
+    /// The drops are all that hold it: without them the errors open it at
+    /// 124 s and it closes at 659 s, 300 s after the last error leaves the
+    /// minute's count.
     #[test]
     fn background_wifi_drops_hold_iface_errors_open() {
         assert_eq!(
