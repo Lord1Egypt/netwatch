@@ -39,3 +39,9 @@ id = "path-rtt-spike"
 kind = "synthetic"
 rules = ["path.rtt_spike"]
 note = "Traces to 1.1.1.1 every 30 s against the internet baseline (12 ms, σ 1.8): 13.4 ms, then 80 ms from 120 s, 16.5 ms (2.5σ, between the close and open lines) from 300 s, and 13.4 ms from 420 s. Opens on the third slow trace and closes after 120 s under the 2σ line."
+
+[[episode]]
+id = "target-slow-stage"
+kind = "synthetic"
+rules = ["target.slow_stage"]
+note = "The api target, probed once a minute against a 40 ms first-byte baseline (σ 4): 41 ms, then 400 ms from 180 s, 50 ms (2.5σ, between the close and open lines) from 360 s, and 41 ms from 480 s. Opens on the third slow probe and closes after 180 s under the 2σ line."

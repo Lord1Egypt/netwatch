@@ -354,17 +354,21 @@ pub struct Cadence {
     /// The DNS, gateway and internet probes, which complete together.
     pub health: Option<u64>,
     pub path: Option<u64>,
+    /// Every developer target in the frame, each on this one grid.
+    pub targets: Option<u64>,
 }
 
 impl Cadence {
     /// The app's: interface and sockets every tick, the health prober every
-    /// 5 s, a trace every 30 s.
+    /// 5 s, a trace every 30 s, and each target at its default interval of
+    /// a minute.
     pub fn live() -> Self {
         Self {
             interface: Some(1),
             sockets: Some(1),
             health: Some(5),
             path: Some(30),
+            targets: Some(60),
         }
     }
 
@@ -645,6 +649,82 @@ fn path_rtt_spike(t: u64) -> Observations {
     obs
 }
 
+/// The `api` target's configuration revision, which keys its baselines.
+const API_REVISION: &str = "target-config:synthetic-api";
+
+/// [`live_baselines`] and the `api` target's stage timings, σ a tenth of
+/// each mean: a 40 ms first byte opens above 52 ms and closes under 48 ms.
+fn target_baselines() -> BaselineStore {
+    let mut b = live_baselines();
+    for (metric, mean) in [
+        ("target.resolve_ms", 2.0),
+        ("target.connect_ms", 12.0),
+        ("target.tls_ms", 30.0),
+        ("target.ttfb_ms", 40.0),
+    ] {
+        b.seed(API_REVISION, metric, mean, mean / 10.0, 2_400);
+    }
+    b
+}
+
+/// The `api` target, probed once a minute. Its first byte goes from 41 ms
+/// to 400 ms at 180 s and reads 50 ms from 360 s, 2.5σ: under the 3σ open
+/// line and over the 2σ close line, so the issue stays open. From 480 s it
+/// is back at 41 ms, and the issue closes once that has held 180 s. The
+/// other stages stay at their baselines.
+fn target_slow_stage(t: u64) -> Observations {
+    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
+    // A frame carries the last probe to complete, on the cadence's grid.
+    let probed = t - t % 60;
+    let first_byte = match probed {
+        180..=359 => 400.0,
+        360..=479 => 50.0,
+        _ => 41.0,
+    };
+    let took = |ms| Stage {
+        ms: Some(ms),
+        error: None,
+    };
+    let mut obs = quiet_frame();
+    if let Some(config) = &mut obs.config {
+        config.targets = vec![("api".into(), API_REVISION.into())];
+    }
+    obs.targets = vec![TargetObs {
+        baseline_key: Some(API_REVISION.into()),
+        name: "api".into(),
+        host: "api.example.com".into(),
+        port: 443,
+        tls: true,
+        http: true,
+        expect_status: None,
+        probed_at: wall_clock(probed),
+        resolve: took(2.0),
+        addresses: vec!["203.0.113.30".into()],
+        lookups: vec![Lookup {
+            resolver: RESOLVER.into(),
+            link: None,
+            outcome: LookupOutcome::Answered,
+        }],
+        connect: Some(took(12.0)),
+        connect_v4: Some(took(12.0)),
+        connect_v6: None,
+        tls_stage: Some(took(30.0)),
+        http_stage: Some(took(first_byte)),
+        status: Some(200),
+        attempts: vec![ConnectAttempt {
+            address: "203.0.113.30:443".into(),
+            stage: took(12.0),
+        }],
+        effective_endpoint: Some("203.0.113.30:443".into()),
+        sni: Some("api.example.com".into()),
+        http_authority: Some("api.example.com".into()),
+        // Three missed probes at the default interval.
+        stale_after_secs: Some(180),
+        context: TargetContext::default(),
+    }];
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -675,6 +755,10 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario::live("zero-window-socket-closes", 420, zero_window_socket_closes),
         // A minute past the close.
         Scenario::live("path-rtt-spike", 600, path_rtt_spike),
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-slow-stage", 720, target_slow_stage)
+        },
     ]
 }
 
@@ -729,6 +813,15 @@ pub fn record(scenario: &Scenario) -> Episode {
         times.health.internet = probed;
         times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
         times.health.gateway_target = obs.gateway.as_ref().and_then(|g| g.addr.clone());
+        // Target results are dropped as stale, and cannot open or verify
+        // anything, without a completion time under their own name.
+        if let Some(probed) = Cadence::stamp(cadence.targets, start, t) {
+            times.targets = obs
+                .targets
+                .iter()
+                .map(|x| (x.name.clone(), probed))
+                .collect();
+        }
         engine.observe_live_at(&obs, &base, &times, now);
         let ended = rec.record(Tick {
             at: SCENARIO_UNIX_START + t as f64,
@@ -1099,6 +1192,32 @@ mod tests {
                 "auto-closed"
             )]
         );
+        // Open on the third slow probe (300 s); 50 ms from 360 s holds it
+        // open; 41 ms from 480 s holds for 180 s.
+        assert_eq!(
+            pinned_spans("target-slow-stage"),
+            vec![span(
+                "2026-09-03 06:49:00",
+                "2026-09-03 06:55:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// Without an age under its own name a target's result is dropped as
+    /// stale, and the target episode would open nothing.
+    #[test]
+    fn a_target_scenario_carries_each_probe_age_under_the_targets_name() {
+        let ep = synthetic("target-slow-stage").unwrap();
+        assert_eq!(ep.frames.len(), 721);
+        for (t, f) in ep.frames.iter().enumerate() {
+            assert_eq!(
+                f.ages.target_ages.get("api"),
+                Some(&((t % 60) as f64)),
+                "{}: off the target's 60 s grid",
+                f.ts
+            );
+        }
     }
 
     /// What a new corpus scenario costs: a frame function and a `Scenario`.
@@ -1183,6 +1302,7 @@ mod tests {
         assert_eq!(at(c.sockets, 37), Some(37));
         assert_eq!(at(c.health, 37), Some(35));
         assert_eq!(at(c.path, 37), Some(30));
+        assert_eq!(at(c.targets, 137), Some(120));
         assert_eq!(at(None, 37), None);
     }
 
