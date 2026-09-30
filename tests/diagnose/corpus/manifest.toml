@@ -63,3 +63,21 @@ id = "gateway-rtt-edge"
 kind = "synthetic"
 rules = ["gateway.rtt_spike"]
 note = "A Wi-Fi access point at 4 ms (σ 4) hovering at the open line from 120 s: 30 s at 3.1σ, then three minutes at 2.9σ, three times, then 4 ms from 750 s. One issue from the first open to the close; a 3σ close line would close and reopen it after each dip."
+
+[[episode]]
+id = "link-down"
+kind = "synthetic"
+rules = ["link.down"]
+note = "The wired link loses its carrier at 120 s and gets it back at 300 s. The connection goes down with it, so no gateway, DNS or path is observed meanwhile. Opens on the third sample without a carrier and closes after the carrier has held 30 s."
+
+[[episode]]
+id = "link-down-carrier-unknown"
+kind = "synthetic"
+rules = ["link.down"]
+note = "The same link, never down: from 120 s to 300 s the platform gives no interface info, so the carrier is unknown while traffic flows. Unknown is not down, and nothing opens."
+
+[[episode]]
+id = "wifi-weak"
+kind = "synthetic"
+rules = ["wifi.weak_signal"]
+note = "A laptop on Wi-Fi at -53 dBm moves away at 120 s: -78 dBm, with 14% of frames retried, under the 20% line. From 300 s it reads -60 dBm. Opens on the third weak sample and closes after 120 s over -70 dBm."

@@ -879,6 +879,73 @@ fn gateway_rtt_edge(t: u64) -> Observations {
     obs
 }
 
+/// The demo's wired link, unplugged at 120 s and plugged back in at 300 s.
+/// NetworkManager takes the connection down with the carrier, and the
+/// default route and the DHCP resolver go with it, so the prober has
+/// nothing to probe and no trace completes: the frames carry no gateway,
+/// DNS or path observation until the link is back. The issue opens on the
+/// third sample with no carrier and closes once the carrier has held 30 s.
+fn link_down(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        let iface = obs
+            .iface
+            .as_mut()
+            .expect("the quiet frame has an interface");
+        iface.carrier = Some(false);
+        iface.link_rate_bps = None;
+        iface.rx_bps = 0.0;
+        iface.tx_bps = 0.0;
+        obs.gateway = None;
+        obs.dns = None;
+        obs.paths.clear();
+        if let Some(config) = &mut obs.config {
+            config.resolvers = None;
+        }
+    }
+    obs
+}
+
+/// The same link, never down: from 120 s to 300 s the platform's
+/// interface list comes back empty, as when the read fails, while the
+/// link's counters keep moving. The carrier is unknown, which is not
+/// down, so nothing opens.
+fn link_down_carrier_unknown(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        let iface = obs
+            .iface
+            .as_mut()
+            .expect("the quiet frame has an interface");
+        iface.carrier = None;
+        iface.wireless = None;
+        if let Some(config) = &mut obs.config {
+            config.interfaces = None;
+        }
+    }
+    obs
+}
+
+/// The laptop carried to the far end of the house at 120 s: −78 dBm, and
+/// 14% of frames retried, under the 20% line, so the signal alone opens
+/// the issue. From 300 s it sits at −60 dBm, over the −70 dBm line, and
+/// the issue closes once that has held 120 s.
+fn wifi_weak(t: u64) -> Observations {
+    let (signal, retries) = match phase(t, &STORY) {
+        Phase::Healthy => (-53, 7.0),
+        Phase::Fault => (-78, 14.0),
+        Phase::Clear => (-60, 9.0),
+    };
+    let mut obs = wifi_frame(t);
+    let iface = obs
+        .iface
+        .as_mut()
+        .expect("the Wi-Fi frame has an interface");
+    iface.signal_dbm = Some(signal);
+    iface.tx_retry_pct = Some(retries);
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -924,6 +991,12 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             baselines: wifi_baselines,
             ..Scenario::live("gateway-rtt-edge", 930, gateway_rtt_edge)
+        },
+        Scenario::live("link-down", 390, link_down),
+        Scenario::live("link-down-carrier-unknown", 420, link_down_carrier_unknown),
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("wifi-weak", 480, wifi_weak)
         },
     ]
 }
@@ -1444,6 +1517,67 @@ mod tests {
                 Some("2026-09-03 06:55:30"),
             ]
         );
+    }
+
+    /// A05 judges the link on what the platform reported. link.down opens
+    /// on a carrier read as down, at 122 s, and closes 30 s after one read
+    /// as up; wifi.weak_signal opens on −78 dBm and closes 120 s into
+    /// −60 dBm.
+    #[test]
+    fn a_link_issue_opens_and_closes_on_what_was_read() {
+        assert_eq!(
+            pinned_spans("link-down"),
+            vec![span(
+                "2026-09-03 06:46:02",
+                "2026-09-03 06:49:30",
+                "auto-closed"
+            )]
+        );
+        assert_eq!(
+            pinned_spans("wifi-weak"),
+            vec![span(
+                "2026-09-03 06:46:02",
+                "2026-09-03 06:51:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// Three minutes with no interface info open nothing, and link.down is
+    /// not measured on each of them rather than passed.
+    #[test]
+    fn an_unknown_carrier_opens_nothing_and_is_not_measured() {
+        assert_eq!(pinned_spans("link-down-carrier-unknown"), vec![]);
+        let ep = synthetic("link-down-carrier-unknown").unwrap();
+        let mut unknown = 0;
+        crate::diagnose::episode::drive(&ep, |step| {
+            let carrier = step.frame.obs.iface.as_ref().and_then(|i| i.carrier);
+            let link_down = step
+                .engine
+                .coverage()
+                .rules
+                .iter()
+                .find(|r| r.rule == "link.down")
+                .map(|r| r.status.clone());
+            match carrier {
+                None => {
+                    unknown += 1;
+                    assert_eq!(
+                        link_down,
+                        Some(Availability::NotMeasured),
+                        "{}",
+                        step.frame.ts
+                    );
+                }
+                Some(_) => assert_eq!(
+                    link_down,
+                    Some(Availability::Available),
+                    "{}",
+                    step.frame.ts
+                ),
+            }
+        });
+        assert_eq!(unknown, 180);
     }
 
     /// Without an age under its own name a target's result is dropped as
