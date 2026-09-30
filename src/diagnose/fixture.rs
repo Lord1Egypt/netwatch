@@ -29,8 +29,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
+use super::coverage::Availability;
 use super::detectors::{
-    DnsObs, GatewayObs, HopObs, IfaceObs, Observations, PathObs, SocketObs, Thresholds,
+    DnsObs, GatewayObs, HopObs, IfaceObs, Observations, ObservedConfig, PathObs, SocketObs,
+    Thresholds,
 };
 use super::engine::{format_ts, Clock, Engine, FixedClock, ObservationTimes, Settings};
 use super::episode::{EnvProfile, Episode, Recorder, Tick};
@@ -352,17 +354,21 @@ pub struct Cadence {
     /// The DNS, gateway and internet probes, which complete together.
     pub health: Option<u64>,
     pub path: Option<u64>,
+    /// Every developer target in the frame, each on this one grid.
+    pub targets: Option<u64>,
 }
 
 impl Cadence {
     /// The app's: interface and sockets every tick, the health prober every
-    /// 5 s, a trace every 30 s.
+    /// 5 s, a trace every 30 s, and each target at its default interval of
+    /// a minute.
     pub fn live() -> Self {
         Self {
             interface: Some(1),
             sockets: Some(1),
             health: Some(5),
             path: Some(30),
+            targets: Some(60),
         }
     }
 
@@ -440,9 +446,320 @@ fn incident_frame(t: u64) -> Observations {
     obs
 }
 
+/// The demo network's baselines as the live sampler learns them. It learns
+/// a path baseline from the internet probe only, never one per trace target
+/// as [`baselines`] seeds for 1.1.1.1, so here a trace is judged against
+/// `internet`.
+fn live_baselines() -> BaselineStore {
+    let mut b = BaselineStore::new(baselines().fingerprint().clone());
+    b.seed(RESOLVER, "dns.rtt_p50", 1.2, 0.4, 2_400);
+    b.seed(GATEWAY, "gateway.rtt", 0.9, 0.2, 2_400);
+    b.seed("internet", "path.rtt", 12.0, 1.8, 2_400);
+    b
+}
+
+/// The demo network before anything goes wrong, with the configuration a
+/// live frame records: its resolver and interfaces, a trace to 1.1.1.1
+/// every 30 s, and no targets. Without a configuration nothing can expire.
+fn quiet_frame() -> Observations {
+    Observations {
+        config: Some(ObservedConfig {
+            resolvers: Some(vec![RESOLVER.into()]),
+            targets: vec![],
+            trace_target: "1.1.1.1".into(),
+            trace_refresh_secs: Some(30),
+            interfaces: Some(vec!["lo".into(), IFACE.into()]),
+        }),
+        ..observations_at(0)
+    }
+}
+
+/// Healthy until 120 s, faulty until the socket closes at 300 s, then gone.
+/// A socket verdict holds 30 s and three samples before it opens, so each
+/// socket episode opens at 152 s, and expires 60 s after the close.
+const SOCKET_STORY: [(u64, Phase); 3] = [
+    (0, Phase::Healthy),
+    (120, Phase::Fault),
+    (300, Phase::Clear),
+];
+
+/// A browser connection that stays healthy throughout. With it listed the
+/// socket rules stay available after the faulty socket closes, which is
+/// what lets the closed socket count as gone.
+fn neighbour_socket(t: u64) -> SocketObs {
+    SocketObs {
+        local: "10.88.0.2:41822".into(),
+        remote: "93.184.215.14:443".into(),
+        process: Some("firefox".into()),
+        rtt_ms: Some(24.0),
+        rttvar_ms: Some(3.0),
+        retrans: Some(0),
+        cwnd: Some(10),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(131_072),
+        mss: Some(1448),
+        tx_bps: 1.2e4,
+        rx_bps: 8.6e5,
+        verdict_age_secs: t,
+    }
+}
+
+/// An upload over a lossy path: 18 retransmits a minute at 38 ms, under
+/// the queueing line, so the path is losing segments rather than queueing
+/// them. The upload ends at 300 s.
+fn retrans_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.sockets.push(neighbour_socket(t));
+    let scp = SocketObs {
+        local: "10.88.0.2:48210".into(),
+        remote: "203.0.113.20:22".into(),
+        process: Some("scp".into()),
+        rtt_ms: Some(31.0),
+        rttvar_ms: Some(4.0),
+        retrans: Some(0),
+        cwnd: Some(42),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(1_048_576),
+        mss: Some(1448),
+        tx_bps: 3.8e6,
+        rx_bps: 4.2e4,
+        verdict_age_secs: t,
+    };
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(scp),
+        Phase::Fault => obs.sockets.push(SocketObs {
+            rtt_ms: Some(38.0),
+            retrans: Some(18),
+            cwnd: Some(12),
+            ssthresh: Some(21),
+            tx_bps: 6.1e5,
+            verdict_age_secs: t - 120,
+            ..scp
+        }),
+        Phase::Clear => {}
+    }
+    obs
+}
+
+/// The demo's bufferbloated LAN socket, fast until 120 s. The loaded-rtt
+/// test in the quiet frame places the queue on the receiver.
+fn bufferbloat_remote_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    obs.sockets.push(neighbour_socket(t));
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(SocketObs {
+            rtt_ms: Some(1.1),
+            rttvar_ms: Some(0.3),
+            retrans: Some(0),
+            ..bloated_socket(t)
+        }),
+        Phase::Fault => obs.sockets.push(bloated_socket(t - 120)),
+        Phase::Clear => {}
+    }
+    obs
+}
+
+/// A backup to a NAS whose daemon stops reading at 120 s; rsync gives up
+/// at 300 s. It is the host's only socket, so once it closes the sampler
+/// lists none and says so, as it does live.
+fn zero_window_socket_closes(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    let rsync = SocketObs {
+        local: "10.88.0.2:40522".into(),
+        remote: "10.88.0.7:873".into(),
+        process: Some("rsync".into()),
+        rtt_ms: Some(0.8),
+        rttvar_ms: Some(0.2),
+        retrans: Some(0),
+        cwnd: Some(40),
+        ssthresh: Some(u32::MAX),
+        rwnd: Some(524_288),
+        mss: Some(1448),
+        tx_bps: 9.1e7,
+        rx_bps: 2.2e5,
+        verdict_age_secs: t,
+    };
+    match phase(t, &SOCKET_STORY) {
+        Phase::Healthy => obs.sockets.push(rsync),
+        Phase::Fault => obs.sockets.push(SocketObs {
+            rwnd: Some(0),
+            tx_bps: 0.0,
+            rx_bps: 0.0,
+            verdict_age_secs: t - 120,
+            ..rsync
+        }),
+        Phase::Clear => {
+            for rule in [
+                "tcp.bufferbloat_remote",
+                "tcp.retrans_burst",
+                "tcp.zero_window",
+            ] {
+                obs.coverage_hints.insert(
+                    rule.into(),
+                    (
+                        Availability::NoSubjects,
+                        "successful TCP dump contained no established sockets in this \
+                         network namespace"
+                            .into(),
+                    ),
+                );
+            }
+        }
+    }
+    obs
+}
+
+/// The local stamp `secs` after [`WINDOW_START`], for the times a collector
+/// writes into its own results.
+fn wall_clock(secs: u64) -> String {
+    let start = chrono::NaiveDateTime::parse_from_str(WINDOW_START, "%Y-%m-%d %H:%M:%S")
+        .expect("WINDOW_START is a stamp");
+    (start + chrono::Duration::seconds(secs as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// The trace to 1.1.1.1, every 30 s, judged against the internet probe's
+/// 12 ms baseline (σ 1.8). Hop 3 congests from 120 s and the path reads
+/// 80 ms. From 300 s it reads 16.5 ms, 2.5σ: under the 3σ open line and
+/// over the 2σ close line, so the issue stays open. From 420 s it is back
+/// at 13.4 ms, and the issue closes once that has held 120 s.
+fn path_rtt_spike(t: u64) -> Observations {
+    // A frame carries the last trace to complete, on the cadence's grid.
+    let traced = t - t % 30;
+    let (hop3, hop4) = match traced {
+        120..=299 => (78.6, 80.0),
+        300..=419 => (15.1, 16.5),
+        _ => (12.0, 13.4),
+    };
+    let mut obs = quiet_frame();
+    obs.paths = vec![PathObs {
+        destination_reached: Some(true),
+        target: "1.1.1.1".into(),
+        hops: vec![
+            hop(1, GATEWAY, "-", 0.9),
+            hop(2, "100.64.0.1", "as7545", 8.1),
+            hop(3, "203.0.113.9", "as7545", hop3),
+            hop(4, "1.1.1.1", "as13335", hop4),
+        ],
+        // The route never changes; only hop 3's queue does.
+        previous: Some(path_before()),
+        traced_at: wall_clock(traced),
+    }];
+    obs
+}
+
+/// The `api` target's configuration revision, which keys its baselines.
+const API_REVISION: &str = "target-config:synthetic-api";
+
+/// [`live_baselines`] and the `api` target's stage timings, σ a tenth of
+/// each mean: a 40 ms first byte opens above 52 ms and closes under 48 ms.
+fn target_baselines() -> BaselineStore {
+    let mut b = live_baselines();
+    for (metric, mean) in [
+        ("target.resolve_ms", 2.0),
+        ("target.connect_ms", 12.0),
+        ("target.tls_ms", 30.0),
+        ("target.ttfb_ms", 40.0),
+    ] {
+        b.seed(API_REVISION, metric, mean, mean / 10.0, 2_400);
+    }
+    b
+}
+
+/// The `api` target, probed once a minute. Its first byte goes from 41 ms
+/// to 400 ms at 180 s and reads 50 ms from 360 s, 2.5σ: under the 3σ open
+/// line and over the 2σ close line, so the issue stays open. From 480 s it
+/// is back at 41 ms, and the issue closes once that has held 180 s. The
+/// other stages stay at their baselines.
+fn target_slow_stage(t: u64) -> Observations {
+    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
+    // A frame carries the last probe to complete, on the cadence's grid.
+    let probed = t - t % 60;
+    let first_byte = match probed {
+        180..=359 => 400.0,
+        360..=479 => 50.0,
+        _ => 41.0,
+    };
+    let took = |ms| Stage {
+        ms: Some(ms),
+        error: None,
+    };
+    let mut obs = quiet_frame();
+    if let Some(config) = &mut obs.config {
+        config.targets = vec![("api".into(), API_REVISION.into())];
+    }
+    obs.targets = vec![TargetObs {
+        baseline_key: Some(API_REVISION.into()),
+        name: "api".into(),
+        host: "api.example.com".into(),
+        port: 443,
+        tls: true,
+        http: true,
+        expect_status: None,
+        probed_at: wall_clock(probed),
+        resolve: took(2.0),
+        addresses: vec!["203.0.113.30".into()],
+        lookups: vec![Lookup {
+            resolver: RESOLVER.into(),
+            link: None,
+            outcome: LookupOutcome::Answered,
+        }],
+        connect: Some(took(12.0)),
+        connect_v4: Some(took(12.0)),
+        connect_v6: None,
+        tls_stage: Some(took(30.0)),
+        http_stage: Some(took(first_byte)),
+        status: Some(200),
+        attempts: vec![ConnectAttempt {
+            address: "203.0.113.30:443".into(),
+            stage: took(12.0),
+        }],
+        effective_endpoint: Some("203.0.113.30:443".into()),
+        sni: Some("api.example.com".into()),
+        http_authority: Some("api.example.com".into()),
+        // Three missed probes at the default interval.
+        stale_after_secs: Some(180),
+        context: TargetContext::default(),
+    }];
+    obs
+}
+
+impl Scenario {
+    /// An episode on the demo network as the app sees it: the live cadence,
+    /// the baselines live learns and the default thresholds.
+    fn live(id: &'static str, secs: u64, obs: fn(u64) -> Observations) -> Self {
+        Self {
+            id,
+            start: WINDOW_START,
+            secs,
+            baselines: live_baselines,
+            obs,
+            cadence: Cadence::live(),
+            thresholds: Thresholds::default(),
+        }
+    }
+}
+
 /// Every scenario the corpus can pin, by id.
 pub fn scenarios() -> Vec<Scenario> {
-    vec![Scenario::incident()]
+    vec![
+        Scenario::incident(),
+        // Each runs a minute past its expiry.
+        Scenario::live("retrans-socket-closes", 420, retrans_socket_closes),
+        Scenario::live(
+            "bufferbloat-remote-socket-closes",
+            420,
+            bufferbloat_remote_socket_closes,
+        ),
+        Scenario::live("zero-window-socket-closes", 420, zero_window_socket_closes),
+        // A minute past the close.
+        Scenario::live("path-rtt-spike", 600, path_rtt_spike),
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-slow-stage", 720, target_slow_stage)
+        },
+    ]
 }
 
 /// The profile every synthetic episode carries. Detected, it held this
@@ -496,6 +813,15 @@ pub fn record(scenario: &Scenario) -> Episode {
         times.health.internet = probed;
         times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
         times.health.gateway_target = obs.gateway.as_ref().and_then(|g| g.addr.clone());
+        // Target results are dropped as stale, and cannot open or verify
+        // anything, without a completion time under their own name.
+        if let Some(probed) = Cadence::stamp(cadence.targets, start, t) {
+            times.targets = obs
+                .targets
+                .iter()
+                .map(|x| (x.name.clone(), probed))
+                .collect();
+        }
         engine.observe_live_at(&obs, &base, &times, now);
         let ended = rec.record(Tick {
             at: SCENARIO_UNIX_START + t as f64,
@@ -808,6 +1134,92 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// The decisions the corpus pins for `id`, which the replay test holds
+    /// the engine to.
+    fn pinned_spans(id: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        use crate::diagnose::episode::{CanonicalDecisions, CORPUS_DIR};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(CORPUS_DIR)
+            .join(format!("{id}.decisions.json"));
+        let text = std::fs::read_to_string(&path).expect("pinned decisions");
+        let decisions: CanonicalDecisions = serde_json::from_str(&text).unwrap();
+        decisions
+            .issues
+            .into_iter()
+            .map(|s| (s.opened, s.closed, s.close_reason))
+            .collect()
+    }
+
+    fn span(opened: &str, closed: &str, reason: &str) -> (String, Option<String>, Option<String>) {
+        (opened.into(), Some(closed.into()), Some(reason.into()))
+    }
+
+    /// B25 closes a socket issue when its socket goes: each opens once on
+    /// the fault, at 152 s, and ends Expired 60 s after the close at 300 s,
+    /// whether a healthy socket is still listed or none is.
+    #[test]
+    fn a_socket_issue_expires_a_minute_after_its_socket_closes() {
+        for id in [
+            "retrans-socket-closes",
+            "bufferbloat-remote-socket-closes",
+            "zero-window-socket-closes",
+        ] {
+            assert_eq!(
+                pinned_spans(id),
+                vec![span(
+                    "2026-09-03 06:46:32",
+                    "2026-09-03 06:50:00",
+                    "expired"
+                )],
+                "{id}"
+            );
+        }
+    }
+
+    /// B11 closes the σ rules at 2σ, under the 3σ open line. Each σ episode
+    /// sits at 2.5σ before it recovers, so it closes only after the metric
+    /// has held under 2σ; a 3σ close line would have closed it two minutes
+    /// sooner.
+    #[test]
+    fn a_sigma_issue_closes_under_its_two_sigma_line() {
+        // Open on the third slow trace (180 s); 16.5 ms from 300 s holds it
+        // open; 13.4 ms from 420 s holds for 120 s.
+        assert_eq!(
+            pinned_spans("path-rtt-spike"),
+            vec![span(
+                "2026-09-03 06:47:00",
+                "2026-09-03 06:53:00",
+                "auto-closed"
+            )]
+        );
+        // Open on the third slow probe (300 s); 50 ms from 360 s holds it
+        // open; 41 ms from 480 s holds for 180 s.
+        assert_eq!(
+            pinned_spans("target-slow-stage"),
+            vec![span(
+                "2026-09-03 06:49:00",
+                "2026-09-03 06:55:00",
+                "auto-closed"
+            )]
+        );
+    }
+
+    /// Without an age under its own name a target's result is dropped as
+    /// stale, and the target episode would open nothing.
+    #[test]
+    fn a_target_scenario_carries_each_probe_age_under_the_targets_name() {
+        let ep = synthetic("target-slow-stage").unwrap();
+        assert_eq!(ep.frames.len(), 721);
+        for (t, f) in ep.frames.iter().enumerate() {
+            assert_eq!(
+                f.ages.target_ages.get("api"),
+                Some(&((t % 60) as f64)),
+                "{}: off the target's 60 s grid",
+                f.ts
+            );
+        }
+    }
+
     /// What a new corpus scenario costs: a frame function and a `Scenario`.
     /// The gateway and everything past it stop answering for three minutes.
     fn gateway_outage(t: u64) -> Observations {
@@ -890,6 +1302,7 @@ mod tests {
         assert_eq!(at(c.sockets, 37), Some(37));
         assert_eq!(at(c.health, 37), Some(35));
         assert_eq!(at(c.path, 37), Some(30));
+        assert_eq!(at(c.targets, 137), Some(120));
         assert_eq!(at(None, 37), None);
     }
 

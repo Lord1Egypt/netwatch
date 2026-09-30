@@ -1,0 +1,13 @@
+{
+  "episode": "bufferbloat-remote-socket-closes",
+  "frames": 421,
+  "issues": [
+    {
+      "key": "tcp.bufferbloat_remote|10.88.0.2:52344 → 10.88.0.3:9000",
+      "opened": "2026-09-03 06:46:32",
+      "closed": "2026-09-03 06:50:00",
+      "top_cause": "tcp.bufferbloat_remote/receiver_queueing",
+      "close_reason": "expired"
+    }
+  ]
+}

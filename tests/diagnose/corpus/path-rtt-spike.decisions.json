@@ -1,0 +1,13 @@
+{
+  "episode": "path-rtt-spike",
+  "frames": 601,
+  "issues": [
+    {
+      "key": "path.rtt_spike|1.1.1.1",
+      "opened": "2026-09-03 06:47:00",
+      "closed": "2026-09-03 06:53:00",
+      "top_cause": "path.rtt_spike/hop_adds_latency",
+      "close_reason": "auto-closed"
+    }
+  ]
+}
