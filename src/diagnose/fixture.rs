@@ -605,6 +605,46 @@ fn zero_window_socket_closes(t: u64) -> Observations {
     obs
 }
 
+/// The local stamp `secs` after [`WINDOW_START`], for the times a collector
+/// writes into its own results.
+fn wall_clock(secs: u64) -> String {
+    let start = chrono::NaiveDateTime::parse_from_str(WINDOW_START, "%Y-%m-%d %H:%M:%S")
+        .expect("WINDOW_START is a stamp");
+    (start + chrono::Duration::seconds(secs as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// The trace to 1.1.1.1, every 30 s, judged against the internet probe's
+/// 12 ms baseline (σ 1.8). Hop 3 congests from 120 s and the path reads
+/// 80 ms. From 300 s it reads 16.5 ms, 2.5σ: under the 3σ open line and
+/// over the 2σ close line, so the issue stays open. From 420 s it is back
+/// at 13.4 ms, and the issue closes once that has held 120 s.
+fn path_rtt_spike(t: u64) -> Observations {
+    // A frame carries the last trace to complete, on the cadence's grid.
+    let traced = t - t % 30;
+    let (hop3, hop4) = match traced {
+        120..=299 => (78.6, 80.0),
+        300..=419 => (15.1, 16.5),
+        _ => (12.0, 13.4),
+    };
+    let mut obs = quiet_frame();
+    obs.paths = vec![PathObs {
+        destination_reached: Some(true),
+        target: "1.1.1.1".into(),
+        hops: vec![
+            hop(1, GATEWAY, "-", 0.9),
+            hop(2, "100.64.0.1", "as7545", 8.1),
+            hop(3, "203.0.113.9", "as7545", hop3),
+            hop(4, "1.1.1.1", "as13335", hop4),
+        ],
+        // The route never changes; only hop 3's queue does.
+        previous: Some(path_before()),
+        traced_at: wall_clock(traced),
+    }];
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -633,6 +673,8 @@ pub fn scenarios() -> Vec<Scenario> {
             bufferbloat_remote_socket_closes,
         ),
         Scenario::live("zero-window-socket-closes", 420, zero_window_socket_closes),
+        // A minute past the close.
+        Scenario::live("path-rtt-spike", 600, path_rtt_spike),
     ]
 }
 
@@ -1039,6 +1081,24 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// B11 closes the σ rules at 2σ, under the 3σ open line. Each σ episode
+    /// sits at 2.5σ before it recovers, so it closes only after the metric
+    /// has held under 2σ; a 3σ close line would have closed it two minutes
+    /// sooner.
+    #[test]
+    fn a_sigma_issue_closes_under_its_two_sigma_line() {
+        // Open on the third slow trace (180 s); 16.5 ms from 300 s holds it
+        // open; 13.4 ms from 420 s holds for 120 s.
+        assert_eq!(
+            pinned_spans("path-rtt-spike"),
+            vec![span(
+                "2026-09-03 06:47:00",
+                "2026-09-03 06:53:00",
+                "auto-closed"
+            )]
+        );
     }
 
     /// What a new corpus scenario costs: a frame function and a `Scenario`.
