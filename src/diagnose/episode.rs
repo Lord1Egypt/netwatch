@@ -437,7 +437,12 @@ impl Recorder {
         let done = match active.episode.source {
             EpisodeSource::QuietSample => elapsed >= QUIET_SAMPLE_SECS,
             _ => {
-                if open.is_empty() {
+                // Over when nothing is tracked, not when `primary` is empty. A
+                // muted issue has left `primary` but the engine still watches
+                // it, and a replay needs every frame up to its close or the
+                // end of its mute.
+                let tracked = tick.engine.issues().iter().any(|i| i.state.is_tracked());
+                if !tracked {
                     let since = *active.all_closed_since.get_or_insert(tick.at);
                     tick.at - since >= POST_ROLL_SECS
                 } else {
@@ -1877,6 +1882,35 @@ mod tests {
         assert!(muted_frames > 0);
         // And the span the mute ended says so, rather than looking fixed.
         assert_eq!(report.issues[0].close_reason.as_deref(), Some("muted"));
+    }
+
+    /// A muted issue is not in `primary`, so the recorder took the incident
+    /// for over and ended it ten minutes into the mute. When the mute ran out
+    /// a second episode began, with a pre-roll recorded while the issue was
+    /// muted; a fresh engine replaying it opened the issue there, and live
+    /// showed nothing open.
+    #[test]
+    fn a_mute_that_ends_mid_fault_replays_as_one_episode() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 120.0, 5.0);
+        let id = s.engine.primary()[0].id.clone();
+        assert!(s.engine.mute(&id, 60));
+        // The fault outlasts the hour's mute by eight minutes.
+        s.run(|_| 80.0, 4_080.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        assert_eq!(s.finished.len(), 1, "{:?}", s.finished.len());
+        let report = replay(&s.finished[0]);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        // Quiet for the hour, then back on the frame the mute ended.
+        let spans: Vec<_> = report
+            .issues
+            .iter()
+            .map(|s| (s.opened.as_str(), s.close_reason.as_deref()))
+            .collect();
+        assert_eq!(spans.len(), 2, "{:#?}", report.issues);
+        assert_eq!(spans[0].1, Some("muted"));
+        assert_eq!(spans[1].0, "2026-09-14 10:17:00");
     }
 
     #[test]
