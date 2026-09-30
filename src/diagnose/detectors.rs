@@ -3827,6 +3827,12 @@ mod tests {
             );
             assert!(line < open, "{baseline:?}: {line} is not below {open}");
         }
+        // The exception: a resolver whose normal range reaches the ceiling.
+        // Its mean plus 2σ, 110ms, is over the 100ms it opened on, so it
+        // closes once its p50 has stayed under the ceiling for the hold.
+        let line = close_line(Some((90.0, 10.0)), 120.0, &t);
+        assert!((line - 110.0).abs() < 1e-9, "{line}");
+        assert!(line > t.dns_ceiling_ms);
 
         // The catalogue's line is the one with no baseline.
         let catalogued = rules::default_verify("dns.slow_resolver").unwrap();

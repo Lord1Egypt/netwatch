@@ -3043,6 +3043,42 @@ mod tests {
         );
     }
 
+    /// A resolver at 90 ms, give or take 10, closes under 110 ms, over the
+    /// 100 ms ceiling it opened on. A p50 over the ceiling fires again and
+    /// keeps the issue open, so it closes only under the ceiling.
+    #[test]
+    fn a_resolver_near_the_ceiling_closes_under_it() {
+        let mut b = base();
+        b.seed("169.254.1.1", "dns.rtt_p50", 90.0, 10.0, 2000);
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(120.0), &b);
+        let id = find(&e, "dns.slow_resolver").id;
+        let line = e.get(&id).unwrap().verify.threshold;
+        assert!((line - 110.0).abs() < 1e-9, "{line}");
+
+        // Five minutes at 105ms: under the close line, over the ceiling.
+        for _ in 0..300 {
+            clock.advance_secs(1);
+            e.observe(&obs(105.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+
+        // Just under the ceiling: closed once 60s have held.
+        for _ in 0..60 {
+            clock.advance_secs(1);
+            e.observe(&obs(99.0), &b);
+        }
+        assert_eq!(e.get(&id).unwrap().state, IssueState::Open);
+        clock.advance_secs(1);
+        e.observe(&obs(99.0), &b);
+        assert_eq!(
+            e.get(&id).unwrap().state,
+            IssueState::AutoClosed {
+                at: "2026-09-03 06:54:11".into()
+            }
+        );
+    }
+
     #[test]
     fn suppression_reaches_the_verdict_line() {
         let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
