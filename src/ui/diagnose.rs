@@ -2153,10 +2153,19 @@ mod tests {
         let (mut one, baselines) = fixture::run();
         let id = one.primary()[0].id.clone();
         assert!(one.mute(&id, 60));
+        // Consequences too: a muted root keeps its consequences suppressed,
+        // so muting only what `primary` lists would leave them open.
         let (mut all, _) = fixture::run();
-        while let Some(id) = all.primary().first().map(|i| i.id.clone()) {
-            assert!(all.mute(&id, 60));
+        let open: Vec<String> = all
+            .issues()
+            .iter()
+            .filter(|i| i.state.is_open())
+            .map(|i| i.id.clone())
+            .collect();
+        for id in &open {
+            assert!(all.mute(id, 60));
         }
+        assert!(all.issues().iter().all(|i| !i.state.is_open()));
         assert!(all.muted_count() > 1);
 
         for engine in [&one, &all] {

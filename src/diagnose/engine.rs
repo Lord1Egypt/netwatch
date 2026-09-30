@@ -3633,6 +3633,44 @@ mod tests {
         assert!(e.get(&id).is_some());
     }
 
+    /// The root is what the verdict names, so it is what gets muted. Muting
+    /// it released its consequences, and for the hour a symptom led the
+    /// verdict while its cause was hidden.
+    #[test]
+    fn muting_a_root_keeps_its_consequences_suppressed() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let mut o = obs(40.0);
+        o.gateway = Some(GatewayObs {
+            addr: Some("192.168.8.1".into()),
+            rtt_ms: None,
+            loss_pct: 100.0,
+            arp_ok: Some(true),
+            icmp_ok: false,
+            internet_reachable: Some(false),
+        });
+        for _ in 0..3 {
+            e.observe(&o, &b);
+            clock.advance_secs(5);
+        }
+        let root = find(&e, "gateway.unreachable").id;
+        assert_eq!(e.open_count(), 1);
+        assert!(e.mute(&root, 60));
+
+        // Ten minutes more of the same fault.
+        for _ in 0..120 {
+            e.observe(&o, &b);
+            clock.advance_secs(5);
+        }
+        assert_eq!(e.issues().len(), 2, "{:#?}", e.issues());
+        let dns = find(&e, "dns.slow_resolver");
+        assert_eq!(dns.suppressed_by.as_deref(), Some(root.as_str()));
+        assert_eq!(e.get(&root).unwrap().consequences, vec![dns.id.clone()]);
+        assert_eq!(e.open_count(), 0, "{:?}", e.primary());
+        assert!(e.verdict(&b).is_clear(), "{}", e.verdict(&b).line());
+        assert_eq!(e.muted_count(), 1);
+    }
+
     #[test]
     fn acking_keeps_an_issue_open() {
         let (mut e, _clock) = engine_at("2026-09-03 06:48:10");
