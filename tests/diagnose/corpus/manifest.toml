@@ -62,7 +62,7 @@ note = "A wired router answering its own pings in 1.0 ms (σ 0.3), then 40 ms fr
 id = "gateway-rtt-edge"
 kind = "synthetic"
 rules = ["gateway.rtt_spike"]
-note = "A Wi-Fi access point at 4 ms (σ 4) hovering at the open line from 120 s: 30 s at 3.1σ, then three minutes at 2.9σ, three times, then 4 ms from 750 s. One issue from the first open to the close; a 3σ close line would close and reopen it after each dip."
+note = "A Wi-Fi access point at 4 ms (σ 4) hovering at the open line from 120 s: 30 s at 3.1σ, then three minutes at 2.9σ, three times, then 4 ms from 750 s. One issue from the first open to the close; a 3σ close line would close it after each dip and reopen it on the next swing to 3.1σ."
 
 [[episode]]
 id = "link-down"
