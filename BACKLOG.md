@@ -26,4 +26,4 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [x] P19 diagnose/034-dns-verify (B13)
 - [x] P20 diagnose/034-mute (C16)
 - [ ] P21 diagnose/034-episodes-net (C09 subset, C11)
-- [ ] P22 diagnose/034-episodes-transport (C10 subset)
+- [x] P22 diagnose/034-episodes-transport (C10 subset)
