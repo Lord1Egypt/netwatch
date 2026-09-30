@@ -3716,7 +3716,8 @@ mod tests {
         let id = e.primary()[0].id.clone();
         assert!(e.mute(&id, 60));
 
-        // dns.slow_resolver verifies on p50 < 5ms held for 60s.
+        // Against this baseline dns.slow_resolver closes once p50 has held
+        // under 4.96ms, 0.8 of its 6.2ms open line, for 60s.
         for _ in 0..61 {
             clock.advance_secs(1);
             e.observe(&obs(1.3), &b);
