@@ -75,7 +75,10 @@ time.sleep(600)
         ip('-6','route','add','default','via','2001:db8::2','dev','nw0')
         for addr in ['2001:db8::2/64','2001:db8::3/64']: ip('-6','addr','del',addr,'dev','nw1',ns=peer.pid)
         check('IPv6 broken with working IPv4','ipv6.broken','fault')
-        for addr in ['192.0.2.2/24','192.0.2.3/24']: ip('addr','del',addr,'dev','nw1',ns=peer.pid)
+        # Secondary first: with promote_secondaries at 0, the default in a
+        # fresh namespace on some kernels, deleting the primary takes the
+        # secondary with it and the second delete fails.
+        for addr in ['192.0.2.3/24','192.0.2.2/24']: ip('addr','del',addr,'dev','nw1',ns=peer.pid)
         check('both families down','ipv6.broken','inconclusive')
         for addr in ['192.0.2.2/24','192.0.2.3/24']: ip('addr','add',addr,'dev','nw1',ns=peer.pid)
         for addr in ['2001:db8::2/64','2001:db8::3/64']: ip('-6','addr','add',addr,'dev','nw1','nodad',ns=peer.pid)
