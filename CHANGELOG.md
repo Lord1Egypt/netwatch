@@ -134,6 +134,9 @@ closes, apart from `iface.errors` on Wi-Fi.
   does not judge with, or leaves out one it does.
 
 ### Fixed
+- Enter in Settings loads the row you are on again. Since 0.29 added the
+  View row, the edit box filled with the next row's value, so accepting GeoIP
+  DB Path unchanged saved the ASN database path as `geoip_db`.
 - A slow-resolver issue on a router never closed. It needed the median under
   a flat 5 ms, which a router answering in 10 ms never reaches, so the issue
   stayed open until netwatch restarted. It now closes against a line set when
