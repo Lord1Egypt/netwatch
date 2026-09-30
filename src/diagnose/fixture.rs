@@ -946,6 +946,32 @@ fn wifi_weak(t: u64) -> Observations {
     obs
 }
 
+/// The laptop's driver drops about 70 frames a minute it has no use for,
+/// multicast for groups nothing here joined, and counts them as interface
+/// drops. That is over the 60/min floor, so iface.errors opens on the
+/// drops alone two seconds in. From 120 s to 300 s interference costs the
+/// link 30 errors a minute as well. The issue never closes: it closes only
+/// under 1/min errors and drops combined, which the drops never allow,
+/// until B19 retunes the rule. On the errors alone it would close at 659 s.
+fn iface_errors_wifi_drops(t: u64) -> Observations {
+    // Both rates count the minute before the frame, as the sampler's do,
+    // so the errors ramp in and out over a minute. The seconds of
+    // `from..to` in that minute:
+    let in_last_minute =
+        |from: u64, to: u64| t.min(to).saturating_sub(t.saturating_sub(60).max(from));
+    let mut obs = wifi_frame(t);
+    let iface = obs
+        .iface
+        .as_mut()
+        .expect("the Wi-Fi frame has an interface");
+    iface.errors_per_min = 30 * in_last_minute(120, 300) / 60;
+    iface.drops_per_min = Some(70);
+    // And the lifetime counters behind them.
+    iface.rx_errors = 30 * t.min(300).saturating_sub(120) / 60;
+    iface.rx_dropped = 18_400 + 70 * t / 60;
+    obs
+}
+
 impl Scenario {
     /// An episode on the demo network as the app sees it: the live cadence,
     /// the baselines live learns and the default thresholds.
@@ -997,6 +1023,11 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             baselines: wifi_baselines,
             ..Scenario::live("wifi-weak", 480, wifi_weak)
+        },
+        // A minute past where it would close without the drops.
+        Scenario {
+            baselines: wifi_baselines,
+            ..Scenario::live("iface-errors-wifi-drops", 720, iface_errors_wifi_drops)
         },
     ]
 }
@@ -1578,6 +1609,45 @@ mod tests {
             }
         });
         assert_eq!(unknown, 180);
+    }
+
+    /// A Wi-Fi driver's background drops open iface.errors two seconds in
+    /// and hold it open to the end, because it closes only under 1/min
+    /// errors and drops combined. The drops are all that hold it: without
+    /// them the errors open it at 124 s and it closes at 659 s, 300 s
+    /// after the last error leaves the minute's count.
+    #[test]
+    fn background_wifi_drops_hold_iface_errors_open() {
+        assert_eq!(
+            pinned_spans("iface-errors-wifi-drops"),
+            vec![("2026-09-03 06:44:02".to_string(), None, None)]
+        );
+        let scenario = scenarios()
+            .into_iter()
+            .find(|s| s.id == "iface-errors-wifi-drops")
+            .unwrap();
+        let errors_alone = record(&Scenario {
+            obs: |t| {
+                let mut obs = iface_errors_wifi_drops(t);
+                obs.iface.as_mut().unwrap().drops_per_min = Some(0);
+                obs
+            },
+            ..scenario
+        });
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&errors_alone);
+        let spans: Vec<_> = decisions
+            .issues
+            .into_iter()
+            .map(|s| (s.opened, s.closed, s.close_reason))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![span(
+                "2026-09-03 06:46:04",
+                "2026-09-03 06:54:59",
+                "auto-closed"
+            )]
+        );
     }
 
     /// Without an age under its own name a target's result is dropped as
