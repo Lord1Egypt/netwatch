@@ -23,12 +23,12 @@
 //! `.../claude/versions/2.1.219` → `claude` while leaving `python3.12`,
 //! `7z` and `Google Chrome Helper (GPU)` exactly as they are.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 use std::path::{Path, PathBuf};
 
 /// Directory names that describe *where* a binary lives rather than *what*
 /// it is. Skipped when walking up from a version-named executable.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 const GENERIC_DIRS: &[&str] = &[
     "versions",
     "version",
@@ -54,7 +54,7 @@ const GENERIC_DIRS: &[&str] = &[
 /// Deliberately strict: a component containing any letter other than a
 /// leading `v` is a name, not a version. That is what keeps `python3.12`,
 /// `7z` and `libexec2` from being collapsed into their parent directory.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn looks_like_version(s: &str) -> bool {
     let body = s.strip_prefix('v').unwrap_or(s);
     if body.is_empty() {
@@ -89,7 +89,7 @@ fn looks_like_version(s: &str) -> bool {
 /// Derive the identity from an executable path.
 ///
 /// Exposed for testing — the path is normally supplied by the kernel.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 pub fn name_from_path(path: &Path) -> Option<String> {
     let base = path.file_name()?.to_string_lossy().into_owned();
     if !looks_like_version(&base) {
@@ -153,24 +153,84 @@ pub fn executable_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// FreeBSD has no `/proc` by default (no linprocfs mounted), so this goes
+/// straight to the kernel via `sysctl(CTL_KERN, KERN_PROC,
+/// KERN_PROC_PATHNAME, pid)` — the same call `std::env::current_exe` uses
+/// internally on this platform, just for an arbitrary pid instead of self.
+#[cfg(target_os = "freebsd")]
+pub fn executable_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    // CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME — <sys/sysctl.h>.
+    const CTL_KERN: i32 = 1;
+    const KERN_PROC: i32 = 14;
+    const KERN_PROC_PATHNAME: i32 = 12;
+    let mib = [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid as i32];
+
+    let mut len: usize = 0;
+    // SAFETY: `mib` is a valid 4-element MIB array on the stack; a null
+    // `oldp` with a valid `oldlenp` is the documented way to size the
+    // answer before fetching it.
+    let rc = unsafe {
+        nix::libc::sysctl(
+            mib.as_ptr() as *mut nix::libc::c_int,
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` is sized exactly to the length just reported by the
+    // sizing call above; `len` is updated in place to the number of bytes
+    // actually written, which is never more than `buf`'s capacity.
+    let rc = unsafe {
+        nix::libc::sysctl(
+            mib.as_ptr() as *mut nix::libc::c_int,
+            mib.len() as u32,
+            buf.as_mut_ptr() as *mut nix::libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    // The sysctl returns a NUL-terminated C string; trim it before building
+    // a PathBuf from the (potentially non-UTF8) bytes.
+    if let Some(nul) = buf.iter().position(|&b| b == 0) {
+        buf.truncate(nul);
+    }
+    (!buf.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 pub fn executable_path(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
 /// Stable identity for a pid, or `None` when the kernel won't tell us and the
 /// caller should keep whatever name it already had.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 pub fn stable_name(pid: u32) -> Option<String> {
     name_from_path(&executable_path(pid)?)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 pub fn stable_name(_pid: u32) -> Option<String> {
     None
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "freebsd")
+))]
 mod tests {
     use super::*;
 
