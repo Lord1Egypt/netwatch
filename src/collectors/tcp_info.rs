@@ -15,6 +15,7 @@
 //! | Linux | `NETLINK_INET_DIAG` / `SOCK_DIAG_BY_FAMILY` with `INET_DIAG_INFO` | implemented |
 //! | macOS | `sysctl net.inet.tcp.pcblist64` (`struct xtcpcb64`) | implemented |
 //! | Windows | `GetPerTcpConnectionEStats` (needs per-connection enablement) | not yet — returns nothing |
+//! | FreeBSD | would be `sysctl net.inet.tcp.pcblist` (a different struct from macOS's exported ABI) | not yet — returns nothing |
 //!
 //! Callers get `None` for an unknown flow on every platform, so a missing
 //! collector and a not-yet-observed connection take the same path: render `--`.

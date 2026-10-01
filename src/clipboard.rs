@@ -21,11 +21,12 @@ pub fn copy(text: &str) -> io::Result<&'static str> {
         Ok("pbcopy")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         // Wayland first, then X11 fallbacks. Stops at the first tool
         // that exists on the system — doesn't try every tool if one
-        // is missing.
+        // is missing. Applies unchanged to FreeBSD desktop users running
+        // the same X11/Wayland tools.
         let candidates: &[(&str, &[&str])] = &[
             ("wl-copy", &[]),
             ("xclip", &["-selection", "clipboard"]),
@@ -57,7 +58,12 @@ pub fn copy(text: &str) -> io::Result<&'static str> {
         Ok("clip")
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     {
         let _ = text;
         Err(io::Error::new(
@@ -97,7 +103,7 @@ fn run(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn which(cmd: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {cmd}")])
