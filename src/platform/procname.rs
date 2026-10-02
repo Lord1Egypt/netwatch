@@ -157,15 +157,29 @@ pub fn executable_path(pid: u32) -> Option<PathBuf> {
 /// straight to the kernel via `sysctl(CTL_KERN, KERN_PROC,
 /// KERN_PROC_PATHNAME, pid)` — the same call `std::env::current_exe` uses
 /// internally on this platform, just for an arbitrary pid instead of self.
+///
+/// Confirmed on a real FreeBSD 15.1 VM: the kernel treats a *negative*
+/// fourth mib element as a sentinel meaning "the calling process", not
+/// "no such pid" — it's exactly how `std::env::current_exe` gets its own
+/// path through this same sysctl. A `pid: u32` that doesn't fit in a
+/// non-negative `i32` (anything above `i32::MAX`, notably `u32::MAX`)
+/// would silently alias to that sentinel via `pid as i32` and come back
+/// with *this process's* path instead of `None` — caught by
+/// `unknown_pid_yields_nothing` actually failing on real hardware, not by
+/// reasoning from docs. Real FreeBSD pids top out at `pid_max` (default
+/// 99999, kernel ceiling `PID_MAX` 999999), nowhere near this range, so
+/// rejecting it here costs nothing on legitimate input.
 #[cfg(target_os = "freebsd")]
 pub fn executable_path(pid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
+
+    let pid: i32 = pid.try_into().ok()?;
 
     // CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME — <sys/sysctl.h>.
     const CTL_KERN: i32 = 1;
     const KERN_PROC: i32 = 14;
     const KERN_PROC_PATHNAME: i32 = 12;
-    let mib = [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid as i32];
+    let mib = [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid];
 
     let mut len: usize = 0;
     // SAFETY: `mib` is a valid 4-element MIB array on the stack; a null
