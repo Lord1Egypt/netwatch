@@ -987,20 +987,28 @@ fn parse_lsof() -> Vec<Connection> {
 /// base-system tools where one exists). It walks the kernel's socket tables
 /// directly and prints numeric addresses without a flag.
 ///
-/// UNVERIFIED against a real FreeBSD host. Written from the documented
-/// `sockstat(1)` column shape: `USER COMMAND PID FD PROTO LOCAL-ADDRESS
-/// FOREIGN-ADDRESS [STATE]`, where `-S` appends STATE for TCP rows only (a
-/// UDP row has one column fewer). Confirm both the column order and `-S`'s
-/// exact behavior on the FreeBSD CI runner; this is the first place to fix
-/// if sockstat's real output disagrees.
+/// Confirmed on a real FreeBSD 15.1 host. `sockstat(1)`'s column shape is
+/// `USER COMMAND PID FD PROTO LOCAL-ADDRESS FOREIGN-ADDRESS CONN-STATE`
+/// (the last column header is two words, "CONN STATE", like "LOCAL ADDRESS"
+/// below). Originally written with `-S` on the theory that it appended
+/// state for TCP rows only (a UDP row short one column) — real
+/// `sockstat(1)` disagreed on both points: `-S` ("Display the protocol
+/// stack") prints a STACK column (e.g. the vnet stack name "freebsd"), not
+/// state at all, and the actual state flag is lowercase `-s` ("Display the
+/// protocol state"). With the correct `-s`, every row — TCP *and* UDP —
+/// has the same column count; UDP rows just carry `??` in that slot since
+/// sockstat only implements state tracking for TCP/SCTP. The code below
+/// already discards the column for non-TCP protocols regardless, so no
+/// parsing logic needed to change, only the flag and these comments.
 #[cfg(target_os = "freebsd")]
 fn parse_sockstat() -> Vec<Connection> {
     // -4/-6: both address families. -c: connected sockets. -l: listening
-    // sockets (parity with lsof -i on macOS / ss -a on Linux). -S: append
-    // TCP state. No numeric-address flag is passed: sockstat does not do
-    // reverse DNS by default (unlike netstat without -n).
+    // sockets (parity with lsof -i on macOS / ss -a on Linux). -s: append
+    // protocol state (lowercase — uppercase -S is the unrelated "protocol
+    // stack" column). No numeric-address flag is passed: sockstat does not
+    // do reverse DNS by default (unlike netstat without -n).
     let output = match Command::new("sockstat")
-        .args(["-4", "-6", "-c", "-l", "-S"])
+        .args(["-4", "-6", "-c", "-l", "-s"])
         .output()
     {
         Ok(o) => o,
@@ -1012,17 +1020,17 @@ fn parse_sockstat() -> Vec<Connection> {
 #[cfg(target_os = "freebsd")]
 fn parse_sockstat_output(text: &str) -> Vec<Connection> {
     // Header: USER COMMAND PID FD PROTO LOCAL-ADDRESS FOREIGN-ADDRESS
-    // [STATE]. Hardcoded positions (like macOS's netstat parser above)
+    // CONN-STATE. Hardcoded positions (like macOS's netstat parser above)
     // rather than header-driven lookup: the header's "LOCAL ADDRESS"/
-    // "FOREIGN ADDRESS" are two whitespace-separated words each, but the
-    // data row's value is one token, so position-by-header-name doesn't
-    // actually line up — don't try it.
+    // "FOREIGN ADDRESS"/"CONN STATE" are each two whitespace-separated
+    // words, but the data row's value is one token, so position-by-
+    // header-name doesn't actually line up — don't try it.
     const COMMAND: usize = 1;
     const PID: usize = 2;
     const PROTO: usize = 4;
     const LOCAL: usize = 5;
     const FOREIGN: usize = 6;
-    const STATE: usize = 7;
+    const CONN_STATE: usize = 7;
 
     let mut connections = Vec::new();
     for line in text.lines().skip(1) {
@@ -1046,8 +1054,12 @@ fn parse_sockstat_output(text: &str) -> Vec<Connection> {
         let remote_addr = row[FOREIGN].to_string();
         let pid = row.get(PID).and_then(|s| s.parse::<u32>().ok());
         let process_name = row.get(COMMAND).map(|s| s.to_string());
+        // Real `sockstat -s` always prints this column (UDP rows get the
+        // placeholder "??", since sockstat only tracks state for TCP/SCTP)
+        // — filtering on protocol still discards it for UDP regardless of
+        // whether the column happens to be present.
         let state = row
-            .get(STATE)
+            .get(CONN_STATE)
             .filter(|_| protocol == "TCP")
             .map(|s| s.to_string())
             .unwrap_or_default();
@@ -1077,14 +1089,15 @@ fn parse_sockstat_output(text: &str) -> Vec<Connection> {
 mod sockstat_tests {
     use super::*;
 
-    // Representative but UNVERIFIED sample data — see parse_sockstat's doc
-    // comment. TCP row carries a STATE column (from -S); the UDP row does
-    // not, since sockstat only appends STATE for TCP sockets.
+    // Sample data matching real `sockstat -4 -6 -c -l -s` output on
+    // FreeBSD 15.1 — see parse_sockstat's doc comment. Every row carries
+    // the CONN STATE column (from lowercase -s); UDP just gets "??" since
+    // sockstat only tracks state for TCP/SCTP.
     const SOCKSTAT_OUTPUT: &str = "\
-USER     COMMAND    PID   FD PROTO  LOCAL ADDRESS         FOREIGN ADDRESS       STATE
+USER     COMMAND    PID   FD PROTO  LOCAL ADDRESS         FOREIGN ADDRESS       CONN STATE
 root     sshd       1234  3  tcp4   192.168.1.5:22        192.168.1.100:54321   ESTABLISHED
 root     sshd       1234  4  tcp4   0.0.0.0:22            *:*                   LISTEN
-_dhcp    dhclient   567   5  udp4   *:68                  *:*";
+_dhcp    dhclient   567   5  udp4   *:68                  *:*                   ??";
 
     #[test]
     fn parses_tcp_row_with_state() {
@@ -1102,15 +1115,18 @@ _dhcp    dhclient   567   5  udp4   *:68                  *:*";
     }
 
     #[test]
-    fn parses_udp_row_with_no_state_column() {
+    fn parses_udp_row_ignoring_its_placeholder_state() {
         let conns = parse_sockstat_output(SOCKSTAT_OUTPUT);
         let udp = conns
             .iter()
             .find(|c| c.protocol == "UDP")
-            .expect("udp row should parse despite having one fewer column");
+            .expect("udp row should parse");
         assert_eq!(udp.local_addr, "*:68");
         assert_eq!(udp.remote_addr, "*:*");
-        assert_eq!(udp.state, "", "UDP sockets have no state");
+        assert_eq!(
+            udp.state, "",
+            "UDP sockets have no state — sockstat's literal \"??\" is discarded"
+        );
         assert_eq!(udp.pid, Some(567));
     }
 
