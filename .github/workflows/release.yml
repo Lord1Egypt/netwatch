@@ -326,8 +326,37 @@ jobs:
             *.deb
             *.rpm
 
+  # Can't join the `build` matrix above: none of its cross-compile paths
+  # (cargo-zigbuild, the armv5te debian:bookworm container, or the host
+  # toolchain directly) link against FreeBSD's libc. This builds for real,
+  # inside a FreeBSD VM — same approach as the `freebsd` job in ci.yml.
+  build-freebsd:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Build inside a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y rust libpcap pkgconf
+          run: |
+            cargo build --release
+            cp target/release/netwatch netwatch-freebsd-x86_64
+            tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netwatch-freebsd-x86_64
+          path: netwatch-freebsd-x86_64.tar.gz
+
   release:
-    needs: build
+    needs: [build, build-freebsd]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

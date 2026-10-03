@@ -67,7 +67,11 @@ impl ConfigCollector {
     }
 }
 
-#[cfg(target_os = "macos")]
+// FreeBSD's `netstat -rn` has the same shape: a row starting with `default`
+// whose second column is the gateway, with the IPv4 `Internet:` section
+// printed before the IPv6 `Internet6:` one — shared BSD routing-table
+// output, same as macOS.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn collect_gateway() -> Option<String> {
     let output = Command::new("netstat").args(["-rn"]).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -109,7 +113,12 @@ fn collect_gateway() -> Option<String> {
     None
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "windows"
+)))]
 fn collect_gateway() -> Option<String> {
     None
 }

@@ -1,3 +1,5 @@
+#[cfg(target_os = "freebsd")]
+pub mod freebsd;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -87,10 +89,18 @@ fn platform_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     #[cfg(target_os = "macos")]
     return macos::collect_interface_stats();
 
+    #[cfg(target_os = "freebsd")]
+    return freebsd::collect_interface_stats();
+
     #[cfg(target_os = "windows")]
     return windows::collect_interface_stats();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     anyhow::bail!("Unsupported platform")
 }
 
@@ -112,10 +122,18 @@ fn platform_default_route_interface() -> Option<String> {
     #[cfg(target_os = "macos")]
     return macos::default_route_interface();
 
+    #[cfg(target_os = "freebsd")]
+    return freebsd::default_route_interface();
+
     #[cfg(target_os = "windows")]
     return windows::default_route_interface();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     None
 }
 
@@ -187,10 +205,19 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
     speed
 }
 
+/// FreeBSD: same `getifaddrs`/`AF_LINK`/`if_data.ifi_baudrate` approach as
+/// macOS — the struct and field are shared BSD ABI. Lives in `freebsd.rs`
+/// since that module also needs `getifaddrs` for nothing else, unlike macOS
+/// where this function sits directly in this file.
+#[cfg(target_os = "freebsd")]
+pub fn link_speed_bps(iface: &str) -> Option<u64> {
+    freebsd::link_speed_bps(iface)
+}
+
 /// Windows would come from `GetIfEntry2`'s `TransmitLinkSpeed`; not wired up
 /// yet, so the saturation meter falls back to labelling itself against the
 /// observed peak rather than inventing a ceiling.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn link_speed_bps(_iface: &str) -> Option<u64> {
     None
 }
@@ -217,10 +244,18 @@ fn platform_interface_info() -> Result<Vec<InterfaceInfo>> {
     #[cfg(target_os = "macos")]
     return macos::collect_interface_info();
 
+    #[cfg(target_os = "freebsd")]
+    return freebsd::collect_interface_info();
+
     #[cfg(target_os = "windows")]
     return windows::collect_interface_info();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     anyhow::bail!("Unsupported platform")
 }
 

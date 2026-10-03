@@ -2,7 +2,7 @@
 //! Application worker entry points apply policy before processing; capture
 //! prepares its device first. Strict entry failure withholds processing.
 //! Main applies the same policy after resource startup. No network restrictions
-//! are installed, and macOS/Windows have no filesystem backend.
+//! are installed, and macOS/Windows/FreeBSD have no filesystem backend.
 //!
 //! Selected capability removals are checked after each attempt. Best-effort
 //! retains CAP_NET_RAW; strict drops it, so later capture reopening may fail.

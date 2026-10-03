@@ -55,6 +55,30 @@ jobs:
       - name: Test
         run: cargo test
 
+  # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
+  # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the
+  # standard way Rust projects get genuine FreeBSD CI. Slower than the native
+  # matrix jobs above (no package cache survives the VM boundary, so every
+  # run compiles every dependency from scratch) and intentionally
+  # lighter-weight: fmt/clippy are already enforced in `test`, so this job
+  # only proves the FreeBSD-specific code (src/platform/freebsd.rs, the
+  # sockstat connection parser, the sysctl-based procname lookup) actually
+  # builds and its tests pass on the real OS.
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y rust libpcap pkgconf
+          run: |
+            cargo build
+            cargo test
+
   # Only the release workflow actually builds for armv5te (Iomega ix2-dl /
   # Marvell Kirkwood), and that only runs on a tag push. Without this, a
   # change like re-introducing an AtomicU64 (armv5te has no native 64-bit

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 // Only `sample_cpu` uses this, and that is macOS/Linux-only.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -282,7 +282,7 @@ fn cache_process_identities() -> HashMap<u32, ProcessIdentity> {
     HashMap::new()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn sample_cpu() -> Option<HashMap<u32, f64>> {
     let output = Command::new("ps")
         .args(["-A", "-o", "pid=,pcpu="])
@@ -304,7 +304,7 @@ fn sample_cpu() -> Option<HashMap<u32, f64>> {
     Some(map)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 fn sample_cpu() -> Option<HashMap<u32, f64>> {
     None
 }

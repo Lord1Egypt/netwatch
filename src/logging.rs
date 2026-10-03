@@ -112,6 +112,14 @@ mod tests {
     #[test]
     fn appender_is_none_when_dir_unwritable() {
         use std::os::unix::fs::PermissionsExt;
+        // Root ignores permission bits, so 0o500 doesn't actually block a
+        // write and the "unwritable" premise below doesn't hold — this is
+        // normal Unix behavior, not a bug, and CI's FreeBSD VM runner runs
+        // as root.
+        if unsafe { nix::libc::geteuid() } == 0 {
+            eprintln!("skipping appender_is_none_when_dir_unwritable: running as root");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("nw-log-ro-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         // r-x, no write: the owner cannot create the log file inside.

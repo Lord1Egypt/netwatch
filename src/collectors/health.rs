@@ -1055,7 +1055,14 @@ fn icmp_checksum(data: &[u8]) -> u16 {
 /// is ignored on exec — the native path above is what makes pings
 /// work under sandbox.
 fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
-    #[cfg(target_os = "macos")]
+    // macOS and FreeBSD share the original BSD ping(8) lineage: `-t timeout`
+    // is an overall deadline in seconds, predating Linux's iputils `-W`
+    // (per-reply timeout) and `-w` (deadline). FreeBSD's `-W` exists too but
+    // means something else again (milliseconds per reply) — reusing Linux's
+    // `-W 1` here would time out almost instantly, so FreeBSD gets macOS's
+    // args, not the generic catch-all below. Unverified against a live
+    // FreeBSD `ping(8)`.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let args = ["-c", "3", "-t", "1", target];
 
     #[cfg(target_os = "linux")]
@@ -1064,7 +1071,12 @@ fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
     #[cfg(target_os = "windows")]
     let args = ["-n", "3", "-w", "1000", target];
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     let args = ["-c", "3", "-W", "1", target];
 
     let output = Command::new("ping").args(args).output().ok()?;

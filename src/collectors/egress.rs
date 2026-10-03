@@ -47,7 +47,11 @@ pub(crate) const MAX_PROCESSES: usize = 256;
 /// *suspected* truncation; see `canonical_process`.
 #[cfg(target_os = "macos")]
 const COMM_TRUNCATE_LEN: usize = 16;
-#[cfg(not(target_os = "macos"))]
+/// FreeBSD's MAXCOMLEN (sys/param.h) is 19, feeding sockstat's COMMAND
+/// column (`ki_comm`). Unverified against a live FreeBSD `ps`/`sockstat`.
+#[cfg(target_os = "freebsd")]
+const COMM_TRUNCATE_LEN: usize = 19;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 const COMM_TRUNCATE_LEN: usize = 15;
 /// Samples kept per destination for the inline activity sparkline — one
 /// per connection tick, so roughly the last minute at the 1 s default.
