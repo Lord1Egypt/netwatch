@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.35.2] - 2026-10-04
 
 ### Fixed
 - The FreeBSD release binary is now built on FreeBSD 13.5 against the base
