@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.34.0
+Version:        0.35.0
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -84,6 +84,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sat Oct 03 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.0-1
+- FreeBSD support: interfaces, routes, process attribution, clipboard, and sockstat-based connections
+
 * Thu Oct 01 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.34.0-1
 - Diagnose issues expire and close when they should, Observations, schema 2
 
