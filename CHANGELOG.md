@@ -2,6 +2,15 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- The FreeBSD release binary is now built on FreeBSD 13.5 against the base
+  system's libpcap, so it runs on FreeBSD 13 and later. It was built on the
+  newest release against ports libpcap, which failed on older hosts with
+  `version FBSD_1.9 required ... not found` (#63). Best-effort: FreeBSD
+  older than 13 is not covered.
+
 ## [0.35.1] - 2026-10-03
 
 ### Fixed
