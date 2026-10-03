@@ -2,6 +2,33 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.35.0] - 2026-10-03
+
+NetWatch now builds and runs on FreeBSD. Interfaces, the default route, link
+speed, process attribution, clipboard, and gateway/DNS all have real FreeBSD
+backends instead of the silent empty fallback every other unsupported
+platform got before. Verified end to end on a real FreeBSD 15.1 VM, not
+cross-compiled blind: that caught a real bug in the connection-attribution
+parser before it shipped.
+
+### Added
+- FreeBSD support: interface stats and info (`netstat`/`ifconfig`), default
+  route detection, link speed (`getifaddrs`), process-path resolution via
+  `sysctl(KERN_PROC_PATHNAME)` (FreeBSD has no `/proc` by default), clipboard
+  (shares Linux's `wl-copy`/`xclip`/`xsel`), gateway/DNS, and connection
+  attribution via `sockstat`.
+- A `freebsd` CI job and release artifact, built and tested inside a real
+  FreeBSD VM (`vmactions/freebsd-vm`), since no cross-compile path safely
+  links this crate's C/asm dependencies (`pcap`, `mimalloc`, `ring`) for this
+  target.
+
+### Known gaps
+- `tcp_info` (cwnd/ssthresh/rwnd) isn't implemented on FreeBSD yet; those
+  columns show `--`, same as Windows today.
+- Wi-Fi interface detection is implemented but unverified on real wireless
+  hardware — the CI VM has none to test against.
+- Not submitted to the FreeBSD ports tree, and no Capsicum sandboxing yet.
+
 ## [0.34.0] - 2026-10-01
 
 Diagnose issues now end when they should, and moves nobody can feel no
