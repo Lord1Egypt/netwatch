@@ -2001,10 +2001,21 @@ mod tests {
         assert_eq!(c.pid, Some(std::process::id()));
         assert_eq!(c.attribution, AttributionSource::Procfs);
 
-        // A stale broker snapshot is ignored in favour of the local scan.
+        // A stale broker snapshot is ignored in favour of the local scan,
+        // which reads live /proc state across every pid on the box. That can
+        // take a while on a loaded test runner: poll, don't race (same
+        // precaution as proc_broker_publishes_fresh_snapshots_and_stops_with_its_owner).
         snap.captured_at = Instant::now() - std::time::Duration::from_secs(10);
-        let mut c = conn();
-        overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut c;
+        loop {
+            c = conn();
+            overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+            if c.pid == Some(std::process::id()) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(c.pid, Some(std::process::id()));
 
         // An owner recorded for a different inode on the same 5-tuple is not applied.

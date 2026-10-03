@@ -2,6 +2,20 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.35.1] - 2026-10-03
+
+### Fixed
+- A connection-attribution test that intermittently failed on a loaded CI
+  runner. It asserted on a single live `/proc` scan instead of polling, the
+  same race the existing `proc_broker_publishes_fresh_snapshots_and_stops_with_its_owner`
+  test already guards against; brought in line with that precedent.
+- `packaging/rpm/netwatch.spec`'s `Version:` left at 0.34.0 in the 0.35.0
+  release commit.
+
+0.35.0 was tagged but never published: the release guard caught both issues
+on the tagged commit before anything built. 0.35.1 is 0.35.0 with both
+fixed; everything under 0.35.0 below ships in this release.
+
 ## [0.35.0] - 2026-10-03
 
 NetWatch now builds and runs on FreeBSD. Interfaces, the default route, link
